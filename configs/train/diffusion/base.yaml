@@ -1,0 +1,12 @@
+training:
+  epochs: 200
+  batch_size: 16
+  optimizer:
+    name: adamw
+    lr: 1e-4
+
+loss:
+  type: mse
+
+transfer:
+  enabled: false

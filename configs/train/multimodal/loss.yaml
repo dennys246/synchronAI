@@ -1,0 +1,3 @@
+loss:
+  name: mse        # options: mse, mae, huber
+  weight: 1.0

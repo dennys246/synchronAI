@@ -1,0 +1,16 @@
+model:
+  name: unet
+  task: regression
+  input_channels: 3
+  output_channels: 1
+
+architecture:
+  base_channels: 64
+  channel_mults: [1, 2, 4, 8]
+  num_res_blocks: 2
+  attention_resolutions: [16]
+  dropout: 0.1
+
+initialization:
+  method: kaiming
+  seed: 42

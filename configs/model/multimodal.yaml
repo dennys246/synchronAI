@@ -1,0 +1,15 @@
+model:
+  name: multimodal_fusion
+  inputs:
+    video: video_encoder
+    audio: audio_encoder
+    transcript: text_encoder
+    fnirs: fnirs_encoder
+
+fusion:
+  method: concat
+  hidden_dim: 512
+
+head:
+  type: regression
+  output_dim: 1

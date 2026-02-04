@@ -1,0 +1,17 @@
+training:
+  epochs: 50
+  batch_size: 8
+  optimizer:
+    name: adamw
+    lr: 1e-5
+
+transfer:
+  enabled: true
+  checkpoint: pretrained/video_audio_text.ckpt
+  strategy: finetune
+  freeze:
+    encoder:
+      video: true
+      audio: true
+      text: true
+      fnirs: false

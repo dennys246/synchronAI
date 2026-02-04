@@ -1,0 +1,46 @@
+# Video Classifier Training Configuration
+
+# Model configuration
+model:
+  backbone: "yolo11n"  # yolo11n, yolo11s, yolo11m, yolo11l, yolo11x
+  backbone_task: "detect"  # detect or pose
+  temporal_aggregation: "attention"  # mean, max, attention, lstm
+  hidden_dim: 256
+  dropout: 0.3
+  freeze_backbone: true
+
+# Data configuration
+data:
+  sample_fps: 12.0
+  window_seconds: 1.0
+  frame_size: 640
+  augment: true
+  horizontal_flip_prob: 0.5
+  color_jitter: true
+  temporal_jitter_frames: 2
+
+# Training configuration
+training:
+  epochs: 50
+  batch_size: 16
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  use_amp: true
+  num_workers: 0  # Set to 0 for cluster compatibility (limited /dev/shm)
+
+  # Two-stage fine-tuning
+  stage1_epochs: 5  # Head-only training
+  backbone_lr: 1.0e-5  # Lower LR for backbone in stage 2
+
+  # Learning rate schedule
+  scheduler: "cosine"
+  warmup_epochs: 2
+
+# Split configuration
+split:
+  val_split: 0.2
+  group_by: "subject_id"  # video_path or subject_id
+
+# Reproducibility
+seed: 42
+deterministic: false
