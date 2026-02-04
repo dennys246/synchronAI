@@ -209,3 +209,8 @@ experiments/
 
 # Ignore stupid apple ._ finder files
 ._*
+
+ml-env/
+runs/
+data/
+**/*.pt
