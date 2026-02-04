@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "synchronai"
+version = "0.1.0"
+description = "A multi-modal AI library for analyzing dyadic synchrony in fNIRS studies."
+readme = "README.md"
+authors = [
+  { name="Denny Schaedig", email="dennys@wustl.edu" }
+]
+license = { file = "LICENSE" }
+requires-python = ">=3.9,<3.13"  # TensorFlow 2.16+ supports up to Python 3.12
+dependencies = [
+  "numpy>=1.24",  # TensorFlow 2.18+ supports NumPy 2.x
+  "tensorflow>=2.18",  # TensorFlow 2.18+ has NumPy 2.x support
+  "protobuf>=3.20,<6.0",  # Prevent protobuf ABI mismatches
+  "h5py>=3.8,<4.0",  # Required for TensorFlow model I/O
+  "mne>=1.11.0",
+  "mne_nirs>=0.7.3",
+  "matplotlib>=3.7",
+  "pillow>=9.5",
+  "datasets>=2.16",
+  "huggingface_hub>=0.20",
+  "click>=8.1",
+  "hrfunc>=1.1.1",
+  "openpyxl>=3.1",
+  "torch>=2.0",
+  "torchvision>=0.15",
+  "opencv-python-headless>=4.8",  # Headless OpenCV for servers without display
+  "ultralytics>=8.0",  # YOLO backbone
+]
+
+[project.optional-dependencies]
+audio = [
+    "openai-whisper>=20231117",
+    "soundfile>=0.12.0",
+    "imageio-ffmpeg>=0.4.9",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+synchronai = "synchronai.main:main"
