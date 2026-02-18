@@ -1,0 +1,91 @@
+# Multi-Modal Classifier with Pretrained Heads
+# ==============================================
+# Recommended transfer learning strategy:
+# - Pretrained YOLO backbone (Ultralytics)
+# - Pretrained Whisper encoder (OpenAI)
+# - Task-adapted heads from your video/audio training runs
+#
+# This combines the best of both worlds:
+# ✓ Strong general-purpose backbones
+# ✓ Heads already adapted to your synchrony/event data
+
+# Video model configuration
+video:
+  backbone: "yolo26s"
+  backbone_task: "detect"
+  temporal_aggregation: "lstm"
+  hidden_dim: 256
+  dropout: 0.3
+  freeze_backbone: true
+  sample_fps: 12.0
+  window_seconds: 2.0
+  frame_size: 640
+
+# Audio model configuration
+audio:
+  model_name: "large-v3"
+  pooling_mode: "mean"
+  hidden_dim: 256
+  dropout: 0.3
+  freeze_encoder: true
+  num_event_classes: 7
+  sample_rate: 16000
+  chunk_duration: 1.0
+
+# Fusion configuration
+fusion:
+  type: "concat"
+  hidden_dim: 256
+  num_heads: 4
+  dropout: 0.3
+
+# Training configuration
+training:
+  epochs: 50
+  batch_size: 16
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  use_amp: true
+  num_workers: 4  # Use 4 workers for parallel data loading (set to 0 if /dev/shm is limited)
+  gradient_clip_max_norm: 1.0
+  label_smoothing: 0.05
+
+  # Two-stage fine-tuning
+  stage1_epochs: 5
+  video_backbone_lr: 1.0e-5
+  audio_encoder_lr: 1.0e-5
+  fusion_head_lr: 5.0e-5
+  stage2_warmup_epochs: 3
+
+  # Learning rate schedule
+  scheduler: "cosine"
+  warmup_epochs: 2
+
+  # Multi-task loss weights
+  sync_loss_weight: 0.6
+  event_loss_weight: 0.4
+
+  # Early stopping
+  early_stopping_patience: 15
+
+  # Checkpointing
+  save_interval: 5
+
+# Data split configuration
+split:
+  val_split: 0.2
+  group_by: "subject_id"
+
+# Transfer Learning (RECOMMENDED SETUP)
+pretrained:
+  # Set these to your trained model paths
+  video: "runs/video_classifier/best.pt"
+  audio: "runs/audio_classifier/best.pt"
+
+  # Load heads only = keep pretrained YOLO/Whisper backbones
+  # This is the recommended approach!
+  load_heads_only: true
+
+# Reproducibility
+seed: 42
+deterministic: false
