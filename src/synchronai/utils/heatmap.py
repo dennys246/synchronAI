@@ -26,7 +26,7 @@ if TYPE_CHECKING:
         PredictionResult,
         VideoPredictionResult,
     )
-    from synchronai.models.cv.YOLO_classifier import VideoClassifier
+    from synchronai.models.cv.video_classifier import VideoClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +69,60 @@ def _create_synchrony_colormap() -> LinearSegmentedColormap:
     return LinearSegmentedColormap.from_list("synchrony", colors, N=256)
 
 
+def load_ground_truth_for_clip(
+    labels_file: Union[str, Path],
+    video_path: Union[str, Path],
+    start_second: int,
+    end_second: int,
+) -> Optional[dict[int, int]]:
+    """Load ground truth labels for specific seconds of a video.
+
+    Args:
+        labels_file: Path to labels CSV (must have video_path, second, label columns)
+        video_path: Video path to match in the CSV
+        start_second: First second (inclusive)
+        end_second: Last second (exclusive)
+
+    Returns:
+        Dict mapping second -> label (0 or 1), or None if labels_file is missing/empty
+    """
+    import pandas as pd
+
+    labels_path = Path(labels_file)
+    if not labels_path.exists():
+        logger.warning(f"Labels file not found for ground truth: {labels_file}")
+        return None
+
+    df = pd.read_csv(labels_path)
+    required = {"video_path", "second", "label"}
+    if not required.issubset(df.columns):
+        logger.warning(f"Labels file missing columns for ground truth: {required - set(df.columns)}")
+        return None
+
+    video_str = str(video_path)
+    mask = (
+        (df["video_path"] == video_str)
+        & (df["second"] >= start_second)
+        & (df["second"] < end_second)
+    )
+    matched = df[mask]
+
+    if matched.empty:
+        # Try matching on just the filename in case paths differ
+        video_name = Path(video_path).name
+        mask = (
+            df["video_path"].apply(lambda p: Path(p).name == video_name)
+            & (df["second"] >= start_second)
+            & (df["second"] < end_second)
+        )
+        matched = df[mask]
+
+    if matched.empty:
+        return None
+
+    return dict(zip(matched["second"].astype(int), matched["label"].astype(int)))
+
+
 def plot_temporal_heatmap(
     predictions: List[PredictionResult],
     *,
@@ -77,6 +131,7 @@ def plot_temporal_heatmap(
     save_path: Optional[str] = None,
     show_annotations: bool = True,
     show_threshold_line: bool = True,
+    ground_truth: Optional[dict[int, int]] = None,
 ) -> None:
     """
     Plot a single-row temporal heatmap showing synchrony probability per second.
@@ -88,6 +143,9 @@ def plot_temporal_heatmap(
         save_path: Optional path to save the figure
         show_annotations: Whether to show probability values on cells
         show_threshold_line: Whether to show threshold indicator
+        ground_truth: Optional dict mapping second -> label (0 or 1).
+            When provided, a ground truth row is added to the heatmap and
+            accuracy statistics are included in the title.
     """
     if config is None:
         config = HeatmapConfig()
@@ -100,16 +158,51 @@ def plot_temporal_heatmap(
     probs = np.array([p.probability for p in predictions])
     preds = np.array([p.prediction for p in predictions])
 
-    # Create figure with two subplots: heatmap + line plot
-    fig, (ax_heat, ax_line) = plt.subplots(
-        2,
-        1,
-        figsize=config.figsize_timeline,
-        height_ratios=[1, 2],
-        sharex=True,
-    )
+    has_gt = ground_truth is not None and len(ground_truth) > 0
 
-    # === Heatmap subplot ===
+    # Build ground truth array aligned to prediction seconds
+    if has_gt:
+        gt_labels = np.array([ground_truth.get(s, -1) for s in seconds])
+        gt_available = gt_labels >= 0
+    else:
+        gt_labels = None
+        gt_available = None
+
+    # Create figure layout depending on whether ground truth is available
+    if has_gt:
+        fig, (ax_gt, ax_heat, ax_line) = plt.subplots(
+            3,
+            1,
+            figsize=(config.figsize_timeline[0], config.figsize_timeline[1] + 1),
+            height_ratios=[1, 1, 2],
+            sharex=True,
+        )
+    else:
+        fig, (ax_heat, ax_line) = plt.subplots(
+            2,
+            1,
+            figsize=config.figsize_timeline,
+            height_ratios=[1, 2],
+            sharex=True,
+        )
+        ax_gt = None
+
+    # === Ground truth row (if available) ===
+    if has_gt and ax_gt is not None:
+        for i, sec in enumerate(seconds):
+            label = ground_truth.get(sec, -1)
+            if label >= 0:
+                color = "green" if label == 1 else "red"
+                ax_gt.barh(0, 1, left=i, height=0.8, color=color, alpha=0.85, edgecolor="none")
+            else:
+                ax_gt.barh(0, 1, left=i, height=0.8, color="lightgray", alpha=0.5, edgecolor="none")
+        ax_gt.set_ylim(-0.5, 0.5)
+        ax_gt.set_yticks([])
+        ax_gt.set_ylabel("Ground\nTruth", fontsize=10, rotation=0, ha="right", va="center", fontweight="bold")
+        ax_gt.set_xlim(0, len(probs))
+        ax_gt.grid(True, axis="x", alpha=config.grid_alpha, linestyle="--")
+
+    # === Prediction heatmap subplot ===
     heatmap_data = probs.reshape(1, -1)
     cmap = plt.get_cmap(config.colormap)
 
@@ -137,10 +230,11 @@ def plot_temporal_heatmap(
             )
 
     ax_heat.set_yticks([])
-    ax_heat.set_ylabel("Sync\nProb", fontsize=10, rotation=0, ha="right", va="center")
+    ax_heat.set_ylabel("Predicted\nSync", fontsize=10, rotation=0, ha="right", va="center")
 
     # Add colorbar
-    cbar = fig.colorbar(im, ax=ax_heat, orientation="vertical", pad=0.02, aspect=10)
+    cbar_axes = [ax_gt, ax_heat] if ax_gt is not None else [ax_heat]
+    cbar = fig.colorbar(im, ax=cbar_axes, orientation="vertical", pad=0.02, aspect=10)
     cbar.set_label(config.cbar_label, fontsize=10)
 
     # === Line plot subplot ===
@@ -149,7 +243,7 @@ def plot_temporal_heatmap(
         probs,
         alpha=0.3,
         color="steelblue",
-        label="Probability",
+        label="Predicted Probability",
     )
     ax_line.plot(seconds, probs, color="steelblue", linewidth=1.5)
 
@@ -162,7 +256,7 @@ def plot_temporal_heatmap(
         color="green",
         s=30,
         zorder=5,
-        label="Synchrony",
+        label="Predicted Sync",
         alpha=0.7,
     )
     ax_line.scatter(
@@ -171,9 +265,24 @@ def plot_temporal_heatmap(
         color="red",
         s=30,
         zorder=5,
-        label="Asynchrony",
+        label="Predicted Async",
         alpha=0.7,
     )
+
+    # Show ground truth as step line on the line plot
+    if has_gt and gt_labels is not None:
+        gt_for_plot = np.where(gt_available, gt_labels.astype(float), np.nan)
+        ax_line.step(
+            seconds,
+            gt_for_plot,
+            where="mid",
+            color="black",
+            linewidth=2,
+            linestyle="--",
+            label="Ground Truth",
+            alpha=0.7,
+            zorder=4,
+        )
 
     # Threshold line
     if show_threshold_line:
@@ -194,13 +303,27 @@ def plot_temporal_heatmap(
     ax_line.spines["top"].set_visible(False)
     ax_line.spines["right"].set_visible(False)
 
-    # Overall title
+    # Overall title with accuracy stats when ground truth is available
     sync_ratio = sum(preds) / len(preds)
-    fig.suptitle(
-        f"{title}\n(Synchrony: {sum(preds)}/{len(preds)} seconds = {sync_ratio:.1%})",
-        fontsize=config.title_fontsize,
-        fontweight="bold",
-    )
+    if has_gt and gt_labels is not None and gt_available.any():
+        gt_sync_count = int(gt_labels[gt_available].sum())
+        gt_total = int(gt_available.sum())
+        correct = int((preds[gt_available] == gt_labels[gt_available]).sum())
+        accuracy = correct / gt_total if gt_total > 0 else 0.0
+        fig.suptitle(
+            f"{title}\n"
+            f"(Predicted sync: {int(sum(preds))}/{len(preds)}s = {sync_ratio:.1%} | "
+            f"Ground truth sync: {gt_sync_count}/{gt_total}s | "
+            f"Accuracy: {correct}/{gt_total} = {accuracy:.1%})",
+            fontsize=config.title_fontsize,
+            fontweight="bold",
+        )
+    else:
+        fig.suptitle(
+            f"{title}\n(Predicted sync: {int(sum(preds))}/{len(preds)} seconds = {sync_ratio:.1%})",
+            fontsize=config.title_fontsize,
+            fontweight="bold",
+        )
 
     plt.tight_layout()
 
@@ -286,7 +409,7 @@ def plot_heatmap_grid(
     preds = [p.prediction for p in predictions]
     sync_ratio = sum(preds) / len(preds)
     ax.set_title(
-        f"{title}\n({n_seconds} seconds total, {sync_ratio:.1%} synchrony)",
+        f"{title}\n({n_seconds} seconds total, {sync_ratio:.1%} predicted synchrony)",
         fontsize=config.title_fontsize,
         fontweight="bold",
     )
@@ -402,7 +525,7 @@ def plot_confidence_distribution(
     high_conf = sum(1 for c in confidences if c > 0.8) / len(confidences) * 100
 
     fig.suptitle(
-        f"{title}\n(Synchrony: {sync_pct:.1f}%, High confidence (>0.8): {high_conf:.1f}%)",
+        f"{title}\n(Predicted sync: {sync_pct:.1f}%, High confidence (>0.8): {high_conf:.1f}%)",
         fontsize=config.title_fontsize,
         fontweight="bold",
     )
@@ -507,7 +630,7 @@ def plot_segment_summary(
 
     overall_sync = sum(preds) / len(preds)
     ax.set_title(
-        f"{title}\n(Overall: {overall_sync:.1%} synchrony across {n_seconds}s)",
+        f"{title}\n(Overall: {overall_sync:.1%} predicted synchrony across {n_seconds}s)",
         fontsize=config.title_fontsize,
         fontweight="bold",
     )
