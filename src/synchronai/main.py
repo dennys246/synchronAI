@@ -396,7 +396,7 @@ def _run_preprocessing(args: argparse.Namespace) -> None:
 
 def _run_video_training(args: argparse.Namespace) -> None:
     """Run video classifier training."""
-    from synchronai.models.cv.YOLO_classifier import VideoClassifierConfig
+    from synchronai.models.cv.video_classifier import VideoClassifierConfig
     from synchronai.training.video.train import TrainingConfig, train_video_classifier
     from synchronai.data.video.dataset import VideoDatasetConfig
 
