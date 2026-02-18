@@ -210,7 +210,12 @@ experiments/
 # Ignore stupid apple ._ finder files
 ._*
 
+.vscode/
+
 ml-env/
 runs/
-data/
+data/*.*
 **/*.pt
+
+scripts/bsub/logs/
+scripts/bsub/data/
