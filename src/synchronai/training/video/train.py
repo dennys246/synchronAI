@@ -17,9 +17,10 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, SequentialLR, LinearLR
 from tqdm import tqdm
@@ -31,7 +32,7 @@ from synchronai.data.video.dataset import (
     split_by_video,
     save_split_info,
 )
-from synchronai.models.cv.YOLO_classifier import (
+from synchronai.models.cv.video_classifier import (
     VideoClassifier,
     VideoClassifierConfig,
     build_video_classifier,
@@ -52,6 +53,7 @@ def generate_training_heatmap(
     clip_duration: int = 10,
     use_gradcam: bool = False,
     gradcam_aggregate: str = "max",
+    labels_file: Optional[Union[str, Path]] = None,
 ) -> Optional[Path]:
     """Generate heatmap visualization during training.
 
@@ -66,6 +68,7 @@ def generate_training_heatmap(
         clip_duration: Duration in seconds of the clip to analyze (from middle of video)
         use_gradcam: Whether to generate Grad-CAM spatial heatmap thumbnails
         gradcam_aggregate: How to aggregate Grad-CAM across frames ("max", "mean", "weighted")
+        labels_file: Optional path to labels CSV for ground truth overlay
 
     Returns:
         Path to generated heatmap directory, or None if generation failed
@@ -83,6 +86,7 @@ def generate_training_heatmap(
         HeatmapConfig,
         plot_temporal_heatmap,
         export_heatmap_data,
+        load_ground_truth_for_clip,
     )
     import numpy as np
 
@@ -173,12 +177,20 @@ def generate_training_heatmap(
         video_name = video_path.stem
         heatmap_config = HeatmapConfig(threshold=threshold)
 
+        # Load ground truth labels if labels_file is available
+        ground_truth = None
+        if labels_file:
+            ground_truth = load_ground_truth_for_clip(
+                labels_file, video_path, start_second, end_second
+            )
+
         # Timeline heatmap
         plot_temporal_heatmap(
             predictions,
             config=heatmap_config,
-            title=f"Batch {epoch} - {video_name} (sec {start_second}-{end_second}, {synchrony_ratio:.1%} sync)",
+            title=f"Batch {epoch} - {video_name} (sec {start_second}-{end_second})",
             save_path=str(heatmap_dir / f"{video_name}_timeline.png"),
+            ground_truth=ground_truth,
         )
 
         # Export data
@@ -315,6 +327,9 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
     gradient_accumulation_steps: int = 1
+    gradient_clip_max_norm: float = 1.0
+    label_smoothing: float = 0.05
+    mixup_alpha: float = 0.2
 
     # Scheduler
     warmup_epochs: int = 1
@@ -323,7 +338,7 @@ class TrainingConfig:
     stage1_epochs: int = 5
     stage2_unfreeze: str = "backbone.last"
     backbone_lr: float = 1e-5
-    stage2_warmup_epochs: int = 1
+    stage2_warmup_epochs: int = 3
 
     # Early stopping
     patience: int = 10
@@ -336,8 +351,8 @@ class TrainingConfig:
     seed: int = 42
     deterministic: bool = False
 
-    # Dataloader (0 for cluster compatibility with limited /dev/shm)
-    num_workers: int = 0
+    # Dataloader workers for parallel data loading
+    num_workers: int = 4
 
     # Checkpointing
     save_best: bool = True
@@ -587,7 +602,7 @@ def compute_metrics(
     Returns:
         Dict with accuracy, precision, recall, f1, auc
     """
-    logits = logits.squeeze()
+    logits = logits.squeeze(-1) if logits.dim() > 1 else logits
     probs = torch.sigmoid(logits)
     preds = (probs > 0.5).float()
 
@@ -630,6 +645,9 @@ def train_epoch(
     device: torch.device,
     accumulation_steps: int = 1,
     use_amp: bool = True,
+    gradient_clip_max_norm: float = 0.0,
+    label_smoothing: float = 0.0,
+    mixup_alpha: float = 0.0,
     # Heatmap generation parameters
     heatmap_batch_interval: int = 0,
     heatmap_video_path: Optional[str] = None,
@@ -638,6 +656,7 @@ def train_epoch(
     global_batch_count: int = 0,
     heatmap_use_gradcam: bool = True,
     heatmap_gradcam_aggregate: str = "max",
+    labels_file: Optional[Union[str, Path]] = None,
     # Batch progress tracking
     history: Optional[TrainingHistory] = None,
     batch_plot_interval: int = 10,
@@ -653,6 +672,7 @@ def train_epoch(
         device: Device to train on
         accumulation_steps: Gradient accumulation steps
         use_amp: Whether to use automatic mixed precision
+        gradient_clip_max_norm: Max norm for gradient clipping (0 = disabled)
         heatmap_batch_interval: Generate heatmaps every N batches (0 = disabled)
         heatmap_video_path: Path to sample video for heatmap generation
         save_dir: Directory to save heatmaps
@@ -678,8 +698,24 @@ def train_epoch(
         frames = batch["frames"].to(device)
         labels = batch["label"].to(device)
 
-        with autocast(enabled=use_amp):
-            logits = model(frames).squeeze()
+        # Store original labels for metrics (before smoothing/mixup)
+        original_labels = labels.clone()
+
+        # Apply label smoothing: {0, 1} -> {smoothing, 1 - smoothing}
+        if label_smoothing > 0:
+            labels = labels * (1.0 - 2 * label_smoothing) + label_smoothing
+
+        # Mixup: blend pairs of samples and labels
+        if mixup_alpha > 0 and frames.size(0) > 1:
+            lam = np.random.beta(mixup_alpha, mixup_alpha)
+            lam = max(lam, 1.0 - lam)  # Ensure lam >= 0.5 for stability
+            perm = torch.randperm(frames.size(0), device=device)
+            frames = lam * frames + (1.0 - lam) * frames[perm]
+            labels = lam * labels + (1.0 - lam) * labels[perm]
+
+        with autocast("cuda", enabled=use_amp):
+            logits = model(frames)
+            logits = logits.squeeze(-1) if logits.dim() > 1 else logits
             loss = criterion(logits, labels)
             loss = loss / accumulation_steps
 
@@ -690,22 +726,27 @@ def train_epoch(
 
         if (batch_idx + 1) % accumulation_steps == 0:
             if use_amp and scaler is not None:
+                scaler.unscale_(optimizer)
+                if gradient_clip_max_norm > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_max_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
+                if gradient_clip_max_norm > 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_max_norm)
                 optimizer.step()
             optimizer.zero_grad()
 
         batch_loss = loss.item() * accumulation_steps
         total_loss += batch_loss
-        all_logits.append(logits.detach())
-        all_labels.append(labels.detach())
+        all_logits.append(logits.detach().cpu())
+        all_labels.append(original_labels.detach().cpu())
 
-        # Compute batch accuracy
+        # Compute batch accuracy (use original labels, not smoothed/mixed)
         with torch.no_grad():
             probs = torch.sigmoid(logits)
-            preds = (probs > 0.5).float()
-            batch_acc = (preds == labels).float().mean().item()
+            preds = (probs > 0.5).long()
+            batch_acc = (preds == original_labels).float().mean().item()
 
         pbar.set_postfix({"loss": f"{batch_loss:.4f}", "acc": f"{batch_acc:.4f}"})
 
@@ -755,6 +796,7 @@ def train_epoch(
                     threshold=0.5,
                     use_gradcam=heatmap_use_gradcam,
                     gradcam_aggregate=heatmap_gradcam_aggregate,
+                    labels_file=labels_file,
                 )
                 model.train()  # Ensure model is back in training mode
 
@@ -796,13 +838,14 @@ def validate(
         frames = batch["frames"].to(device)
         labels = batch["label"].to(device)
 
-        with autocast(enabled=use_amp):
-            logits = model(frames).squeeze()
+        with autocast("cuda", enabled=use_amp):
+            logits = model(frames)
+            logits = logits.squeeze(-1) if logits.dim() > 1 else logits
             loss = criterion(logits, labels)
 
         total_loss += loss.item()
-        all_logits.append(logits)
-        all_labels.append(labels)
+        all_logits.append(logits.detach().cpu())
+        all_labels.append(labels.detach().cpu())
 
     all_logits = torch.cat(all_logits)
     all_labels = torch.cat(all_labels)
@@ -890,6 +933,10 @@ def train_video_classifier(
             sample_fps=model_config.sample_fps,
             window_seconds=model_config.window_seconds,
             frame_size=model_config.frame_height,
+            augment=True,
+            color_jitter=True,
+            horizontal_flip_prob=0.5,
+            temporal_jitter_frames=2,
         )
 
     training_config.labels_file = str(labels_file)
@@ -981,14 +1028,17 @@ def train_video_classifier(
     model = build_video_classifier(model_config)
     model.to(device)
 
-    # Loss function
+    # Loss function (with label smoothing to handle annotation noise)
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
+    label_smoothing = training_config.label_smoothing
+    if label_smoothing > 0:
+        logger.info(f"Using label smoothing: {label_smoothing} (labels: {label_smoothing} to {1.0 - label_smoothing})")
 
     # Training history
     history = TrainingHistory()
 
     # Mixed precision scaler
-    scaler = GradScaler() if training_config.use_amp else None
+    scaler = GradScaler("cuda") if training_config.use_amp else None
 
     # Resume from checkpoint if specified
     start_epoch = 0
@@ -1059,6 +1109,9 @@ def train_video_classifier(
             train_loss, train_acc, global_batch_count = train_epoch(
                 model, train_loader, criterion, optimizer, scaler, device,
                 training_config.gradient_accumulation_steps, training_config.use_amp,
+                gradient_clip_max_norm=training_config.gradient_clip_max_norm,
+                label_smoothing=label_smoothing,
+                mixup_alpha=training_config.mixup_alpha,
                 heatmap_batch_interval=training_config.heatmap_batch_interval,
                 heatmap_video_path=heatmap_video_path,
                 save_dir=save_dir,
@@ -1066,6 +1119,7 @@ def train_video_classifier(
                 global_batch_count=global_batch_count,
                 heatmap_use_gradcam=training_config.heatmap_use_gradcam,
                 heatmap_gradcam_aggregate=training_config.heatmap_gradcam_aggregate,
+                labels_file=training_config.labels_file,
                 history=history,
                 batch_plot_interval=10,
             )
@@ -1157,24 +1211,32 @@ def train_video_classifier(
         else:
             model.unfreeze_backbone(mode="last")
 
-        # New optimizer with parameter groups
+        # Reduce head LR for stage 2 — head is already well-trained from stage 1,
+        # so use a lower rate to avoid destabilizing it while backbone adapts
+        stage2_head_lr = training_config.backbone_lr * 5  # 5e-5 by default (half of stage 1)
+        logger.info(
+            f"  Stage 2 LRs: backbone={training_config.backbone_lr:.1e}, "
+            f"head/temporal={stage2_head_lr:.1e}"
+        )
+
+        # New optimizer — only includes trainable params (frozen layers excluded)
         optimizer = AdamW(
             model.get_parameter_groups(
                 backbone_lr=training_config.backbone_lr,
-                head_lr=training_config.learning_rate,
+                head_lr=stage2_head_lr,
             ),
             weight_decay=training_config.weight_decay,
         )
 
         # Reset scaler
         if training_config.use_amp:
-            scaler = GradScaler()
+            scaler = GradScaler("cuda")
 
-        # Scheduler for stage 2
+        # Scheduler for stage 2 with gentle warmup
         if training_config.stage2_warmup_epochs > 0:
             warmup_scheduler = LinearLR(
                 optimizer,
-                start_factor=0.1,
+                start_factor=0.3,  # Start at 30% of base LR (gentler than 10%)
                 total_iters=training_config.stage2_warmup_epochs,
             )
             main_scheduler = CosineAnnealingLR(
@@ -1197,6 +1259,9 @@ def train_video_classifier(
             train_loss, train_acc, global_batch_count = train_epoch(
                 model, train_loader, criterion, optimizer, scaler, device,
                 training_config.gradient_accumulation_steps, training_config.use_amp,
+                gradient_clip_max_norm=training_config.gradient_clip_max_norm,
+                label_smoothing=label_smoothing,
+                mixup_alpha=training_config.mixup_alpha,
                 heatmap_batch_interval=training_config.heatmap_batch_interval,
                 heatmap_video_path=heatmap_video_path,
                 save_dir=save_dir,
@@ -1204,6 +1269,7 @@ def train_video_classifier(
                 global_batch_count=global_batch_count,
                 heatmap_use_gradcam=training_config.heatmap_use_gradcam,
                 heatmap_gradcam_aggregate=training_config.heatmap_gradcam_aggregate,
+                labels_file=training_config.labels_file,
                 history=history,
                 batch_plot_interval=10,
             )
@@ -1319,6 +1385,7 @@ def train_video_classifier(
             threshold=0.5,
             use_gradcam=training_config.heatmap_use_gradcam,
             gradcam_aggregate=training_config.heatmap_gradcam_aggregate,
+            labels_file=training_config.labels_file,
         )
 
     # Clean up

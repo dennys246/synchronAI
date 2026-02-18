@@ -87,7 +87,7 @@ TRAIN_CMD="python -m synchronai.main --video --train classifier \
     --batch-size ${BATCH_SIZE} \
     --epochs ${EPOCHS} \
     --seed ${SEED} \
-    --num-workers 0 \
+    --num-workers 4 \
     --use-amp"
 
 # Add heatmap options if configured

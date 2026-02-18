@@ -17,7 +17,7 @@ from synchronai.inference.video.predict import (
     predict_video,
     predict_video_batch,
 )
-from synchronai.models.cv.YOLO_classifier import (
+from synchronai.models.cv.video_classifier import (
     VideoClassifier,
     load_video_classifier,
 )

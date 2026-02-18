@@ -10,6 +10,10 @@ from synchronai.models.audio.whisper_encoder import (
     WhisperEncoderConfig,
     WhisperEncoderFeatures,
 )
+from synchronai.models.audio.wavlm_encoder import (
+    WavLMEncoderConfig,
+    WavLMEncoderFeatures,
+)
 
 __all__ = [
     "AudioClassifier",
@@ -18,4 +22,6 @@ __all__ = [
     "load_audio_classifier",
     "WhisperEncoderConfig",
     "WhisperEncoderFeatures",
+    "WavLMEncoderConfig",
+    "WavLMEncoderFeatures",
 ]

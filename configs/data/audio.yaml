@@ -1,0 +1,8 @@
+dataset:
+  name: audio_waveform
+  root: data/audio
+  sample_rate: 16000
+
+preprocessing:
+  mel_spectrogram: true
+  n_mels: 128

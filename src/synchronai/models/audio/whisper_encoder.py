@@ -90,8 +90,12 @@ class WhisperEncoderFeatures(nn.Module):
         self.model_size = model_size
         self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self._freeze = freeze
-        self._whisper = None
         self._encoder_dim = WhisperEncoderConfig(model_size=model_size).encoder_dim
+        self._is_loaded = False  # Track if model is loaded
+
+        # CRITICAL FIX: Register encoder as a module attribute (not private!)
+        # This ensures it's part of state_dict() and can be fine-tuned
+        self.encoder = None  # Will be populated by _load_model()
 
         logger.info(
             f"WhisperEncoderFeatures: model={model_size}, "
@@ -99,32 +103,57 @@ class WhisperEncoderFeatures(nn.Module):
         )
 
     def _load_model(self) -> None:
-        """Lazy load Whisper model on first use."""
-        if self._whisper is not None:
+        """
+        Lazy load Whisper model on first use.
+
+        CRITICAL: The encoder is registered as self.encoder (not self._whisper)
+        to ensure it's included in state_dict() for proper saving/loading.
+        """
+        if self._is_loaded:
             return
 
         whisper = _lazy_import_whisper()
         cache_dir = get_whisper_cache_dir()
         logger.info(f"Loading Whisper model: {self.model_size} (cache: {cache_dir})")
-        self._whisper = whisper.load_model(
+
+        # Load full whisper model
+        whisper_model = whisper.load_model(
             self.model_size, device=self._device, download_root=str(cache_dir)
         )
 
+        # CRITICAL FIX: Register encoder as a proper module attribute
+        # This makes it part of state_dict() and enables fine-tuning
+        self.encoder = whisper_model.encoder
+
         if self._freeze:
-            for param in self._whisper.encoder.parameters():
+            for param in self.encoder.parameters():
                 param.requires_grad = False
             logger.info("Froze Whisper encoder parameters")
+
+        self._is_loaded = True
 
     @property
     def encoder_dim(self) -> int:
         """Output feature dimension."""
         return self._encoder_dim
 
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Override to ensure encoder is loaded before restoring weights."""
+        # If state_dict has encoder keys but encoder isn't loaded yet, load it
+        has_encoder_keys = any(k.startswith("encoder.") for k in state_dict)
+        if has_encoder_keys and not self._is_loaded:
+            self._load_model()
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
     @property
     def whisper(self):
-        """Get Whisper model (lazy loaded)."""
+        """Get Whisper encoder (lazy loaded)."""
         self._load_model()
-        return self._whisper
+        # Return a simple object with encoder attribute for compatibility
+        class WhisperWrapper:
+            def __init__(self, encoder):
+                self.encoder = encoder
+        return WhisperWrapper(self.encoder)
 
     def _audio_to_mel(self, audio: Union[np.ndarray, torch.Tensor]) -> torch.Tensor:
         """Convert audio to log-mel spectrogram.
@@ -164,6 +193,7 @@ class WhisperEncoderFeatures(nn.Module):
         self,
         audio: Union[np.ndarray, torch.Tensor],
         pool: str = "mean",
+        chunk_duration: float = 1.0,
     ) -> torch.Tensor:
         """Extract encoder features from audio.
 
@@ -171,11 +201,14 @@ class WhisperEncoderFeatures(nn.Module):
             audio: Audio samples, shape (batch, n_samples) or (n_samples,)
                    Expected sample rate: 16kHz
             pool: Pooling strategy for temporal dimension
-                  "mean" - average over time
-                  "max" - max over time
+                  "mean" - average over time (only real audio frames)
+                  "max" - max over time (only real audio frames)
                   "first" - first frame only
-                  "last" - last frame only
+                  "last" - last real frame
                   "none" - return full sequence
+            chunk_duration: Duration of actual audio content in seconds.
+                  Whisper pads to 30s, so pooling only over the real frames
+                  avoids diluting signal with silence representations.
 
         Returns:
             Features tensor:
@@ -188,20 +221,30 @@ class WhisperEncoderFeatures(nn.Module):
         mel = self._audio_to_mel(audio)
 
         # Run through encoder
-        with torch.no_grad() if self._freeze else torch.enable_grad():
+        # Dynamically check requires_grad instead of stale self._freeze flag.
+        # This ensures fine-tuning works after unfreeze_encoder() is called.
+        any_requires_grad = any(p.requires_grad for p in self.encoder.parameters())
+        grad_ctx = torch.enable_grad() if any_requires_grad else torch.no_grad()
+        with grad_ctx:
             # Whisper encoder expects (batch, n_mels, n_frames)
-            features = self._whisper.encoder(mel)
+            features = self.encoder(mel)
             # Output shape: (batch, n_frames, encoder_dim)
 
-        # Pool temporal dimension
+        # Compute how many encoder frames correspond to real audio content.
+        # Whisper encoder produces 1500 frames for 30s of audio (50 frames/sec).
+        # For a 1s chunk, only ~50 frames contain real audio.
+        total_frames = features.shape[1]
+        content_frames = max(1, int(total_frames * chunk_duration / 30.0))
+
+        # Pool temporal dimension (only over real content frames)
         if pool == "mean":
-            features = features.mean(dim=1)
+            features = features[:, :content_frames, :].mean(dim=1)
         elif pool == "max":
-            features = features.max(dim=1).values
+            features = features[:, :content_frames, :].max(dim=1).values
         elif pool == "first":
             features = features[:, 0, :]
         elif pool == "last":
-            features = features[:, -1, :]
+            features = features[:, content_frames - 1, :]
         elif pool == "none":
             pass  # Keep full sequence
         else:
@@ -213,16 +256,21 @@ class WhisperEncoderFeatures(nn.Module):
         self,
         audio: Union[np.ndarray, torch.Tensor],
         pool: str = "mean",
+        chunk_duration: float = 1.0,
     ) -> torch.Tensor:
         """Forward pass (alias for extract_features)."""
-        return self.extract_features(audio, pool=pool)
+        return self.extract_features(audio, pool=pool, chunk_duration=chunk_duration)
 
-    def to(self, device: str) -> "WhisperEncoderFeatures":
-        """Move model to device."""
-        self._device = device
-        if self._whisper is not None:
-            self._whisper = self._whisper.to(device)
-        return self
+    def to(self, *args, **kwargs) -> "WhisperEncoderFeatures":
+        """Move model to device, updating internal device tracking."""
+        result = super().to(*args, **kwargs)
+        # Update _device to match whatever device the parameters are on
+        if self.encoder is not None:
+            try:
+                self._device = str(next(self.encoder.parameters()).device)
+            except StopIteration:
+                pass
+        return result
 
 
 # Cached global encoder to avoid reloading for batch processing

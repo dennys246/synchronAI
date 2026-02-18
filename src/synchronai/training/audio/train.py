@@ -109,6 +109,7 @@ class AudioTrainingConfig:
     # Data
     labels_file: str = ""
     val_split: float = 0.2
+    group_by: str = "subject_id"
 
     # Training
     epochs: int = 50
@@ -116,9 +117,16 @@ class AudioTrainingConfig:
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
     use_amp: bool = True
+    gradient_clip_max_norm: float = 1.0
+    label_smoothing: float = 0.05
+
+    # Two-stage fine-tuning
+    stage1_epochs: int = 5
+    encoder_lr: float = 1e-5
+    stage2_warmup_epochs: int = 3
 
     # Learning rate schedule
-    warmup_epochs: int = 5
+    warmup_epochs: int = 3
     min_lr: float = 1e-6
 
     # Checkpoint
@@ -289,6 +297,119 @@ def plot_batch_progress(
     return output_path
 
 
+def _run_epoch(
+    model: nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    device: str,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
+    use_amp: bool = True,
+    gradient_clip_max_norm: float = 0.0,
+    label_smoothing: float = 0.0,
+    history: Optional[TrainingHistory] = None,
+    batch_plot_interval: int = 10,
+    save_dir: Optional[Path] = None,
+) -> tuple[float, float]:
+    """Run a single training or validation epoch.
+
+    Args:
+        model: Model to train/evaluate
+        dataloader: DataLoader
+        criterion: Loss function
+        device: Device
+        optimizer: Optimizer (None for validation)
+        scaler: GradScaler for AMP (None for validation or no AMP)
+        use_amp: Whether to use automatic mixed precision
+        gradient_clip_max_norm: Max norm for gradient clipping (0 = disabled)
+        label_smoothing: Label smoothing factor (applied as uniform noise)
+        history: TrainingHistory for batch-level tracking (training only)
+        batch_plot_interval: Plot batch progress every N batches
+        save_dir: Directory to save batch progress plots
+
+    Returns:
+        Tuple of (avg_loss, accuracy)
+    """
+    is_training = optimizer is not None
+    model.train() if is_training else model.eval()
+
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+
+    context = torch.enable_grad() if is_training else torch.no_grad()
+    with context:
+        for batch_idx, batch in enumerate(dataloader):
+            audio = batch["audio"].to(device)
+            label = batch["label"].to(device)
+
+            # Apply label smoothing for training
+            # Convert hard labels to soft: mix with uniform distribution
+            if is_training and label_smoothing > 0:
+                num_classes = criterion.weight.shape[0] if criterion.weight is not None else 7
+                smooth_label = torch.zeros(label.size(0), num_classes, device=device)
+                smooth_label.fill_(label_smoothing / (num_classes - 1))
+                smooth_label.scatter_(1, label.unsqueeze(1), 1.0 - label_smoothing)
+
+            if is_training:
+                optimizer.zero_grad()
+
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                outputs = model(audio)
+                if is_training and label_smoothing > 0:
+                    # Manual cross-entropy with soft labels
+                    log_probs = F.log_softmax(outputs["event_logits"], dim=-1)
+                    loss = -(smooth_label * log_probs).sum(dim=-1).mean()
+                    if criterion.weight is not None:
+                        # Apply class weights to soft-label loss
+                        weight_per_sample = criterion.weight[label]
+                        loss = (-(smooth_label * log_probs).sum(dim=-1) * weight_per_sample).mean()
+                else:
+                    loss = criterion(outputs["event_logits"], label)
+
+            if is_training:
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    if gradient_clip_max_norm > 0:
+                        nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_max_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    if gradient_clip_max_norm > 0:
+                        nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_max_norm)
+                    optimizer.step()
+
+            batch_loss = loss.item()
+            _, predicted = outputs["event_logits"].max(1)
+            batch_correct = predicted.eq(label).sum().item()
+            batch_acc = batch_correct / audio.size(0)
+
+            total_loss += batch_loss * audio.size(0)
+            total_correct += batch_correct
+            total_samples += audio.size(0)
+
+            # Record batch metrics (training only)
+            if is_training and history is not None:
+                history.add_batch_metrics(batch_loss, batch_acc)
+                if (
+                    batch_plot_interval > 0
+                    and save_dir is not None
+                    and history._global_batch % batch_plot_interval == 0
+                ):
+                    plot_batch_progress(
+                        history,
+                        save_dir / "batch_progress.png",
+                        title="Audio Classifier Batch Progress",
+                    )
+                    history.save(save_dir / "history.json")
+
+    avg_loss = total_loss / total_samples
+    accuracy = total_correct / total_samples
+    return avg_loss, accuracy
+
+
 def train_audio_classifier(
     labels_file: Union[str, Path],
     save_dir: Union[str, Path] = "runs/audio_classifier",
@@ -296,7 +417,10 @@ def train_audio_classifier(
     training_config: Optional[AudioTrainingConfig] = None,
     resume_from: Optional[str] = None,
 ) -> tuple[AudioClassifier, TrainingHistory]:
-    """Train audio classifier.
+    """Train audio classifier with two-stage fine-tuning.
+
+    Stage 1: Freeze Whisper encoder, train classification head only.
+    Stage 2: Unfreeze encoder with lower LR, fine-tune end-to-end.
 
     Args:
         labels_file: Path to labels CSV
@@ -323,7 +447,7 @@ def train_audio_classifier(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Training on device: {device}")
 
-    # Create dataloaders
+    # Create dataloaders (group-based split to prevent leakage)
     train_loader, val_loader, dataset = create_audio_dataloaders(
         labels_file=labels_file,
         batch_size=training_config.batch_size,
@@ -331,6 +455,7 @@ def train_audio_classifier(
         num_workers=training_config.num_workers,
         seed=training_config.seed,
         event_classes=model_config.event_classes,
+        group_by=training_config.group_by,
     )
 
     # Log class distribution
@@ -350,34 +475,6 @@ def train_audio_classifier(
     # Loss function
     event_criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-    # Optimizer
-    optimizer = AdamW(
-        model.parameters(),
-        lr=training_config.learning_rate,
-        weight_decay=training_config.weight_decay,
-    )
-
-    # Learning rate scheduler (warmup + cosine annealing)
-    warmup_scheduler = LinearLR(
-        optimizer,
-        start_factor=0.1,
-        end_factor=1.0,
-        total_iters=training_config.warmup_epochs,
-    )
-    cosine_scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=training_config.epochs - training_config.warmup_epochs,
-        eta_min=training_config.min_lr,
-    )
-    scheduler = SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[training_config.warmup_epochs],
-    )
-
-    # Mixed precision
-    scaler = torch.cuda.amp.GradScaler() if training_config.use_amp and device == "cuda" else None
-
     # Training history
     history = TrainingHistory()
 
@@ -386,9 +483,6 @@ def train_audio_classifier(
     if resume_from:
         checkpoint = torch.load(resume_from, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        if "scheduler_state_dict" in checkpoint:
-            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         if "history" in checkpoint:
             history = TrainingHistory.from_dict(checkpoint["history"])
         start_epoch = checkpoint.get("epoch", 0) + 1
@@ -400,90 +494,61 @@ def train_audio_classifier(
     with open(save_dir / "training_config.json", "w") as f:
         json.dump(asdict(training_config), f, indent=2)
 
-    # Training loop
+    # Mixed precision
+    use_amp = training_config.use_amp and device == "cuda"
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
+
     early_stop_counter = 0
-    batch_plot_interval = 10  # Plot batch progress every N batches
 
-    for epoch in range(start_epoch, training_config.epochs):
-        # Training phase
-        model.train()
-        train_loss = 0.0
-        train_correct = 0
-        train_total = 0
+    # ========== Stage 1: Head-only training (encoder frozen) ==========
+    logger.info(f"Stage 1: Training head only for {training_config.stage1_epochs} epochs")
+    model.freeze_encoder()
 
-        for batch_idx, batch in enumerate(train_loader):
-            audio = batch["audio"].to(device)
-            label = batch["label"].to(device)
+    # Only optimize trainable parameters (head layers)
+    optimizer = AdamW(
+        model.get_parameter_groups(
+            encoder_lr=0.0,  # Encoder frozen, won't be in groups
+            head_lr=training_config.learning_rate,
+        ),
+        weight_decay=training_config.weight_decay,
+    )
 
-            optimizer.zero_grad()
+    # LR schedule for stage 1: warmup + cosine
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=0.1,
+        end_factor=1.0,
+        total_iters=training_config.warmup_epochs,
+    )
+    cosine_scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, training_config.stage1_epochs - training_config.warmup_epochs),
+        eta_min=training_config.min_lr,
+    )
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[training_config.warmup_epochs],
+    )
 
-            with torch.cuda.amp.autocast(enabled=scaler is not None):
-                outputs = model(audio)
+    stage1_start = min(start_epoch, training_config.stage1_epochs)
+    for epoch in range(stage1_start, training_config.stage1_epochs):
+        logger.info(f"Epoch {epoch + 1}/{training_config.stage1_epochs} (Stage 1)")
 
-                # Classification loss
-                loss = event_criterion(outputs["event_logits"], label)
+        train_loss, train_acc = _run_epoch(
+            model, train_loader, event_criterion, device,
+            optimizer=optimizer, scaler=scaler,
+            use_amp=use_amp,
+            gradient_clip_max_norm=training_config.gradient_clip_max_norm,
+            label_smoothing=training_config.label_smoothing,
+            history=history, save_dir=save_dir,
+        )
 
-            if scaler is not None:
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                optimizer.step()
+        val_loss, val_acc = _run_epoch(
+            model, val_loader, event_criterion, device,
+            use_amp=use_amp,
+        )
 
-            # Compute batch metrics
-            batch_loss = loss.item()
-            _, predicted = outputs["event_logits"].max(1)
-            batch_correct = predicted.eq(label).sum().item()
-            batch_acc = batch_correct / audio.size(0)
-
-            # Accumulate for epoch metrics
-            train_loss += batch_loss * audio.size(0)
-            train_correct += batch_correct
-            train_total += audio.size(0)
-
-            # Record batch metrics to history
-            history.add_batch_metrics(batch_loss, batch_acc)
-
-            # Plot batch progress at intervals
-            if (
-                batch_plot_interval > 0
-                and history._global_batch % batch_plot_interval == 0
-            ):
-                plot_batch_progress(
-                    history,
-                    save_dir / "batch_progress.png",
-                    title="Audio Classifier Batch Progress",
-                )
-                # Also save history incrementally
-                history.save(save_dir / "history.json")
-
-        train_loss /= train_total
-        train_acc = train_correct / train_total
-
-        # Validation phase
-        model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-
-        with torch.no_grad():
-            for batch in val_loader:
-                audio = batch["audio"].to(device)
-                label = batch["label"].to(device)
-
-                outputs = model(audio)
-                loss = event_criterion(outputs["event_logits"], label)
-
-                val_loss += loss.item() * audio.size(0)
-                _, predicted = outputs["event_logits"].max(1)
-                val_correct += predicted.eq(label).sum().item()
-                val_total += audio.size(0)
-
-        val_loss /= val_total
-        val_acc = val_correct / val_total
-
-        # Update scheduler
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
@@ -494,47 +559,27 @@ def train_audio_classifier(
         history.val_accs.append(val_acc)
         history.learning_rates.append(current_lr)
 
-        # Log progress
         logger.info(
-            f"Epoch {epoch + 1}/{training_config.epochs} | "
-            f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2%} | "
-            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2%} | "
-            f"LR: {current_lr:.2e}"
+            f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2%} | "
+            f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2%} | LR: {current_lr:.2e}"
         )
 
-        # Check for best model
         is_best = val_loss < history.best_val_loss
         if is_best:
             history.best_val_loss = val_loss
             history.best_val_acc = val_acc
             history.best_epoch = epoch
             early_stop_counter = 0
-
-            # Save best model
             save_audio_classifier(
-                model,
-                save_dir / "best.pt",
-                optimizer=optimizer,
-                epoch=epoch,
+                model, save_dir / "best.pt",
+                optimizer=optimizer, epoch=epoch,
                 metrics={"val_loss": val_loss, "val_acc": val_acc},
             )
-            logger.info(f"  -> New best model saved (val_loss: {val_loss:.4f})")
+            logger.info(f"  -> New best model (val_loss: {val_loss:.4f})")
         else:
             early_stop_counter += 1
 
-        # Save periodic checkpoint
-        if (epoch + 1) % training_config.save_every == 0:
-            checkpoint_path = save_dir / f"checkpoint_epoch_{epoch + 1}.pt"
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "history": history.to_dict(),
-                "config": asdict(model_config),
-            }, checkpoint_path)
-
-        # Save latest checkpoint (for resume)
+        # Save latest checkpoint
         torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
@@ -542,37 +587,150 @@ def train_audio_classifier(
             "scheduler_state_dict": scheduler.state_dict(),
             "history": history.to_dict(),
             "config": asdict(model_config),
+            "stage": 1,
         }, save_dir / "latest.pt")
-
-        # Save history after each epoch (ensures epoch metrics are persisted)
         history.save(save_dir / "history.json")
 
-        # Early stopping
-        if early_stop_counter >= training_config.early_stopping_patience:
-            logger.info(f"Early stopping at epoch {epoch + 1}")
-            break
+    # ========== Stage 2: End-to-end fine-tuning (encoder unfrozen) ==========
+    stage2_epochs = training_config.epochs - training_config.stage1_epochs
+    if stage2_epochs > 0:
+        logger.info(f"Stage 2: Fine-tuning encoder + head for {stage2_epochs} epochs")
+        model.unfreeze_encoder()
 
-        # Plot training progress periodically
-        if (epoch + 1) % 5 == 0 or epoch == training_config.epochs - 1:
-            plot_training_history(
-                history,
-                save_dir / "training_plot.png",
-                title=f"Audio Classifier Training (Epoch {epoch + 1})",
+        # Reduce head LR — head is already well-trained from stage 1
+        stage2_head_lr = training_config.encoder_lr * 5
+        logger.info(
+            f"  Stage 2 LRs: encoder={training_config.encoder_lr:.1e}, "
+            f"head={stage2_head_lr:.1e}"
+        )
+
+        # New optimizer with differential LRs (only trainable params)
+        optimizer = AdamW(
+            model.get_parameter_groups(
+                encoder_lr=training_config.encoder_lr,
+                head_lr=stage2_head_lr,
+            ),
+            weight_decay=training_config.weight_decay,
+        )
+
+        if use_amp:
+            scaler = torch.amp.GradScaler("cuda")
+
+        # Scheduler for stage 2: gentle warmup + cosine
+        if training_config.stage2_warmup_epochs > 0:
+            warmup_scheduler = LinearLR(
+                optimizer,
+                start_factor=0.3,
+                total_iters=training_config.stage2_warmup_epochs,
             )
+            main_scheduler = CosineAnnealingLR(
+                optimizer,
+                T_max=max(1, stage2_epochs - training_config.stage2_warmup_epochs),
+                eta_min=training_config.min_lr,
+            )
+            scheduler = SequentialLR(
+                optimizer,
+                schedulers=[warmup_scheduler, main_scheduler],
+                milestones=[training_config.stage2_warmup_epochs],
+            )
+        else:
+            scheduler = CosineAnnealingLR(
+                optimizer, T_max=stage2_epochs, eta_min=training_config.min_lr,
+            )
+
+        stage2_start = max(0, start_epoch - training_config.stage1_epochs)
+        for epoch in range(stage2_start, stage2_epochs):
+            global_epoch = training_config.stage1_epochs + epoch
+            logger.info(f"Epoch {global_epoch + 1}/{training_config.epochs} (Stage 2)")
+
+            train_loss, train_acc = _run_epoch(
+                model, train_loader, event_criterion, device,
+                optimizer=optimizer, scaler=scaler,
+                use_amp=use_amp,
+                gradient_clip_max_norm=training_config.gradient_clip_max_norm,
+                label_smoothing=training_config.label_smoothing,
+                history=history, save_dir=save_dir,
+            )
+
+            val_loss, val_acc = _run_epoch(
+                model, val_loader, event_criterion, device,
+                use_amp=use_amp,
+            )
+
+            scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
+
+            history.train_losses.append(train_loss)
+            history.val_losses.append(val_loss)
+            history.train_accs.append(train_acc)
+            history.val_accs.append(val_acc)
+            history.learning_rates.append(current_lr)
+
+            logger.info(
+                f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2%} | "
+                f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2%} | LR: {current_lr:.2e}"
+            )
+
+            is_best = val_loss < history.best_val_loss
+            if is_best:
+                history.best_val_loss = val_loss
+                history.best_val_acc = val_acc
+                history.best_epoch = global_epoch
+                early_stop_counter = 0
+                save_audio_classifier(
+                    model, save_dir / "best.pt",
+                    optimizer=optimizer, epoch=global_epoch,
+                    metrics={"val_loss": val_loss, "val_acc": val_acc},
+                )
+                logger.info(f"  -> New best model (val_loss: {val_loss:.4f})")
+            else:
+                early_stop_counter += 1
+
+            # Save periodic checkpoint
+            if (global_epoch + 1) % training_config.save_every == 0:
+                torch.save({
+                    "epoch": global_epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "history": history.to_dict(),
+                    "config": asdict(model_config),
+                    "stage": 2,
+                }, save_dir / f"checkpoint_epoch_{global_epoch + 1}.pt")
+
+            # Save latest checkpoint
+            torch.save({
+                "epoch": global_epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "history": history.to_dict(),
+                "config": asdict(model_config),
+                "stage": 2,
+            }, save_dir / "latest.pt")
+            history.save(save_dir / "history.json")
+
+            # Early stopping
+            if early_stop_counter >= training_config.early_stopping_patience:
+                logger.info(f"Early stopping at epoch {global_epoch + 1}")
+                break
+
+            # Plot training progress periodically
+            if (global_epoch + 1) % 5 == 0:
+                plot_training_history(
+                    history, save_dir / "training_plot.png",
+                    title=f"Audio Classifier Training (Epoch {global_epoch + 1})",
+                )
 
     # Final plots
     plot_training_history(
-        history,
-        save_dir / "training_plot.png",
+        history, save_dir / "training_plot.png",
         title="Audio Classifier Training (Final)",
     )
     plot_batch_progress(
-        history,
-        save_dir / "batch_progress.png",
+        history, save_dir / "batch_progress.png",
         title="Audio Classifier Batch Progress (Final)",
     )
-
-    # Save history
     history.save(save_dir / "history.json")
 
     logger.info(f"Training complete! Best val_loss: {history.best_val_loss:.4f} at epoch {history.best_epoch + 1}")

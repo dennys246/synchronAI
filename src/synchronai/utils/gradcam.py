@@ -49,8 +49,9 @@ class GradCAM:
     """
     Grad-CAM implementation for the VideoClassifier model.
 
-    Hooks into the YOLO backbone to capture activations and gradients,
-    then computes class activation maps showing important spatial regions.
+    Hooks into the backbone (DINOv2 transformer layers or YOLO conv layers)
+    to capture activations and gradients, then computes class activation maps
+    showing important spatial regions.
     """
 
     def __init__(
@@ -72,12 +73,60 @@ class GradCAM:
         self._activations: Optional[torch.Tensor] = None
         self._gradients: Optional[torch.Tensor] = None
 
+        # Detect backbone type
+        self._backbone_type = self._detect_backbone_type()
+
         # Register hooks
         self._hook_handles: List[torch.utils.hooks.RemovableHandle] = []
         self._register_hooks()
 
+    def _detect_backbone_type(self) -> str:
+        """Detect whether the model uses DINOv2 or YOLO backbone."""
+        from synchronai.models.cv.dinov2_encoder import DINOv2FeatureExtractor
+
+        if isinstance(self.model.feature_extractor, DINOv2FeatureExtractor):
+            return "dinov2"
+        return "yolo"
+
     def _register_hooks(self) -> None:
         """Register forward and backward hooks on target layer."""
+        if self._backbone_type == "dinov2":
+            self._register_hooks_dinov2()
+        else:
+            self._register_hooks_yolo()
+
+    def _register_hooks_dinov2(self) -> None:
+        """Register hooks on DINOv2 transformer encoder layer."""
+        extractor = self.model.feature_extractor
+        extractor._load_model()  # Ensure model is loaded
+
+        # Hook into transformer encoder layer
+        encoder_layers = extractor.dinov2.encoder.layer
+        target_layer = encoder_layers[self.config.target_layer_idx]
+
+        # Forward hook to capture activations
+        def forward_hook(module, input, output):
+            # DINOv2 encoder layer output is a tuple (hidden_states, ...)
+            if isinstance(output, (list, tuple)):
+                self._activations = output[0].detach()
+            else:
+                self._activations = output.detach()
+
+        # Backward hook to capture gradients
+        def backward_hook(module, grad_input, grad_output):
+            if isinstance(grad_output, (list, tuple)):
+                self._gradients = grad_output[0].detach()
+            else:
+                self._gradients = grad_output.detach()
+
+        handle_fwd = target_layer.register_forward_hook(forward_hook)
+        handle_bwd = target_layer.register_full_backward_hook(backward_hook)
+
+        self._hook_handles = [handle_fwd, handle_bwd]
+        logger.debug(f"Registered DINOv2 Grad-CAM hooks on layer: {type(target_layer).__name__}")
+
+    def _register_hooks_yolo(self) -> None:
+        """Register hooks on YOLO backbone conv layers."""
         # Get the YOLO backbone layers
         backbone = self.model.feature_extractor.backbone
 
@@ -104,7 +153,7 @@ class GradCAM:
         handle_bwd = target_layer.register_full_backward_hook(backward_hook)
 
         self._hook_handles = [handle_fwd, handle_bwd]
-        logger.debug(f"Registered Grad-CAM hooks on layer: {type(target_layer).__name__}")
+        logger.debug(f"Registered YOLO Grad-CAM hooks on layer: {type(target_layer).__name__}")
 
     def remove_hooks(self) -> None:
         """Remove all registered hooks."""
@@ -170,34 +219,94 @@ class GradCAM:
         Returns:
             List of CAM heatmaps, one per frame (each H, W array in [0, 1])
         """
+        if self._backbone_type == "dinov2":
+            return self._generate_cam_dinov2(frames, target_class)
+        else:
+            return self._generate_cam_yolo(frames, target_class)
+
+    def _generate_cam_dinov2(
+        self,
+        frames: torch.Tensor,
+        target_class: Optional[int] = None,
+    ) -> List[np.ndarray]:
+        """Generate Grad-CAM heatmaps using DINOv2 backbone.
+
+        DINOv2 outputs patch tokens (B, 257, D) where index 0 is CLS.
+        We reshape the 256 patch tokens to a 16x16 spatial grid for the CAM.
+        """
+        if frames.dim() == 4:
+            frames = frames.unsqueeze(0)
+
+        batch_size, n_frames, C, H, W = frames.shape
+        cams = []
+
+        self.model.eval()
+
+        for frame_idx in range(n_frames):
+            frame_input = frames[:, frame_idx, :, :, :].requires_grad_(True)
+
+            self._activations = None
+            self._gradients = None
+
+            # Forward through DINOv2 feature extractor (hooks capture activations)
+            features = self.model.feature_extractor(frame_input)  # (1, D)
+
+            # Simplified temporal + head for single-frame CAM
+            features_temporal = features.unsqueeze(1)  # (1, 1, D)
+            aggregated = features_temporal.mean(dim=1)  # (1, D)
+            logits = self.model.head(aggregated)
+
+            # Backward pass
+            self.model.zero_grad()
+
+            if target_class is None:
+                target = logits
+            else:
+                target = logits[:, target_class] if logits.dim() > 1 else logits
+
+            target.backward(retain_graph=True)
+
+            if self._activations is None or self._gradients is None:
+                logger.warning(f"No activations/gradients captured for frame {frame_idx}")
+                cams.append(np.zeros((H, W), dtype=np.float32))
+                continue
+
+            # DINOv2 encoder layer output: (B, 257, D) — strip CLS token
+            act_patches = self._activations[0, 1:, :]  # (256, D)
+            grad_patches = self._gradients[0, 1:, :]  # (256, D)
+
+            # Reshape to spatial grid: (256, D) → (16, 16, D) → (D, 16, 16)
+            h = w = int(act_patches.shape[0] ** 0.5)
+            act_spatial = act_patches.reshape(h, w, -1).permute(2, 0, 1)
+            grad_spatial = grad_patches.reshape(h, w, -1).permute(2, 0, 1)
+
+            # Standard Grad-CAM computation
+            cam = self._compute_cam(act_spatial, grad_spatial)
+
+            # Resize to original frame size
+            cam_resized = cv2.resize(cam, (W, H), interpolation=cv2.INTER_LINEAR)
+            cams.append(cam_resized)
+
+        return cams
+
+    def _generate_cam_yolo(
+        self,
+        frames: torch.Tensor,
+        target_class: Optional[int] = None,
+    ) -> List[np.ndarray]:
+        """Generate Grad-CAM heatmaps using YOLO backbone (legacy)."""
         # Ensure batch dimension
         if frames.dim() == 4:
             frames = frames.unsqueeze(0)
 
         batch_size, n_frames, C, H, W = frames.shape
-        device = frames.device
-
-        # We process one frame at a time to get per-frame CAMs
         cams = []
 
-        # Put model in eval mode but enable gradients for CAM computation
         self.model.eval()
 
         for frame_idx in range(n_frames):
-            # Get single frame, but we need to process through the full model
-            # For proper gradients, we run the full forward pass each time
-            # with a different frame highlighted
-
-            # Create input with single frame repeated (for temporal consistency)
-            single_frame = frames[:, frame_idx : frame_idx + 1, :, :, :]
-            # Repeat to match expected temporal dimension
-            repeated_frames = single_frame.repeat(1, n_frames, 1, 1, 1)
-            repeated_frames.requires_grad_(True)
-
-            # Forward pass through feature extractor for single frame
             frame_input = frames[:, frame_idx, :, :, :].requires_grad_(True)
 
-            # Forward through backbone only to get activations
             self._activations = None
             self._gradients = None
 
@@ -230,12 +339,10 @@ class GradCAM:
             self.model.zero_grad()
 
             if target_class is None:
-                # Use predicted class (for binary: high logit = synchrony)
                 target = logits
             else:
                 target = logits[:, target_class] if logits.dim() > 1 else logits
 
-            # Compute gradients
             target.backward(retain_graph=True)
 
             if self._gradients is None:

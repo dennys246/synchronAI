@@ -22,7 +22,7 @@ from synchronai.data.video.processing import (
     load_video_info,
     read_window_frames,
 )
-from synchronai.models.cv.YOLO_classifier import (
+from synchronai.models.cv.video_classifier import (
     VideoClassifier,
     VideoClassifierConfig,
     load_video_classifier,

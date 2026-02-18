@@ -12,6 +12,10 @@ source $SYNCHRONAI_DIR/ml-env/bin/activate
 
 cd $SYNCHRONAI_DIR
 
+# Fix NumPy installation - reinstall to get proper binary dependencies
+# NumPy 2.x bundles OpenBLAS, but the wheel wasn't installed correctly
+pip install --force-reinstall --no-cache-dir "numpy>=2.0,<2.5"
+
 # Fix OpenCV for headless Docker container (no libGL)
 pip uninstall -y opencv-python opencv-python-headless 2>/dev/null || true
 pip install opencv-python-headless

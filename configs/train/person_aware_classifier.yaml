@@ -1,0 +1,58 @@
+# Person-Aware Video Classifier Training Configuration
+# Uses DINOv2 backbone + cross-person attention for dyadic synchrony
+
+# Model configuration
+model:
+  backbone: "dinov2-base"  # dinov2-small, dinov2-base, dinov2-large (Apache 2.0)
+  temporal_aggregation: "lstm"
+  hidden_dim: 256
+  dropout: 0.3
+  freeze_backbone: true
+
+  # Cross-person attention
+  num_cross_attn_layers: 1  # 1-2 layers
+  cross_attn_heads: 4
+  cross_attn_dropout: 0.1
+
+# Data configuration
+data:
+  sample_fps: 12.0
+  window_seconds: 2.0
+  frame_size: 224
+  augment: true
+  horizontal_flip_prob: 0.5
+  color_jitter: true
+  temporal_jitter_frames: 2
+
+  # Person detection bounding boxes (run scripts/detect_persons.py first)
+  bbox_dir: "data/person_bboxes"
+  fallback_to_full_frame: true  # Use full frame when no persons detected
+
+# Training configuration
+training:
+  epochs: 50
+  batch_size: 16
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  use_amp: true
+  num_workers: 4
+  gradient_clip_max_norm: 1.0
+  label_smoothing: 0.05
+
+  # Two-stage fine-tuning
+  stage1_epochs: 5
+  backbone_lr: 1.0e-5
+  stage2_warmup_epochs: 3
+
+  # Learning rate schedule
+  scheduler: "cosine"
+  warmup_epochs: 2
+
+# Split configuration
+split:
+  val_split: 0.2
+  group_by: "subject_id"
+
+# Reproducibility
+seed: 42
+deterministic: false
