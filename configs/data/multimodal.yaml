@@ -1,0 +1,14 @@
+modalities:
+  - video
+  - audio
+  - transcript
+  - fnirs
+
+alignment:
+  method: linear_interpolation
+  target_sampling_rate: 10  # Hz, aligned with fNIRS
+
+dataloader:
+  batch_size: 8
+  shuffle: true
+  num_workers: 8
