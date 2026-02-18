@@ -1,10 +1,15 @@
 """
-Audio event classifier using Whisper encoder features.
+Audio event classifier using Whisper or WavLM encoder features.
 
 Architecture:
-- Whisper encoder (frozen) for audio feature extraction
+- Audio encoder (Whisper or WavLM, frozen by default) for feature extraction
 - Classification head for audio event detection
 - Designed for per-second classification aligned with video synchrony
+
+Supported encoders:
+- Whisper (OpenAI): ASR-pretrained, good general audio features
+- WavLM (Microsoft): Utterance-mixing pretrained, ideal for dyadic conversation
+  and paralinguistic features (prosody, emotion, turn-taking)
 
 Audio Event Classes:
 - speech: Human speech
@@ -50,8 +55,15 @@ AUDIO_EVENT_CLASSES = [
 class AudioClassifierConfig:
     """Configuration for audio classifier model."""
 
-    # Whisper encoder settings
+    # Encoder backend: "whisper" or "wavlm"
+    encoder_type: str = "whisper"
+
+    # Whisper encoder settings (used when encoder_type="whisper")
     whisper_model_size: str = "large-v3"
+
+    # WavLM encoder settings (used when encoder_type="wavlm")
+    wavlm_model_name: str = "microsoft/wavlm-large"
+
     freeze_encoder: bool = True
 
     # Classification head settings
@@ -75,15 +87,18 @@ class AudioClassifierConfig:
 
     @property
     def encoder_dim(self) -> int:
-        """Whisper encoder output dimension."""
-        from synchronai.models.audio.whisper_encoder import WHISPER_DIMS
+        """Encoder output dimension (Whisper or WavLM)."""
+        if self.encoder_type == "wavlm":
+            from synchronai.models.audio.wavlm_encoder import WavLMEncoderConfig
+            return WavLMEncoderConfig(model_name=self.wavlm_model_name).encoder_dim
 
+        from synchronai.models.audio.whisper_encoder import WHISPER_DIMS
         base_size = self.whisper_model_size.split("-")[0]
         return WHISPER_DIMS.get(base_size, WHISPER_DIMS.get(self.whisper_model_size, 1280))
 
 
 class AudioClassifier(nn.Module):
-    """Audio event classifier using Whisper encoder features.
+    """Audio event classifier using Whisper or WavLM encoder features.
 
     Input: 1-second audio waveform (16kHz, mono)
     Output: Audio event classification + optional vocalization/energy predictions
@@ -93,17 +108,31 @@ class AudioClassifier(nn.Module):
         super().__init__()
         self.config = config
 
-        # Whisper encoder for feature extraction
-        self.encoder = WhisperEncoderFeatures(
-            model_size=config.whisper_model_size,
-            freeze=config.freeze_encoder,
-        )
+        # Build encoder based on encoder_type
+        if config.encoder_type == "wavlm":
+            from synchronai.models.audio.wavlm_encoder import WavLMEncoderFeatures
+            self.encoder = WavLMEncoderFeatures(
+                model_name=config.wavlm_model_name,
+                freeze=config.freeze_encoder,
+            )
+        else:
+            # Default: Whisper encoder
+            self.encoder = WhisperEncoderFeatures(
+                model_size=config.whisper_model_size,
+                freeze=config.freeze_encoder,
+            )
 
         encoder_dim = self.encoder.encoder_dim
 
-        # Shared feature projection
+        # Shared feature projection (deeper with BatchNorm for better gradient flow)
+        proj_mid_dim = max(encoder_dim // 2, 2 * config.hidden_dim)
         self.feature_proj = nn.Sequential(
-            nn.Linear(encoder_dim, config.hidden_dim),
+            nn.Linear(encoder_dim, proj_mid_dim),
+            nn.BatchNorm1d(proj_mid_dim),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(proj_mid_dim, config.hidden_dim),
+            nn.BatchNorm1d(config.hidden_dim),
             nn.ReLU(),
             nn.Dropout(config.dropout),
         )
@@ -123,8 +152,12 @@ class AudioClassifier(nn.Module):
         else:
             self.energy_head = None
 
+        encoder_name = (
+            config.wavlm_model_name if config.encoder_type == "wavlm"
+            else config.whisper_model_size
+        )
         logger.info(
-            f"AudioClassifier: whisper={config.whisper_model_size}, "
+            f"AudioClassifier: encoder={config.encoder_type} ({encoder_name}), "
             f"encoder_dim={encoder_dim}, hidden_dim={config.hidden_dim}, "
             f"num_classes={config.num_event_classes}"
         )
@@ -147,8 +180,10 @@ class AudioClassifier(nn.Module):
             - vocalization_prob: (batch, 1) - vocalization probability (if enabled)
             - energy: (batch, 1) - predicted energy level (if enabled)
         """
-        # Extract Whisper encoder features
-        features = self.encoder.extract_features(audio, pool="mean")
+        # Extract Whisper encoder features (pool only over real content frames)
+        features = self.encoder.extract_features(
+            audio, pool="mean", chunk_duration=self.config.chunk_duration
+        )
 
         # Project features
         hidden = self.feature_proj(features)
@@ -161,6 +196,7 @@ class AudioClassifier(nn.Module):
             "event_logits": event_logits,
             "event_probs": event_probs,
             "features": features,  # Raw encoder features for analysis
+            "hidden_features": hidden,  # Projected features (hidden_dim)
         }
 
         # Vocalization detection
@@ -201,15 +237,25 @@ class AudioClassifier(nn.Module):
             return event_class, confidence.item()
 
     def freeze_encoder(self) -> None:
-        """Freeze Whisper encoder parameters."""
-        for param in self.encoder.parameters():
-            param.requires_grad = False
+        """Freeze encoder parameters.
+
+        For WavLM, delegates to encoder.freeze_encoder() which preserves
+        layer_weights trainability. For Whisper, freezes all parameters.
+        """
+        if hasattr(self.encoder, 'freeze_encoder'):
+            self.encoder.freeze_encoder()
+        else:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
         logger.info("Froze encoder parameters")
 
     def unfreeze_encoder(self) -> None:
-        """Unfreeze Whisper encoder parameters for fine-tuning."""
-        for param in self.encoder.parameters():
-            param.requires_grad = True
+        """Unfreeze encoder parameters for fine-tuning."""
+        if hasattr(self.encoder, 'unfreeze_encoder'):
+            self.encoder.unfreeze_encoder()
+        else:
+            for param in self.encoder.parameters():
+                param.requires_grad = True
         logger.info("Unfroze encoder parameters")
 
     def get_parameter_groups(
@@ -219,6 +265,12 @@ class AudioClassifier(nn.Module):
     ) -> list[dict]:
         """Get parameter groups with different learning rates.
 
+        Only includes parameters that require gradients, so frozen encoder
+        layers don't waste optimizer state or risk accidental updates.
+
+        For WavLM, delegates to encoder.get_parameter_groups() which properly
+        separates WavLM backbone params from always-trainable layer_weights.
+
         Args:
             encoder_lr: Learning rate for encoder (typically lower)
             head_lr: Learning rate for classification heads
@@ -226,11 +278,23 @@ class AudioClassifier(nn.Module):
         Returns:
             List of parameter group dicts for optimizer
         """
-        groups = [
-            {"params": self.encoder.parameters(), "lr": encoder_lr},
-            {"params": self.feature_proj.parameters(), "lr": head_lr},
-            {"params": self.event_head.parameters(), "lr": head_lr},
-        ]
+        groups = []
+
+        # Encoder parameter groups
+        if hasattr(self.encoder, 'get_parameter_groups'):
+            # WavLM encoder: separates backbone from layer_weights
+            groups.extend(self.encoder.get_parameter_groups(encoder_lr, head_lr))
+        else:
+            # Whisper encoder: simple requires_grad filter
+            encoder_params = [
+                p for p in self.encoder.parameters() if p.requires_grad
+            ]
+            if encoder_params:
+                groups.append({"params": encoder_params, "lr": encoder_lr})
+
+        # Head parameter groups (always present)
+        groups.append({"params": self.feature_proj.parameters(), "lr": head_lr})
+        groups.append({"params": self.event_head.parameters(), "lr": head_lr})
 
         if self.vocalization_head is not None:
             groups.append({"params": self.vocalization_head.parameters(), "lr": head_lr})
