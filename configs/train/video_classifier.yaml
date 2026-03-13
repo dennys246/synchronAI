@@ -42,6 +42,9 @@ training:
   scheduler: "cosine"
   warmup_epochs: 2
 
+  # Batch progress tracking
+  batch_plot_interval: 10  # Update batch_progress.png + history.json every N batches (0 = disabled)
+
 # Split configuration
 split:
   val_split: 0.2

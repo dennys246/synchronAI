@@ -13,4 +13,4 @@ source $SYNCHRONAI_DIR/ml-env/bin/activate
 cd $SYNCHRONAI_DIR
 pip install -e .
 
-bash $SYNCHRONAI_DIR/scripts/generative_pretrain.sh --duration-seconds 15
+bash $SYNCHRONAI_DIR/scripts/generative_pretrain.sh --duration-seconds 60

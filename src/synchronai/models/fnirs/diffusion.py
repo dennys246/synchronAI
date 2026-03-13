@@ -227,6 +227,7 @@ class FnirsDiffusionConfig:
 
     # Diffusion schedule
     diffusion_timesteps: int = 1000
+    beta_schedule: str = "cosine"
     beta_start: float = 1e-4
     beta_end: float = 2e-2
 
@@ -249,6 +250,7 @@ class FnirsDiffusionConfig:
             "unet_time_embed_dim": self.unet_time_embed_dim,
             "unet_dropout": self.unet_dropout,
             "diffusion_timesteps": self.diffusion_timesteps,
+            "beta_schedule": self.beta_schedule,
             "beta_start": self.beta_start,
             "beta_end": self.beta_end,
             "weights_path": self.weights_path,
@@ -271,6 +273,7 @@ class FnirsDiffusionConfig:
             unet_time_embed_dim=int(d.get("unet_time_embed_dim", 128)),
             unet_dropout=float(d.get("unet_dropout", 0.0)),
             diffusion_timesteps=int(d.get("diffusion_timesteps", 1000)),
+            beta_schedule=str(d.get("beta_schedule", "cosine")),
             beta_start=float(d.get("beta_start", 1e-4)),
             beta_end=float(d.get("beta_end", 2e-2)),
             weights_path=str(d.get("weights_path", "fnirs_unet.weights.h5")),

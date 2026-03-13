@@ -9,7 +9,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 # Configuration - use absolute paths based on project root
-LABELS_FILE="${PROJECT_ROOT}/data/labels.csv"
+# NOTE: This script expects real audio event labels (not synchrony labels).
+LABELS_FILE="${PROJECT_ROOT}/data/audio_event_labels.csv"
 SAVE_DIR="${PROJECT_ROOT}/runs/audio_classifier"
 WHISPER_MODEL="large-v3"
 

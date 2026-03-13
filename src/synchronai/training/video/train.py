@@ -343,6 +343,7 @@ class TrainingConfig:
     # Early stopping
     patience: int = 10
     monitor: str = "val_auc"
+    auc_thresholds: Optional[int] = 200
 
     # Mixed precision
     use_amp: bool = True
@@ -363,6 +364,9 @@ class TrainingConfig:
     heatmap_video_path: Optional[str] = None  # Path to sample video for heatmap generation
     heatmap_use_gradcam: bool = True  # Generate Grad-CAM spatial heatmaps during training
     heatmap_gradcam_aggregate: str = "max"  # How to aggregate Grad-CAM: max, mean, weighted
+
+    # Batch progress tracking
+    batch_plot_interval: int = 10  # Plot batch progress + save history every N batches (0 = disabled)
 
 
 @dataclass
@@ -589,51 +593,68 @@ def plot_batch_progress(
     return output_path
 
 
-def compute_metrics(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-) -> dict[str, float]:
-    """Compute classification metrics.
+class BinaryMetricTracker:
+    """Track binary classification metrics without storing full logits/labels."""
 
-    Args:
-        logits: Model logits (batch,) or (batch, 1)
-        labels: Ground truth labels (batch,)
+    def __init__(self, device: torch.device, auc_thresholds: Optional[int] = 200) -> None:
+        self.correct = 0
+        self.total = 0
+        self.tp = 0
+        self.fp = 0
+        self.fn = 0
+        self._auc = None
 
-    Returns:
-        Dict with accuracy, precision, recall, f1, auc
-    """
-    logits = logits.squeeze(-1) if logits.dim() > 1 else logits
-    probs = torch.sigmoid(logits)
-    preds = (probs > 0.5).float()
+        try:
+            from torchmetrics.classification import BinaryAUROC
 
-    # Accuracy
-    correct = (preds == labels).float().sum()
-    accuracy = correct / len(labels)
+            if auc_thresholds is None:
+                self._auc = BinaryAUROC().to(device)
+            else:
+                self._auc = BinaryAUROC(thresholds=auc_thresholds).to(device)
+        except Exception:
+            self._auc = None
 
-    # For AUC, we need more sophisticated handling
-    try:
-        from torchmetrics.functional import auroc
+    def update(self, logits: torch.Tensor, labels: torch.Tensor) -> None:
+        logits = logits.squeeze(-1) if logits.dim() > 1 else logits
+        probs = torch.sigmoid(logits.detach())
+        labels_int = labels.detach().long()
+        preds = (probs > 0.5).long()
 
-        auc = auroc(probs, labels.long(), task="binary").item()
-    except Exception:
-        auc = 0.5  # Default if computation fails
+        self.correct += (preds == labels_int).sum().item()
+        self.total += labels_int.numel()
 
-    # Precision, Recall, F1
-    tp = ((preds == 1) & (labels == 1)).float().sum()
-    fp = ((preds == 1) & (labels == 0)).float().sum()
-    fn = ((preds == 0) & (labels == 1)).float().sum()
+        self.tp += ((preds == 1) & (labels_int == 1)).sum().item()
+        self.fp += ((preds == 1) & (labels_int == 0)).sum().item()
+        self.fn += ((preds == 0) & (labels_int == 1)).sum().item()
 
-    precision = tp / (tp + fp + 1e-8)
-    recall = tp / (tp + fn + 1e-8)
-    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+        if self._auc is not None:
+            self._auc.update(probs, labels_int)
 
-    return {
-        "accuracy": accuracy.item(),
-        "precision": precision.item(),
-        "recall": recall.item(),
-        "f1": f1.item(),
-        "auc": auc,
-    }
+    def compute(self) -> dict[str, float]:
+        if self.total == 0:
+            accuracy = 0.0
+        else:
+            accuracy = self.correct / self.total
+
+        precision = self.tp / (self.tp + self.fp + 1e-8)
+        recall = self.tp / (self.tp + self.fn + 1e-8)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+
+        if self._auc is not None:
+            try:
+                auc = float(self._auc.compute().item())
+            except Exception:
+                auc = 0.5
+        else:
+            auc = 0.5
+
+        return {
+            "accuracy": float(accuracy),
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+            "auc": float(auc),
+        }
 
 
 def train_epoch(
@@ -688,13 +709,15 @@ def train_epoch(
     """
     model.train()
     total_loss = 0.0
-    all_logits = []
-    all_labels = []
+    total_correct = 0
+    total_samples = 0
+    num_batches = 0
 
     optimizer.zero_grad()
 
     pbar = tqdm(dataloader, desc="Training", leave=False)
     for batch_idx, batch in enumerate(pbar):
+        num_batches += 1
         frames = batch["frames"].to(device)
         labels = batch["label"].to(device)
 
@@ -713,7 +736,7 @@ def train_epoch(
             frames = lam * frames + (1.0 - lam) * frames[perm]
             labels = lam * labels + (1.0 - lam) * labels[perm]
 
-        with autocast("cuda", enabled=use_amp):
+        with autocast(device.type, enabled=use_amp):
             logits = model(frames)
             logits = logits.squeeze(-1) if logits.dim() > 1 else logits
             loss = criterion(logits, labels)
@@ -739,14 +762,15 @@ def train_epoch(
 
         batch_loss = loss.item() * accumulation_steps
         total_loss += batch_loss
-        all_logits.append(logits.detach().cpu())
-        all_labels.append(original_labels.detach().cpu())
 
         # Compute batch accuracy (use original labels, not smoothed/mixed)
         with torch.no_grad():
             probs = torch.sigmoid(logits)
             preds = (probs > 0.5).long()
-            batch_acc = (preds == original_labels).float().mean().item()
+            batch_correct = (preds == original_labels).float().sum().item()
+            batch_acc = batch_correct / max(1, original_labels.numel())
+            total_correct += batch_correct
+            total_samples += original_labels.numel()
 
         pbar.set_postfix({"loss": f"{batch_loss:.4f}", "acc": f"{batch_acc:.4f}"})
 
@@ -800,13 +824,22 @@ def train_epoch(
                 )
                 model.train()  # Ensure model is back in training mode
 
-    # Compute metrics
-    all_logits = torch.cat(all_logits)
-    all_labels = torch.cat(all_labels)
-    metrics = compute_metrics(all_logits, all_labels)
+    if accumulation_steps > 1 and num_batches % accumulation_steps != 0:
+        if use_amp and scaler is not None:
+            scaler.unscale_(optimizer)
+            if gradient_clip_max_norm > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_max_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            if gradient_clip_max_norm > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_max_norm)
+            optimizer.step()
+        optimizer.zero_grad()
 
     avg_loss = total_loss / len(dataloader)
-    return avg_loss, metrics["accuracy"], global_batch_count
+    accuracy = total_correct / max(1, total_samples)
+    return avg_loss, accuracy, global_batch_count
 
 
 @torch.no_grad()
@@ -816,6 +849,7 @@ def validate(
     criterion: nn.Module,
     device: torch.device,
     use_amp: bool = True,
+    auc_thresholds: Optional[int] = 200,
 ) -> tuple[float, dict[str, float]]:
     """Validate model.
 
@@ -831,28 +865,22 @@ def validate(
     """
     model.eval()
     total_loss = 0.0
-    all_logits = []
-    all_labels = []
+    metrics = BinaryMetricTracker(device=device, auc_thresholds=auc_thresholds)
 
     for batch in tqdm(dataloader, desc="Validating", leave=False):
         frames = batch["frames"].to(device)
         labels = batch["label"].to(device)
 
-        with autocast("cuda", enabled=use_amp):
+        with autocast(device.type, enabled=use_amp):
             logits = model(frames)
             logits = logits.squeeze(-1) if logits.dim() > 1 else logits
             loss = criterion(logits, labels)
 
         total_loss += loss.item()
-        all_logits.append(logits.detach().cpu())
-        all_labels.append(labels.detach().cpu())
-
-    all_logits = torch.cat(all_logits)
-    all_labels = torch.cat(all_labels)
-    metrics = compute_metrics(all_logits, all_labels)
+        metrics.update(logits, labels)
 
     avg_loss = total_loss / len(dataloader)
-    return avg_loss, metrics
+    return avg_loss, metrics.compute()
 
 
 def save_checkpoint(
@@ -940,6 +968,10 @@ def train_video_classifier(
         )
 
     training_config.labels_file = str(labels_file)
+    if training_config.monitor not in {"val_auc", "val_loss"}:
+        raise ValueError(
+            f"Unsupported monitor '{training_config.monitor}'. Use 'val_auc' or 'val_loss'."
+        )
 
     # Set seed
     set_seed(training_config.seed, training_config.deterministic)
@@ -947,6 +979,7 @@ def train_video_classifier(
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
+    use_amp = training_config.use_amp and device.type == "cuda"
 
     # Load data
     logger.info("Loading video index...")
@@ -1038,11 +1071,12 @@ def train_video_classifier(
     history = TrainingHistory()
 
     # Mixed precision scaler
-    scaler = GradScaler("cuda") if training_config.use_amp else None
+    scaler = GradScaler("cuda") if use_amp else None
 
     # Resume from checkpoint if specified
     start_epoch = 0
     resume_stage = 1
+    resume_checkpoint: Optional[dict] = None
     if resume_from:
         checkpoint_path = Path(resume_from)
         if not checkpoint_path.is_absolute():
@@ -1055,6 +1089,7 @@ def train_video_classifier(
                 history = TrainingHistory.from_dict(checkpoint["history"])
             start_epoch = checkpoint.get("epoch", 0) + 1
             resume_stage = checkpoint.get("stage", 1)
+            resume_checkpoint = checkpoint
             logger.info(f"Resumed from epoch {start_epoch}, stage {resume_stage}")
         else:
             logger.warning(f"Checkpoint not found: {checkpoint_path}, starting from scratch")
@@ -1065,6 +1100,13 @@ def train_video_classifier(
         training_config.seed,
         config={"model": asdict(model_config), "training": asdict(training_config)},
     )
+
+    monitor = training_config.monitor
+
+    def _is_improvement(val_loss: float, val_metrics: dict[str, float]) -> bool:
+        if monitor == "val_auc":
+            return val_metrics["auc"] > history.best_val_auc
+        return val_loss < history.best_val_loss
 
     # ========================
     # Stage 1: Head-only training
@@ -1092,7 +1134,7 @@ def train_video_classifier(
             )
             main_scheduler = CosineAnnealingLR(
                 optimizer,
-                T_max=training_config.stage1_epochs - training_config.warmup_epochs,
+                T_max=max(1, training_config.stage1_epochs - training_config.warmup_epochs),
             )
             scheduler = SequentialLR(
                 optimizer,
@@ -1102,13 +1144,21 @@ def train_video_classifier(
         else:
             scheduler = CosineAnnealingLR(optimizer, T_max=training_config.stage1_epochs)
 
+        if resume_checkpoint is not None and resume_stage == 1 and start_epoch > 0:
+            if "optimizer_state_dict" in resume_checkpoint:
+                optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+            if "scheduler_state_dict" in resume_checkpoint:
+                scheduler.load_state_dict(resume_checkpoint["scheduler_state_dict"])
+            if scaler is not None and "scaler_state_dict" in resume_checkpoint:
+                scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
+
         for epoch in range(stage1_start, training_config.stage1_epochs):
             logger.info(f"Epoch {epoch + 1}/{training_config.stage1_epochs} (Stage 1)")
 
             # Train
             train_loss, train_acc, global_batch_count = train_epoch(
                 model, train_loader, criterion, optimizer, scaler, device,
-                training_config.gradient_accumulation_steps, training_config.use_amp,
+                training_config.gradient_accumulation_steps, use_amp,
                 gradient_clip_max_norm=training_config.gradient_clip_max_norm,
                 label_smoothing=label_smoothing,
                 mixup_alpha=training_config.mixup_alpha,
@@ -1121,11 +1171,18 @@ def train_video_classifier(
                 heatmap_gradcam_aggregate=training_config.heatmap_gradcam_aggregate,
                 labels_file=training_config.labels_file,
                 history=history,
-                batch_plot_interval=10,
+                batch_plot_interval=training_config.batch_plot_interval,
             )
 
             # Validate
-            val_loss, val_metrics = validate(model, val_loader, criterion, device, training_config.use_amp)
+            val_loss, val_metrics = validate(
+                model,
+                val_loader,
+                criterion,
+                device,
+                use_amp,
+                auc_thresholds=training_config.auc_thresholds,
+            )
 
             # Update scheduler
             scheduler.step()
@@ -1146,8 +1203,8 @@ def train_video_classifier(
             history.val_aucs.append(val_metrics["auc"])
             history.learning_rates.append(lr)
 
-            # Check for best model (track both AUC and loss)
-            is_best = val_metrics["auc"] > history.best_val_auc
+            # Check for best model (monitor-driven)
+            is_best = _is_improvement(val_loss, val_metrics)
             if is_best:
                 history.best_val_auc = val_metrics["auc"]
                 history.best_val_loss = val_loss
@@ -1162,7 +1219,11 @@ def train_video_classifier(
                         scheduler=scheduler,
                         stage=1,
                     )
-                    logger.info(f"  -> New best model saved (val_auc: {val_metrics['auc']:.4f})")
+                    if monitor == "val_auc":
+                        metric_value = val_metrics["auc"]
+                    else:
+                        metric_value = val_loss
+                    logger.info(f"  -> New best model saved ({monitor}: {metric_value:.4f})")
             else:
                 history.epochs_without_improvement += 1
 
@@ -1229,8 +1290,10 @@ def train_video_classifier(
         )
 
         # Reset scaler
-        if training_config.use_amp:
+        if use_amp:
             scaler = GradScaler("cuda")
+        else:
+            scaler = None
 
         # Scheduler for stage 2 with gentle warmup
         if training_config.stage2_warmup_epochs > 0:
@@ -1241,7 +1304,7 @@ def train_video_classifier(
             )
             main_scheduler = CosineAnnealingLR(
                 optimizer,
-                T_max=stage2_epochs - training_config.stage2_warmup_epochs,
+                T_max=max(1, stage2_epochs - training_config.stage2_warmup_epochs),
             )
             scheduler = SequentialLR(
                 optimizer,
@@ -1251,6 +1314,16 @@ def train_video_classifier(
         else:
             scheduler = CosineAnnealingLR(optimizer, T_max=stage2_epochs)
 
+        if resume_checkpoint is not None and resume_stage == 2 and start_epoch > training_config.stage1_epochs:
+            if "optimizer_state_dict" in resume_checkpoint:
+                optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+            if "scheduler_state_dict" in resume_checkpoint:
+                scheduler.load_state_dict(resume_checkpoint["scheduler_state_dict"])
+            if scaler is not None and "scaler_state_dict" in resume_checkpoint:
+                scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
+
+        history.epochs_without_improvement = 0
+
         for epoch in range(stage2_start, stage2_epochs):
             global_epoch = training_config.stage1_epochs + epoch
             logger.info(f"Epoch {global_epoch + 1}/{training_config.epochs} (Stage 2)")
@@ -1258,7 +1331,7 @@ def train_video_classifier(
             # Train
             train_loss, train_acc, global_batch_count = train_epoch(
                 model, train_loader, criterion, optimizer, scaler, device,
-                training_config.gradient_accumulation_steps, training_config.use_amp,
+                training_config.gradient_accumulation_steps, use_amp,
                 gradient_clip_max_norm=training_config.gradient_clip_max_norm,
                 label_smoothing=label_smoothing,
                 mixup_alpha=training_config.mixup_alpha,
@@ -1271,11 +1344,18 @@ def train_video_classifier(
                 heatmap_gradcam_aggregate=training_config.heatmap_gradcam_aggregate,
                 labels_file=training_config.labels_file,
                 history=history,
-                batch_plot_interval=10,
+                batch_plot_interval=training_config.batch_plot_interval,
             )
 
             # Validate
-            val_loss, val_metrics = validate(model, val_loader, criterion, device, training_config.use_amp)
+            val_loss, val_metrics = validate(
+                model,
+                val_loader,
+                criterion,
+                device,
+                use_amp,
+                auc_thresholds=training_config.auc_thresholds,
+            )
 
             # Update scheduler
             scheduler.step()
@@ -1296,8 +1376,8 @@ def train_video_classifier(
             history.val_aucs.append(val_metrics["auc"])
             history.learning_rates.append(lr)
 
-            # Check for best model (track both AUC and loss)
-            is_best = val_metrics["auc"] > history.best_val_auc
+            # Check for best model (monitor-driven)
+            is_best = _is_improvement(val_loss, val_metrics)
             if is_best:
                 history.best_val_auc = val_metrics["auc"]
                 history.best_val_loss = val_loss
@@ -1312,7 +1392,11 @@ def train_video_classifier(
                         scheduler=scheduler,
                         stage=2,
                     )
-                    logger.info(f"  -> New best model saved (val_auc: {val_metrics['auc']:.4f})")
+                    if monitor == "val_auc":
+                        metric_value = val_metrics["auc"]
+                    else:
+                        metric_value = val_loss
+                    logger.info(f"  -> New best model saved ({monitor}: {metric_value:.4f})")
             else:
                 history.epochs_without_improvement += 1
 

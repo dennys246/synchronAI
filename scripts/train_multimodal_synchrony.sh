@@ -57,7 +57,7 @@ VIDEO_TEMPORAL_AGG="lstm"
 AUDIO_MODEL="large-v3"
 
 # Fusion configuration
-FUSION_TYPE="cross_attention"  # concat, cross_attention, gated
+FUSION_TYPE="concat"  # concat (default), cross_attention (no-op with single tokens), gated
 
 # =============================================================================
 # Training Configuration
@@ -75,8 +75,8 @@ AUDIO_ENCODER_LR=1e-5  # Stage 2
 FUSION_HEAD_LR=5e-5  # Stage 2
 
 # Multi-task loss weights
-SYNC_LOSS_WEIGHT=0.6  # Primary task
-EVENT_LOSS_WEIGHT=0.4  # Auxiliary task
+SYNC_LOSS_WEIGHT=1.0  # Primary task
+EVENT_LOSS_WEIGHT=0.0  # Auxiliary task (requires real event labels)
 
 # Heatmap visualization (optional, helpful for debugging)
 HEATMAP_EPOCH_INTERVAL=0  # Generate every N epochs (0 = disabled, e.g., 5 = every 5 epochs)

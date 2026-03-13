@@ -12,10 +12,13 @@ DEFAULT_SEGMENTS_PER_RECORDING=4
 DEFAULT_UNET_BASE_WIDTH=64
 DEFAULT_UNET_DEPTH=3
 DEFAULT_UNET_TIME_EMBED_DIM=128
+DEFAULT_UNET_DROPOUT=0.15
 DEFAULT_MAX_RECORDINGS=0
 DEFAULT_RECORDINGS_PER_BATCH=4
 DEFAULT_DISABLE_NUMBA=0
-DEFAULT_DURATION_SECONDS=120.0
+DEFAULT_DURATION_SECONDS=60.0
+DEFAULT_VAL_FRACTION=0.2
+DEFAULT_LR_SCHEDULE=cosine_restarts
 
 EPOCHS="$DEFAULT_EPOCHS"
 LR="$DEFAULT_LR"
@@ -24,11 +27,14 @@ SEGMENTS_PER_RECORDING="$DEFAULT_SEGMENTS_PER_RECORDING"
 UNET_BASE_WIDTH="$DEFAULT_UNET_BASE_WIDTH"
 UNET_DEPTH="$DEFAULT_UNET_DEPTH"
 UNET_TIME_EMBED_DIM="$DEFAULT_UNET_TIME_EMBED_DIM"
+UNET_DROPOUT="$DEFAULT_UNET_DROPOUT"
 MAX_RECORDINGS="$DEFAULT_MAX_RECORDINGS"
 RECORDINGS_PER_BATCH="$DEFAULT_RECORDINGS_PER_BATCH"
 VERBOSEE=0
 DISABLE_NUMBA="$DEFAULT_DISABLE_NUMBA"
 DURATION_SECONDS="$DEFAULT_DURATION_SECONDS"
+VAL_FRACTION="$DEFAULT_VAL_FRACTION"
+LR_SCHEDULE="$DEFAULT_LR_SCHEDULE"
 SAVE_ROOT="${SYNCHRONAI_DIR:-$(dirname "$(dirname "$(realpath "$0")")")}/runs/fnirs_diffusion"
 
 usage() {
@@ -84,6 +90,21 @@ while [[ $# -gt 0 ]]; do
     --duration-seconds)
       require_arg "$1" "${2:-}"
       DURATION_SECONDS="$2"
+      shift 2
+      ;;
+    --lr-schedule)
+      require_arg "$1" "${2:-}"
+      LR_SCHEDULE="$2"
+      shift 2
+      ;;
+    --save-dir)
+      require_arg "$1" "${2:-}"
+      SAVE_ROOT="$2"
+      shift 2
+      ;;
+    --unet-base-width)
+      require_arg "$1" "${2:-}"
+      UNET_BASE_WIDTH="$2"
       shift 2
       ;;
     -h|--help)
@@ -145,11 +166,14 @@ CMD=(
   --unet-base-width "$UNET_BASE_WIDTH"
   --unet-depth "$UNET_DEPTH"
   --unet-time-embed-dim "$UNET_TIME_EMBED_DIM"
+  --unet-dropout "$UNET_DROPOUT"
   --epochs "$EPOCHS"
   --learning-rate "$LR"
   --max-recordings "$MAX_RECORDINGS"
   --recordings-per-batch "$RECORDINGS_PER_BATCH"
   --duration-seconds "$DURATION_SECONDS"
+  --val-fraction "$VAL_FRACTION"
+  --lr-schedule "$LR_SCHEDULE"
 )
 if [[ "$VERBOSEE" -eq 1 ]]; then
   CMD+=(--verbosee)

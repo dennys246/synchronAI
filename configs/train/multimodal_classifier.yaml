@@ -59,8 +59,8 @@ training:
   warmup_epochs: 2  # Stage 1 warmup
 
   # Multi-task loss weights
-  sync_loss_weight: 0.6  # Primary task (synchrony prediction)
-  event_loss_weight: 0.4  # Auxiliary task (audio event classification)
+  sync_loss_weight: 1.0  # Primary task (synchrony prediction)
+  event_loss_weight: 0.0  # Auxiliary task (requires real event labels)
 
   # Early stopping
   early_stopping_patience: 15
