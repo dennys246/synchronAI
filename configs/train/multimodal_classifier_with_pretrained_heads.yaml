@@ -62,8 +62,8 @@ training:
   warmup_epochs: 2
 
   # Multi-task loss weights
-  sync_loss_weight: 0.6
-  event_loss_weight: 0.4
+  sync_loss_weight: 1.0
+  event_loss_weight: 0.0
 
   # Early stopping
   early_stopping_patience: 15

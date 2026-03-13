@@ -259,6 +259,17 @@ class VideoWindowDataset(Dataset):
             backend=config.video_backend,
         )
 
+        # Cache video durations for jitter bounds (avoid reading past end)
+        self._video_durations: dict[str, float] = {}
+        unique_paths = sorted({s.video_path for s in specs})
+        for path in unique_paths:
+            try:
+                info = load_video_info(path)
+                self._video_durations[path] = info.duration
+            except Exception as e:
+                logger.warning(f"Failed to get duration for {path}: {e}")
+                self._video_durations[path] = float("inf")
+
         # Compute class weights for balanced sampling
         labels = [s.label for s in specs]
         unique_labels = sorted(set(labels))
@@ -282,7 +293,9 @@ class VideoWindowDataset(Dataset):
             temporal_offset = random.uniform(-max_offset, max_offset)
             # Clamp to valid range: can't go before time 0 or past video end
             min_offset = -spec.second  # don't go before start of video
-            temporal_offset = max(min_offset, temporal_offset)
+            duration = self._video_durations.get(spec.video_path, float("inf"))
+            max_forward = max(0.0, duration - (spec.second + spec.window_seconds))
+            temporal_offset = max(min_offset, min(max_forward, temporal_offset))
 
         # Get reader from pool
         reader = self.reader_pool.get_reader(spec.video_path)

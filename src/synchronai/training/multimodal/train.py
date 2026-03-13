@@ -77,6 +77,7 @@ class MultiModalTrainingConfig:
 
     # Early stopping
     early_stopping_patience: int = 15
+    auc_thresholds: Optional[int] = 200
 
     # Reproducibility
     seed: int = 42
@@ -152,42 +153,68 @@ class TrainingHistory:
         return cls(**data)
 
 
-def compute_metrics(
-    sync_logits: torch.Tensor,
-    sync_labels: torch.Tensor,
-) -> Dict[str, float]:
-    """Compute classification metrics for synchrony prediction."""
-    sync_logits = sync_logits.squeeze(-1) if sync_logits.dim() > 1 else sync_logits
-    probs = torch.sigmoid(sync_logits)
-    preds = (probs > 0.5).float()
+class BinaryMetricTracker:
+    """Track binary classification metrics without storing full logits/labels."""
 
-    # Accuracy
-    correct = (preds == sync_labels).float().sum()
-    accuracy = correct / len(sync_labels)
+    def __init__(self, device: torch.device, auc_thresholds: Optional[int] = 200) -> None:
+        self.correct = 0
+        self.total = 0
+        self.tp = 0
+        self.fp = 0
+        self.fn = 0
+        self._auc = None
 
-    # AUC
-    try:
-        from torchmetrics.functional import auroc
-        auc = auroc(probs, sync_labels.long(), task="binary").item()
-    except Exception:
-        auc = 0.5
+        try:
+            from torchmetrics.classification import BinaryAUROC
 
-    # Precision, Recall, F1
-    tp = ((preds == 1) & (sync_labels == 1)).float().sum()
-    fp = ((preds == 1) & (sync_labels == 0)).float().sum()
-    fn = ((preds == 0) & (sync_labels == 1)).float().sum()
+            if auc_thresholds is None:
+                self._auc = BinaryAUROC().to(device)
+            else:
+                self._auc = BinaryAUROC(thresholds=auc_thresholds).to(device)
+        except Exception:
+            self._auc = None
 
-    precision = tp / (tp + fp + 1e-8)
-    recall = tp / (tp + fn + 1e-8)
-    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    def update(self, logits: torch.Tensor, labels: torch.Tensor) -> None:
+        logits = logits.squeeze(-1) if logits.dim() > 1 else logits
+        probs = torch.sigmoid(logits.detach())
+        labels_int = labels.detach().long()
+        preds = (probs > 0.5).long()
 
-    return {
-        "accuracy": accuracy.item(),
-        "precision": precision.item(),
-        "recall": recall.item(),
-        "f1": f1.item(),
-        "auc": auc
-    }
+        self.correct += (preds == labels_int).sum().item()
+        self.total += labels_int.numel()
+
+        self.tp += ((preds == 1) & (labels_int == 1)).sum().item()
+        self.fp += ((preds == 1) & (labels_int == 0)).sum().item()
+        self.fn += ((preds == 0) & (labels_int == 1)).sum().item()
+
+        if self._auc is not None:
+            self._auc.update(probs, labels_int)
+
+    def compute(self) -> Dict[str, float]:
+        if self.total == 0:
+            accuracy = 0.0
+        else:
+            accuracy = self.correct / self.total
+
+        precision = self.tp / (self.tp + self.fp + 1e-8)
+        recall = self.tp / (self.tp + self.fn + 1e-8)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+
+        if self._auc is not None:
+            try:
+                auc = float(self._auc.compute().item())
+            except Exception:
+                auc = 0.5
+        else:
+            auc = 0.5
+
+        return {
+            "accuracy": float(accuracy),
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+            "auc": float(auc),
+        }
 
 
 def train_epoch(
@@ -197,7 +224,7 @@ def train_epoch(
     scaler: Optional[GradScaler],
     device: torch.device,
     sync_criterion: nn.Module,
-    event_criterion: nn.Module,
+    event_criterion: Optional[nn.Module],
     sync_weight: float,
     event_weight: float,
     use_amp: bool = True,
@@ -210,8 +237,10 @@ def train_epoch(
     total_loss = 0.0
     total_sync_loss = 0.0
     total_event_loss = 0.0
-    all_sync_logits = []
-    all_sync_labels = []
+    total_correct = 0
+    total_samples = 0
+
+    use_event = event_weight > 0 and event_criterion is not None
 
     pbar = tqdm(dataloader, desc="Training", leave=False)
 
@@ -219,7 +248,8 @@ def train_epoch(
         video_frames = batch['video_frames'].to(device)
         audio_chunks = batch['audio_chunk'].to(device)
         sync_labels = batch['sync_label'].to(device).float()
-        event_labels = batch['event_label'].to(device).long()
+        original_sync_labels = sync_labels
+        event_labels = batch['event_label'].to(device).long() if use_event else None
 
         # Apply label smoothing to sync labels
         if label_smoothing > 0:
@@ -228,16 +258,16 @@ def train_epoch(
         optimizer.zero_grad()
 
         # Forward pass with AMP
-        with autocast("cuda", enabled=use_amp):
+        with autocast(device.type, enabled=use_amp):
             outputs = model(video_frames, audio_chunks)
 
             sync_logits = outputs['sync_logits']
             sync_logits = sync_logits.squeeze(-1) if sync_logits.dim() > 1 else sync_logits
-            event_logits = outputs['event_logits']
+            event_logits = outputs['event_logits'] if use_event else None
 
             # Multi-task loss
             sync_loss = sync_criterion(sync_logits, sync_labels)
-            if event_weight > 0:
+            if use_event:
                 event_loss = event_criterion(event_logits, event_labels)
                 loss = sync_weight * sync_loss + event_weight * event_loss
             else:
@@ -263,8 +293,12 @@ def train_epoch(
         total_sync_loss += sync_loss.item()
         total_event_loss += event_loss.item()
 
-        all_sync_logits.append(sync_logits.detach().cpu())
-        all_sync_labels.append(batch['sync_label'].cpu())
+        with torch.no_grad():
+            probs = torch.sigmoid(sync_logits.detach())
+            preds = (probs > 0.5).float()
+            batch_correct = (preds == original_sync_labels).float().sum().item()
+            total_correct += batch_correct
+            total_samples += original_sync_labels.numel()
 
         pbar.set_postfix({
             'loss': f"{loss.item():.4f}",
@@ -272,14 +306,13 @@ def train_epoch(
             'event': f"{event_loss.item():.4f}"
         })
 
-    # Compute epoch metrics
-    all_sync_logits = torch.cat(all_sync_logits)
-    all_sync_labels = torch.cat(all_sync_labels)
-
-    metrics = compute_metrics(all_sync_logits, all_sync_labels)
-    metrics['loss'] = total_loss / len(dataloader)
-    metrics['sync_loss'] = total_sync_loss / len(dataloader)
-    metrics['event_loss'] = total_event_loss / len(dataloader)
+    accuracy = total_correct / max(1, total_samples)
+    metrics = {
+        "accuracy": float(accuracy),
+        "loss": total_loss / len(dataloader),
+        "sync_loss": total_sync_loss / len(dataloader),
+        "event_loss": total_event_loss / len(dataloader),
+    }
 
     return metrics
 
@@ -290,10 +323,11 @@ def validate_epoch(
     dataloader: torch.utils.data.DataLoader,
     device: torch.device,
     sync_criterion: nn.Module,
-    event_criterion: nn.Module,
+    event_criterion: Optional[nn.Module],
     sync_weight: float,
     event_weight: float,
     use_amp: bool = True,
+    auc_thresholds: Optional[int] = 200,
 ) -> Dict[str, float]:
     """Validate for one epoch."""
     model.eval()
@@ -301,8 +335,9 @@ def validate_epoch(
     total_loss = 0.0
     total_sync_loss = 0.0
     total_event_loss = 0.0
-    all_sync_logits = []
-    all_sync_labels = []
+    metrics_tracker = BinaryMetricTracker(device=device, auc_thresholds=auc_thresholds)
+
+    use_event = event_weight > 0 and event_criterion is not None
 
     pbar = tqdm(dataloader, desc="Validation", leave=False)
 
@@ -310,17 +345,17 @@ def validate_epoch(
         video_frames = batch['video_frames'].to(device)
         audio_chunks = batch['audio_chunk'].to(device)
         sync_labels = batch['sync_label'].to(device).float()
-        event_labels = batch['event_label'].to(device).long()
+        event_labels = batch['event_label'].to(device).long() if use_event else None
 
-        with autocast("cuda", enabled=use_amp):
+        with autocast(device.type, enabled=use_amp):
             outputs = model(video_frames, audio_chunks)
 
             sync_logits = outputs['sync_logits']
             sync_logits = sync_logits.squeeze(-1) if sync_logits.dim() > 1 else sync_logits
-            event_logits = outputs['event_logits']
+            event_logits = outputs['event_logits'] if use_event else None
 
             sync_loss = sync_criterion(sync_logits, sync_labels)
-            if event_weight > 0:
+            if use_event:
                 event_loss = event_criterion(event_logits, event_labels)
                 loss = sync_weight * sync_loss + event_weight * event_loss
             else:
@@ -331,16 +366,11 @@ def validate_epoch(
         total_sync_loss += sync_loss.item()
         total_event_loss += event_loss.item()
 
-        all_sync_logits.append(sync_logits.detach().cpu())
-        all_sync_labels.append(sync_labels.detach().cpu())
+        metrics_tracker.update(sync_logits, sync_labels)
 
         pbar.set_postfix({'loss': f"{loss.item():.4f}"})
 
-    # Compute metrics
-    all_sync_logits = torch.cat(all_sync_logits)
-    all_sync_labels = torch.cat(all_sync_labels)
-
-    metrics = compute_metrics(all_sync_logits, all_sync_labels)
+    metrics = metrics_tracker.compute()
     metrics['loss'] = total_loss / len(dataloader)
     metrics['sync_loss'] = total_sync_loss / len(dataloader)
     metrics['event_loss'] = total_event_loss / len(dataloader)
@@ -382,6 +412,7 @@ def train_multimodal_classifier(
     # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
+    use_amp = training_config.use_amp and device.type == "cuda"
 
     # Create dataset configs
     video_data_config = VideoDatasetConfig(
@@ -461,12 +492,15 @@ def train_multimodal_classifier(
 
     # Create model
     logger.info("Building multi-modal model...")
+    use_audio_auxiliary = training_config.event_loss_weight > 0
+    if not use_audio_auxiliary:
+        logger.info("Audio event auxiliary task disabled (event_loss_weight=0)")
     model = MultiModalSynchronyModel(
         video_config=video_config,
         audio_config=audio_config,
         fusion_config=fusion_config,
         num_classes=1,
-        use_audio_auxiliary=True
+        use_audio_auxiliary=use_audio_auxiliary
     )
 
     # Load pretrained weights if specified
@@ -507,17 +541,19 @@ def train_multimodal_classifier(
         pos_weight=torch.tensor([sync_pos_weight], device=device)
     )
 
-    event_class_weights = train_dataset.get_class_weights_events()
-    event_criterion = nn.CrossEntropyLoss(weight=event_class_weights.to(device))
+    event_criterion = None
+    if use_audio_auxiliary:
+        event_class_weights = train_dataset.get_class_weights_events()
+        event_criterion = nn.CrossEntropyLoss(weight=event_class_weights.to(device))
+        logger.info(f"Event class weights: {event_class_weights.tolist()}")
 
     logger.info(f"Sync pos_weight: {sync_pos_weight:.3f}")
-    logger.info(f"Event class weights: {event_class_weights.tolist()}")
 
     # Training history
     history = TrainingHistory()
 
     # Mixed precision scaler
-    scaler = GradScaler("cuda") if training_config.use_amp else None
+    scaler = GradScaler("cuda") if use_amp else None
 
     # Log config
     log_reproducibility_info(
@@ -564,7 +600,7 @@ def train_multimodal_classifier(
         )
         main_scheduler = CosineAnnealingLR(
             optimizer,
-            T_max=training_config.stage1_epochs - training_config.warmup_epochs
+            T_max=max(1, training_config.stage1_epochs - training_config.warmup_epochs)
         )
         scheduler = SequentialLR(
             optimizer,
@@ -584,7 +620,7 @@ def train_multimodal_classifier(
             sync_criterion, event_criterion,
             training_config.sync_loss_weight,
             training_config.event_loss_weight,
-            training_config.use_amp,
+            use_amp,
             training_config.gradient_clip_max_norm,
             training_config.label_smoothing
         )
@@ -595,7 +631,8 @@ def train_multimodal_classifier(
             sync_criterion, event_criterion,
             training_config.sync_loss_weight,
             training_config.event_loss_weight,
-            training_config.use_amp
+            use_amp,
+            auc_thresholds=training_config.auc_thresholds,
         )
 
         # Update history
@@ -674,7 +711,7 @@ def train_multimodal_classifier(
         )
         main_scheduler = CosineAnnealingLR(
             optimizer,
-            T_max=stage2_epochs - training_config.stage2_warmup_epochs
+            T_max=max(1, stage2_epochs - training_config.stage2_warmup_epochs)
         )
         scheduler = SequentialLR(
             optimizer,
@@ -696,7 +733,7 @@ def train_multimodal_classifier(
             sync_criterion, event_criterion,
             training_config.sync_loss_weight,
             training_config.event_loss_weight,
-            training_config.use_amp,
+            use_amp,
             training_config.gradient_clip_max_norm,
             training_config.label_smoothing
         )
@@ -707,7 +744,8 @@ def train_multimodal_classifier(
             sync_criterion, event_criterion,
             training_config.sync_loss_weight,
             training_config.event_loss_weight,
-            training_config.use_amp
+            use_amp,
+            auc_thresholds=training_config.auc_thresholds,
         )
 
         # Update history

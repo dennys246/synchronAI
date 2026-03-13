@@ -343,29 +343,29 @@ def _run_epoch(
             audio = batch["audio"].to(device)
             label = batch["label"].to(device)
 
-            # Apply label smoothing for training
-            # Convert hard labels to soft: mix with uniform distribution
-            if is_training and label_smoothing > 0:
-                num_classes = criterion.weight.shape[0] if criterion.weight is not None else 7
-                smooth_label = torch.zeros(label.size(0), num_classes, device=device)
-                smooth_label.fill_(label_smoothing / (num_classes - 1))
-                smooth_label.scatter_(1, label.unsqueeze(1), 1.0 - label_smoothing)
-
             if is_training:
                 optimizer.zero_grad()
 
             with torch.amp.autocast("cuda", enabled=use_amp):
                 outputs = model(audio)
+                logits = outputs["event_logits"]
                 if is_training and label_smoothing > 0:
+                    num_classes = logits.shape[-1]
+                    if num_classes < 2:
+                        raise ValueError("Label smoothing requires at least 2 classes.")
+                    # Convert hard labels to soft: mix with uniform distribution
+                    smooth_label = torch.zeros(label.size(0), num_classes, device=device)
+                    smooth_label.fill_(label_smoothing / (num_classes - 1))
+                    smooth_label.scatter_(1, label.unsqueeze(1), 1.0 - label_smoothing)
                     # Manual cross-entropy with soft labels
-                    log_probs = F.log_softmax(outputs["event_logits"], dim=-1)
+                    log_probs = F.log_softmax(logits, dim=-1)
                     loss = -(smooth_label * log_probs).sum(dim=-1).mean()
                     if criterion.weight is not None:
                         # Apply class weights to soft-label loss
                         weight_per_sample = criterion.weight[label]
                         loss = (-(smooth_label * log_probs).sum(dim=-1) * weight_per_sample).mean()
                 else:
-                    loss = criterion(outputs["event_logits"], label)
+                    loss = criterion(logits, label)
 
             if is_training:
                 if scaler is not None:
@@ -461,6 +461,14 @@ def train_audio_classifier(
     # Log class distribution
     class_dist = dataset.get_class_distribution()
     logger.info(f"Class distribution: {class_dist}")
+    unique_labels = sorted(class_dist.keys())
+    if unique_labels and max(unique_labels) <= 1 and len(model_config.event_classes) > 2:
+        raise ValueError(
+            "Audio labels appear to be binary (0/1), but event_classes has "
+            f"{len(model_config.event_classes)} classes. This would train the "
+            "7-class event head on synchrony labels. Provide real event labels "
+            "or switch to a binary audio synchrony head instead."
+        )
 
     # Build model
     model = build_audio_classifier(model_config)
@@ -480,12 +488,16 @@ def train_audio_classifier(
 
     # Resume from checkpoint
     start_epoch = 0
+    resume_checkpoint: Optional[dict] = None
+    resume_stage = 1
     if resume_from:
         checkpoint = torch.load(resume_from, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
         if "history" in checkpoint:
             history = TrainingHistory.from_dict(checkpoint["history"])
         start_epoch = checkpoint.get("epoch", 0) + 1
+        resume_stage = checkpoint.get("stage", 1)
+        resume_checkpoint = checkpoint
         logger.info(f"Resumed from checkpoint at epoch {start_epoch}")
 
     # Save configs
@@ -530,6 +542,14 @@ def train_audio_classifier(
         schedulers=[warmup_scheduler, cosine_scheduler],
         milestones=[training_config.warmup_epochs],
     )
+
+    if resume_checkpoint is not None and resume_stage == 1 and start_epoch > 0:
+        if "optimizer_state_dict" in resume_checkpoint:
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+        if "scheduler_state_dict" in resume_checkpoint:
+            scheduler.load_state_dict(resume_checkpoint["scheduler_state_dict"])
+        if scaler is not None and "scaler_state_dict" in resume_checkpoint:
+            scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
 
     stage1_start = min(start_epoch, training_config.stage1_epochs)
     for epoch in range(stage1_start, training_config.stage1_epochs):
@@ -580,7 +600,7 @@ def train_audio_classifier(
             early_stop_counter += 1
 
         # Save latest checkpoint
-        torch.save({
+        checkpoint = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
@@ -588,12 +608,16 @@ def train_audio_classifier(
             "history": history.to_dict(),
             "config": asdict(model_config),
             "stage": 1,
-        }, save_dir / "latest.pt")
+        }
+        if scaler is not None:
+            checkpoint["scaler_state_dict"] = scaler.state_dict()
+        torch.save(checkpoint, save_dir / "latest.pt")
         history.save(save_dir / "history.json")
 
     # ========== Stage 2: End-to-end fine-tuning (encoder unfrozen) ==========
     stage2_epochs = training_config.epochs - training_config.stage1_epochs
     if stage2_epochs > 0:
+        early_stop_counter = 0
         logger.info(f"Stage 2: Fine-tuning encoder + head for {stage2_epochs} epochs")
         model.unfreeze_encoder()
 
@@ -637,6 +661,14 @@ def train_audio_classifier(
             scheduler = CosineAnnealingLR(
                 optimizer, T_max=stage2_epochs, eta_min=training_config.min_lr,
             )
+
+        if resume_checkpoint is not None and resume_stage == 2 and start_epoch > training_config.stage1_epochs:
+            if "optimizer_state_dict" in resume_checkpoint:
+                optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+            if "scheduler_state_dict" in resume_checkpoint:
+                scheduler.load_state_dict(resume_checkpoint["scheduler_state_dict"])
+            if scaler is not None and "scaler_state_dict" in resume_checkpoint:
+                scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
 
         stage2_start = max(0, start_epoch - training_config.stage1_epochs)
         for epoch in range(stage2_start, stage2_epochs):
@@ -688,7 +720,7 @@ def train_audio_classifier(
 
             # Save periodic checkpoint
             if (global_epoch + 1) % training_config.save_every == 0:
-                torch.save({
+                checkpoint = {
                     "epoch": global_epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
@@ -696,10 +728,13 @@ def train_audio_classifier(
                     "history": history.to_dict(),
                     "config": asdict(model_config),
                     "stage": 2,
-                }, save_dir / f"checkpoint_epoch_{global_epoch + 1}.pt")
+                }
+                if scaler is not None:
+                    checkpoint["scaler_state_dict"] = scaler.state_dict()
+                torch.save(checkpoint, save_dir / f"checkpoint_epoch_{global_epoch + 1}.pt")
 
             # Save latest checkpoint
-            torch.save({
+            checkpoint = {
                 "epoch": global_epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -707,7 +742,10 @@ def train_audio_classifier(
                 "history": history.to_dict(),
                 "config": asdict(model_config),
                 "stage": 2,
-            }, save_dir / "latest.pt")
+            }
+            if scaler is not None:
+                checkpoint["scaler_state_dict"] = scaler.state_dict()
+            torch.save(checkpoint, save_dir / "latest.pt")
             history.save(save_dir / "history.json")
 
             # Early stopping
