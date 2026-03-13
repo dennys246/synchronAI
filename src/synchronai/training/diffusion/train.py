@@ -49,6 +49,13 @@ class TrainingHistory:
         self.best_loss: float = float("inf")
         self.best_epoch: int = 0
         self.last_loss: float = float("inf")
+        # Validation metrics
+        self.val_losses: List[float] = []
+        self.val_accuracies: List[float] = []  # R² as percentage (0–100)
+        self.val_epoch_indices: List[int] = []
+        self.val_batch_indices: List[int] = []  # global batch idx when val was run
+        self.best_val_loss: float = float("inf")
+        self.best_val_epoch: int = 0
 
     def add_batch_loss(self, loss: float, recordings_in_batch: int = 0) -> None:
         """Record loss for a single batch."""
@@ -68,6 +75,16 @@ class TrainingHistory:
             self.best_loss = loss
             self.best_epoch = epoch
 
+    def add_val_metrics(self, val_loss: float, val_accuracy: float, epoch: int, batch_idx: int) -> None:
+        """Record validation loss and accuracy for an epoch."""
+        self.val_losses.append(float(val_loss))
+        self.val_accuracies.append(float(val_accuracy))
+        self.val_epoch_indices.append(epoch)
+        self.val_batch_indices.append(batch_idx)
+        if float(val_loss) < self.best_val_loss:
+            self.best_val_loss = float(val_loss)
+            self.best_val_epoch = epoch
+
     def save(self, path: str) -> None:
         """Save training history to a JSON file."""
         data = {
@@ -82,6 +99,12 @@ class TrainingHistory:
             "best_loss": self.best_loss if self.best_loss != float("inf") else None,
             "best_epoch": self.best_epoch,
             "last_loss": self.last_loss if self.last_loss != float("inf") else None,
+            "val_losses": self.val_losses,
+            "val_accuracies": self.val_accuracies,
+            "val_epoch_indices": self.val_epoch_indices,
+            "val_batch_indices": self.val_batch_indices,
+            "best_val_loss": self.best_val_loss if self.best_val_loss != float("inf") else None,
+            "best_val_epoch": self.best_val_epoch,
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
@@ -107,6 +130,14 @@ class TrainingHistory:
             history.best_epoch = data.get("best_epoch", 0)
             last_loss = data.get("last_loss")
             history.last_loss = last_loss if last_loss is not None else float("inf")
+            # Validation metrics (backwards compatible)
+            history.val_losses = data.get("val_losses", [])
+            history.val_accuracies = data.get("val_accuracies", [])
+            history.val_epoch_indices = data.get("val_epoch_indices", [])
+            history.val_batch_indices = data.get("val_batch_indices", [])
+            best_val_loss = data.get("best_val_loss")
+            history.best_val_loss = best_val_loss if best_val_loss is not None else float("inf")
+            history.best_val_epoch = data.get("best_val_epoch", 0)
             # Backwards compatibility: compute from epoch_losses if not saved
             if history.best_loss == float("inf") and history.epoch_losses:
                 history.best_loss = min(history.epoch_losses)
@@ -125,80 +156,75 @@ class TrainingHistory:
             f"Total batches: {self._global_batch}",
             f"Total recordings: {self._total_recordings}",
         ]
+        if self.val_losses:
+            lines += [
+                f"Last val loss: {self.val_losses[-1]:.6f}",
+                f"Last val accuracy: {self.val_accuracies[-1]:.1f}%",
+                f"Best val loss: {self.best_val_loss:.6f} (epoch {self.best_val_epoch})",
+            ]
         return " | ".join(lines)
 
     def plot(self, save_path: str, title: str = "Training Loss") -> None:
         """
-        Plot training loss history and save to PNG.
+        Plot training history and save to PNG.
 
-        Creates a figure with:
-        - Batch-level loss (light line)
-        - Smoothed loss (moving average, darker line)
-        - Epoch markers if available
+        Two-panel figure:
+        - Top: Train loss (batch, smoothed) + val loss per epoch on same axes
+        - Bottom: Val accuracy (R², %) per epoch with 70% target reference line
         """
         if not self.batch_losses:
             return
 
         fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
 
-        # Top plot: Loss vs Batch
+        # --- Top panel: train loss + val loss ---
         ax1 = axes[0]
         batches = np.array(self.batch_indices)
         losses = np.array(self.batch_losses)
 
-        # Plot raw batch losses (semi-transparent)
-        ax1.plot(batches, losses, alpha=0.3, color='blue', linewidth=0.5, label='Batch Loss')
+        ax1.plot(batches, losses, alpha=0.25, color='steelblue', linewidth=0.5, label='Train (batch)')
 
-        # Plot smoothed loss (moving average)
         if len(losses) > 10:
             window_size = min(50, len(losses) // 5)
             if window_size > 1:
-                smoothed = np.convolve(losses, np.ones(window_size)/window_size, mode='valid')
-                smoothed_x = batches[window_size-1:]
-                ax1.plot(smoothed_x, smoothed, color='blue', linewidth=1.5, label=f'Smoothed (window={window_size})')
+                smoothed = np.convolve(losses, np.ones(window_size) / window_size, mode='valid')
+                smoothed_x = batches[window_size - 1:]
+                ax1.plot(smoothed_x, smoothed, color='steelblue', linewidth=2.0,
+                         label=f'Train (smoothed, w={window_size})')
 
-        # Mark epoch boundaries if we have epoch data
-        if self.epoch_indices and len(self.epoch_indices) > 1:
-            for i, epoch in enumerate(self.epoch_indices[:-1]):
-                # Find approximate batch index for this epoch
-                if i < len(self.batch_indices):
-                    ax1.axvline(x=self.batch_indices[min(i * (len(self.batch_indices) // len(self.epoch_indices)), len(self.batch_indices)-1)],
-                               color='red', alpha=0.3, linestyle='--', linewidth=0.5)
+        if self.val_losses and self.val_batch_indices:
+            ax1.plot(self.val_batch_indices, self.val_losses, 'o--',
+                     color='darkorange', linewidth=1.5, markersize=6, label='Val loss')
 
         ax1.set_xlabel('Batch')
         ax1.set_ylabel('Loss (MSE)')
-        ax1.set_title(f'{title} - Batch Loss')
+        ax1.set_title(f'{title} — Loss')
         ax1.legend(loc='upper right')
         ax1.grid(True, alpha=0.3)
-        ax1.set_yscale('log')  # Log scale often better for loss
+        ax1.set_yscale('log')
 
-        # Bottom plot: Loss vs Recordings Processed
+        # --- Bottom panel: val accuracy (%) vs epoch ---
         ax2 = axes[1]
-        if self.recordings_processed and len(self.recordings_processed) == len(losses):
-            recordings = np.array(self.recordings_processed)
-            ax2.plot(recordings, losses, alpha=0.3, color='green', linewidth=0.5, label='Batch Loss')
-
-            # Smoothed version
-            if len(losses) > 10:
-                window_size = min(50, len(losses) // 5)
-                if window_size > 1:
-                    smoothed = np.convolve(losses, np.ones(window_size)/window_size, mode='valid')
-                    smoothed_recordings = recordings[window_size-1:]
-                    ax2.plot(smoothed_recordings, smoothed, color='green', linewidth=1.5, label=f'Smoothed (window={window_size})')
-
-            ax2.set_xlabel('Recordings Processed')
-            ax2.set_ylabel('Loss (MSE)')
-            ax2.set_title(f'{title} - Loss vs Data Seen')
-            ax2.legend(loc='upper right')
+        if self.val_accuracies and self.val_epoch_indices:
+            ax2.plot(self.val_epoch_indices, self.val_accuracies, 'o-',
+                     color='darkorange', linewidth=2.0, markersize=6, label='Val accuracy')
+            ax2.axhline(y=70.0, color='forestgreen', linestyle='--', linewidth=1.5,
+                        alpha=0.8, label='Target (70%)')
+            ax2.set_ylim(0, 105)
+            ax2.set_xlabel('Epoch')
+            ax2.set_ylabel('Accuracy (%)')
+            ax2.set_title(f'{title} — Val Accuracy (R²)')
+            ax2.legend(loc='lower right')
             ax2.grid(True, alpha=0.3)
-            ax2.set_yscale('log')
         else:
-            # Fallback: just show epoch losses if available
+            # Fallback: epoch train losses when no val data available
             if self.epoch_losses:
-                ax2.plot(self.epoch_indices, self.epoch_losses, 'o-', color='purple', linewidth=2, markersize=6)
+                ax2.plot(self.epoch_indices, self.epoch_losses, 'o-',
+                         color='steelblue', linewidth=2, markersize=6, label='Train (epoch avg)')
                 ax2.set_xlabel('Epoch')
                 ax2.set_ylabel('Loss (MSE)')
-                ax2.set_title(f'{title} - Epoch Loss')
+                ax2.set_title(f'{title} — Epoch Loss')
+                ax2.legend(loc='upper right')
                 ax2.grid(True, alpha=0.3)
                 ax2.set_yscale('log')
 
@@ -512,19 +538,19 @@ def train_fnirs_diffusion(
     *,
     data_dir: str,
     save_dir: str,
-    duration_seconds: float = 120.0,
+    duration_seconds: float = 60.0,
     target_sfreq_hz: Optional[float] = None,
-    segments_per_recording: int = 8,
+    segments_per_recording: int = 4,
     max_recordings: Optional[int] = None,
     recordings_per_batch: int = 4,
     diffusion_timesteps: int = 1000,
     beta_schedule: str = "cosine",
     beta_start: float = 1e-4,
     beta_end: float = 2e-2,
-    unet_base_width: int = 64,
+    unet_base_width: int = 32,
     unet_depth: int = 3,
     unet_time_embed_dim: int = 128,
-    unet_dropout: float = 0.0,
+    unet_dropout: float = 0.15,
     batch_size: int = 8,
     epochs: int = 10,
     learning_rate: float = 1e-4,
@@ -532,6 +558,10 @@ def train_fnirs_diffusion(
     deconvolution: bool = False,
     signal_type: str = "hemodynamic",
     config_filename: str = "fnirs_diffusion_config.json",
+    val_fraction: float = 0.2,
+    stats_mode: str = "frozen",
+    save_every_batches: int = 0,
+    lr_schedule: str = "constant",
 ) -> FnirsDiffusionConfig:
     """
     Train a diffusion model on fNIRS windows and save weights + config.
@@ -541,11 +571,18 @@ def train_fnirs_diffusion(
         max_recordings: Total number of recordings to process (None for unlimited)
         recordings_per_batch: Number of recordings to load into memory at once
         signal_type: Type of signal to train on - 'hemodynamic' (HbO/HbR) or 'neural' (deconvolved)
+        stats_mode: "frozen" (precompute stats) or "streaming" (update during training)
+        save_every_batches: Save checkpoints every N recording batches (0 = per-epoch only)
     """
     logger = get_logger(__name__)
     trace("train_fnirs_diffusion: start")
     save_root = Path(save_dir)
     save_root.mkdir(parents=True, exist_ok=True)
+    stats_mode = stats_mode.lower()
+    if stats_mode not in {"frozen", "streaming"}:
+        raise ValueError(f"stats_mode must be 'frozen' or 'streaming', got: {stats_mode}")
+    if save_every_batches < 0:
+        raise ValueError("save_every_batches must be >= 0")
 
     # Initialize lazy discovery
     discovery = LazyFnirsDiscovery(
@@ -554,31 +591,34 @@ def train_fnirs_diffusion(
         signal_type=signal_type
     )
 
-    # Get initial batch for immediate training start
-    initial_paths = discovery.get_paths(max_recordings=recordings_per_batch)
+    # Discover all recordings upfront so we can make a stable train/val split
+    logger.info("Discovering all recordings for train/val split...")
+    all_discovered = discovery.get_paths(max_recordings=max_recordings)
+    if not all_discovered:
+        raise RuntimeError(f"No fNIRS recordings found in: {data_dir}")
 
-    # Determine total_recordings:
-    # - If max_recordings specified, that's our target
-    # - If unlimited (None), we'll discover as we go and update dynamically
-    if max_recordings is not None:
-        total_recordings = max_recordings
+    if val_fraction > 0.0:
+        n_val = max(1, int(len(all_discovered) * val_fraction))
+        rng_split = np.random.default_rng(seed)
+        perm = rng_split.permutation(len(all_discovered)).tolist()
+        val_paths = [all_discovered[i] for i in perm[:n_val]]
+        train_paths = [all_discovered[i] for i in perm[n_val:]]
         logger.info(
-            "Training with batch loading: target_recordings=%d, recordings_per_batch=%d (load at once), epochs=%d",
-            total_recordings,
-            recordings_per_batch,
-            epochs,
+            "Val split (fraction=%.2f): %d train recordings, %d val recordings",
+            val_fraction, len(train_paths), len(val_paths),
         )
     else:
-        # Unlimited mode: keep discovering during training
-        # We'll update total_recordings as we discover more
-        total_recordings = len(initial_paths)  # Start with what we have
-        logger.info(
-            "Training with dynamic discovery: starting with %d recordings, recordings_per_batch=%d (load at once), epochs=%d",
-            total_recordings,
-            recordings_per_batch,
-            epochs,
-        )
-        logger.info("Will continue discovering and training on new recordings as found...")
+        train_paths = list(all_discovered)
+        val_paths = []
+        logger.info("No validation split (val_fraction=0)")
+
+    total_recordings = len(train_paths)
+    initial_paths = train_paths[:recordings_per_batch]
+
+    logger.info(
+        "Training with batch loading: train_recordings=%d, recordings_per_batch=%d, epochs=%d",
+        total_recordings, recordings_per_batch, epochs,
+    )
 
     # Load first batch to initialize config and model
     trace("train_fnirs_diffusion: loading initial training windows")
@@ -633,10 +673,45 @@ def train_fnirs_diffusion(
         running_stats = RunningStats(feature_dim)
         logger.info("Initialized new running stats for %d features", feature_dim)
 
-    # Update running stats with initial batch (using raw windows)
-    running_stats.update_batch(training.windows)
-    running_stats.save(running_stats_path)
-    logger.info("Updated running stats with initial batch: n=%d samples, saving to %s", running_stats.n, running_stats_path)
+    if stats_mode == "frozen":
+        if running_stats.n == 0:
+            logger.info("Computing running stats over training set (frozen mode)...")
+            running_stats.update_batch(training.windows)
+            remaining_paths = train_paths[initial_batch_size:]
+            for start in range(0, len(remaining_paths), recordings_per_batch):
+                batch_paths = remaining_paths[start:start + recordings_per_batch]
+                batch_training = load_training_windows(
+                    batch_paths,
+                    duration_seconds=duration_seconds,
+                    target_sfreq_hz=target_sfreq_hz,
+                    segments_per_recording=segments_per_recording,
+                    seed=seed + start,
+                    deconvolution=deconvolution,
+                    max_recordings=None,
+                    normalize=False,
+                )
+                running_stats.update_batch(batch_training.windows)
+                if start == 0 or (start // recordings_per_batch) % 10 == 0:
+                    logger.info(
+                        "Stats pass: processed %d/%d recordings",
+                        min(initial_batch_size + start + recordings_per_batch, len(train_paths)),
+                        len(train_paths),
+                    )
+            running_stats.save(running_stats_path)
+            logger.info("Saved frozen running stats (n=%d) to %s", running_stats.n, running_stats_path)
+        else:
+            logger.info("Using existing running stats (frozen mode)")
+    else:
+        if running_stats.n == 0:
+            running_stats.update_batch(training.windows)
+            running_stats.save(running_stats_path)
+            logger.info(
+                "Updated running stats with initial batch: n=%d samples, saving to %s",
+                running_stats.n,
+                running_stats_path,
+            )
+        else:
+            logger.info("Using existing running stats (streaming mode)")
 
     # Now normalize the initial windows using running stats
     windows_normalized = standardize_with_stats(
@@ -661,6 +736,7 @@ def train_fnirs_diffusion(
         unet_time_embed_dim=unet_time_embed_dim,
         unet_dropout=unet_dropout,
         diffusion_timesteps=diffusion_timesteps,
+        beta_schedule=beta_schedule,
         beta_start=beta_start,
         beta_end=beta_end,
         weights_path=os.path.basename(weights_path),
@@ -688,7 +764,31 @@ def train_fnirs_diffusion(
         time_embed_dim=unet_time_embed_dim,
         dropout=unet_dropout,
     )
-    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    # Learning rate schedule
+    if lr_schedule == "cosine_restarts":
+        # Estimate steps per epoch: ~(total_recordings / recordings_per_batch) * (segments * batch_ratio)
+        # Use a conservative estimate; the restart period auto-adjusts via t_mul
+        estimated_steps_per_epoch = max(
+            50,
+            (total_recordings // recordings_per_batch) * segments_per_recording * 2,
+        )
+        lr_sched = tf.keras.optimizers.schedules.CosineDecayRestarts(
+            initial_learning_rate=learning_rate,
+            first_decay_steps=estimated_steps_per_epoch,
+            t_mul=2.0,       # Double the period after each restart
+            m_mul=0.9,       # Reduce peak LR by 10% after each restart
+            alpha=1e-6,      # Minimum LR floor
+        )
+        logger.info(
+            "Using cosine decay with warm restarts: first_decay_steps=%d, t_mul=2.0, m_mul=0.9",
+            estimated_steps_per_epoch,
+        )
+    elif lr_schedule == "constant":
+        lr_sched = learning_rate
+        logger.info("Using constant learning rate: %s", learning_rate)
+    else:
+        raise ValueError(f"Unknown lr_schedule: {lr_schedule}. Use 'constant' or 'cosine_restarts'.")
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_sched)
 
     # Build once so model variables exist before loading/saving.
     _ = model([tf.zeros((1, model_len, feature_dim)), tf.zeros((1,), dtype=tf.int32)])
@@ -715,6 +815,22 @@ def train_fnirs_diffusion(
         grads = tape.gradient(loss, model.trainable_variables)
         optimizer.apply_gradients(zip(grads, model.trainable_variables))
         return loss
+
+    @tf.function
+    def val_step(x0: tf.Tensor):
+        """Compute val loss and R² accuracy (no gradient update)."""
+        batch = tf.shape(x0)[0]
+        t = tf.random.uniform((batch,), 0, schedule.timesteps, dtype=tf.int32)
+        noise = tf.random.normal(tf.shape(x0))
+        sqrt_ab = tf.gather(schedule.sqrt_alpha_bars, t)[:, None, None]
+        sqrt_1mab = tf.gather(schedule.sqrt_one_minus_alpha_bars, t)[:, None, None]
+        x_t = sqrt_ab * x0 + sqrt_1mab * noise
+        pred = model([x_t, t], training=False)
+        loss = tf.reduce_mean(tf.square(noise - pred))
+        # R²: ss_tot ≈ 1.0 for standard-normal noise; clamp accuracy to [0, 100]
+        ss_tot = tf.reduce_mean(tf.square(noise - tf.reduce_mean(noise)))
+        accuracy = tf.clip_by_value((1.0 - loss / (ss_tot + 1e-8)) * 100.0, 0.0, 100.0)
+        return loss, accuracy
 
     # Create generated samples directory
     generated_dir = save_root / "generated"
@@ -753,27 +869,19 @@ def train_fnirs_diffusion(
         epoch_count += 1
         loss_metric = tf.keras.metrics.Mean()
 
-        # Start with already discovered paths (don't trigger full discovery)
-        all_paths = discovery.get_paths(max_recordings=len(discovery.cached_paths) if max_recordings is None else max_recordings)
+        # Use the fixed train split for every epoch
+        all_paths = train_paths
 
         # Cycle through all recordings in batches
         recording_idx = 0
-        batch_count = 0
+        recording_batch_count = 0
 
         while recording_idx < len(all_paths):
             # Determine batch of recordings to load
             batch_end = min(recording_idx + recordings_per_batch, len(all_paths))
 
-            # Trigger discovery of more paths ahead of time if we're getting close to the end
-            if not discovery.discovery_complete and recording_idx + recordings_per_batch * 2 >= len(all_paths):
-                # We're getting close to the end, try to discover more
-                # Only discover a bit more (current + 10 batches)
-                target_count = len(all_paths) + (recordings_per_batch * 10)
-                all_paths = discovery.get_paths(max_recordings=target_count if max_recordings is None else max_recordings)
-                if max_recordings is None:
-                    total_recordings = len(all_paths)
-
             batch_paths = all_paths[recording_idx:batch_end]
+            recording_batch_count += 1
 
             logger.info(
                 "Epoch %d/%s - Loading recordings %d-%d/%d...",
@@ -798,8 +906,9 @@ def train_fnirs_diffusion(
                     normalize=False,  # Don't normalize - we'll use running stats
                 )
 
-                # Update running statistics with this batch
-                running_stats.update_batch(batch_training.windows)
+                # Update running statistics with this batch (streaming mode only)
+                if stats_mode == "streaming":
+                    running_stats.update_batch(batch_training.windows)
 
                 # Normalize using current running stats
                 batch_windows_normalized = standardize_with_stats(
@@ -819,10 +928,11 @@ def train_fnirs_diffusion(
                 dataset = dataset.batch(batch_size, drop_remainder=False).prefetch(tf.data.AUTOTUNE)
 
                 # Train on this batch
+                batch_loss_metric = tf.keras.metrics.Mean()
                 for batch_data in dataset:
                     loss = train_step(batch_data)
                     loss_metric.update_state(loss)
-                    batch_count += 1
+                    batch_loss_metric.update_state(loss)
 
                 logger.info(
                     "Epoch %d/%s - Completed recordings %d-%d/%d - running loss=%.6f",
@@ -834,55 +944,77 @@ def train_fnirs_diffusion(
                     loss_metric.result(),
                 )
 
-                # Save model weights after each batch
-                model.save_weights(weights_path)
-                logger.info("Saved weights after batch: %s", weights_path)
-
-                # Save running stats and update config with latest normalization parameters
-                running_stats.save(running_stats_path)
-                config = FnirsDiffusionConfig(
-                    duration_seconds=config.duration_seconds,
-                    sfreq_hz=config.sfreq_hz,
-                    target_len=config.target_len,
-                    model_len=config.model_len,
-                    pair_names=config.pair_names,
-                    hb_types=config.hb_types,
-                    feature_dim=config.feature_dim,
-                    feature_mean=running_stats.get_mean().tolist(),
-                    feature_std=running_stats.std.tolist(),
-                    unet_base_width=config.unet_base_width,
-                    unet_depth=config.unet_depth,
-                    unet_time_embed_dim=config.unet_time_embed_dim,
-                    unet_dropout=config.unet_dropout,
-                    diffusion_timesteps=config.diffusion_timesteps,
-                    beta_start=config.beta_start,
-                    beta_end=config.beta_end,
-                    weights_path=config.weights_path,
+                # Record loss in training history (per recording batch)
+                history.add_batch_loss(
+                    float(batch_loss_metric.result()),
+                    recordings_in_batch=batch_end - recording_idx,
                 )
-                _save_json(config_path, config.to_dict())
-                logger.info("Saved running stats (n=%d) and updated config", running_stats.n)
 
-                # Record loss in training history
-                history.add_batch_loss(float(loss_metric.result()), recordings_in_batch=batch_end - recording_idx)
-                history.save(history_path)
-                history.plot(loss_plot_path, title="fNIRS Diffusion Training")
-                logger.info("Updated training history and loss plot")
+                should_save_batch = save_every_batches > 0 and (
+                    recording_batch_count % save_every_batches == 0
+                )
 
-                # Generate and save a checkpoint sample after each batch for progress monitoring
-                try:
-                    sample = _generate_sample(model, schedule, config, n_samples=1, seed=seed + epoch * 10000 + recording_idx)
-                    plot_path = str(generated_dir / f"epoch_{epoch:04d}_batch_{recording_idx:05d}_sample.png")
-                    plot_hemoglobin_signal(
-                        sample[0],
+                if should_save_batch:
+                    # Save model weights after batch checkpoints
+                    model.save_weights(weights_path)
+                    logger.info("Saved weights after batch: %s", weights_path)
+
+                    # Save running stats and update config with latest normalization parameters
+                    if stats_mode == "streaming":
+                        running_stats.save(running_stats_path)
+                    config = FnirsDiffusionConfig(
+                        duration_seconds=config.duration_seconds,
                         sfreq_hz=config.sfreq_hz,
+                        target_len=config.target_len,
+                        model_len=config.model_len,
                         pair_names=config.pair_names,
                         hb_types=config.hb_types,
-                        title=f"Generated fNIRS (Epoch {epoch}/{epochs_display}, Rec {recording_idx+1}-{batch_end}/{total_recordings})",
-                        save_path=plot_path,
+                        feature_dim=config.feature_dim,
+                        feature_mean=running_stats.get_mean().tolist(),
+                        feature_std=running_stats.std.tolist(),
+                        unet_base_width=config.unet_base_width,
+                        unet_depth=config.unet_depth,
+                        unet_time_embed_dim=config.unet_time_embed_dim,
+                        unet_dropout=config.unet_dropout,
+                        diffusion_timesteps=config.diffusion_timesteps,
+                        beta_schedule=config.beta_schedule,
+                        beta_start=config.beta_start,
+                        beta_end=config.beta_end,
+                        weights_path=config.weights_path,
                     )
-                    logger.info("Saved checkpoint sample: %s", plot_path)
-                except Exception as sample_err:
-                    logger.warning(f"Failed to generate checkpoint sample: {sample_err}")
+                    _save_json(config_path, config.to_dict())
+                    logger.info("Saved running stats (n=%d) and updated config", running_stats.n)
+
+                    history.save(history_path)
+                    history.plot(loss_plot_path, title="fNIRS Diffusion Training")
+                    logger.info("Updated training history and loss plot")
+
+                    # Generate and save a checkpoint sample after each batch for progress monitoring
+                    try:
+                        sample = _generate_sample(
+                            model,
+                            schedule,
+                            config,
+                            n_samples=1,
+                            seed=seed + epoch * 10000 + recording_idx,
+                        )
+                        plot_path = str(
+                            generated_dir / f"epoch_{epoch:04d}_batch_{recording_idx:05d}_sample.png"
+                        )
+                        plot_hemoglobin_signal(
+                            sample[0],
+                            sfreq_hz=config.sfreq_hz,
+                            pair_names=config.pair_names,
+                            hb_types=config.hb_types,
+                            title=(
+                                f"Generated fNIRS (Epoch {epoch}/{epochs_display}, "
+                                f"Rec {recording_idx+1}-{batch_end}/{total_recordings})"
+                            ),
+                            save_path=plot_path,
+                        )
+                        logger.info("Saved checkpoint sample: %s", plot_path)
+                    except Exception as sample_err:
+                        logger.warning(f"Failed to generate checkpoint sample: {sample_err}")
 
             except Exception as e:
                 logger.warning(f"Error loading recordings {recording_idx}-{batch_end}: {e}")
@@ -890,12 +1022,78 @@ def train_fnirs_diffusion(
             recording_idx = batch_end
 
         model.save_weights(weights_path)
+        if stats_mode == "streaming":
+            running_stats.save(running_stats_path)
+        config = FnirsDiffusionConfig(
+            duration_seconds=config.duration_seconds,
+            sfreq_hz=config.sfreq_hz,
+            target_len=config.target_len,
+            model_len=config.model_len,
+            pair_names=config.pair_names,
+            hb_types=config.hb_types,
+            feature_dim=config.feature_dim,
+            feature_mean=running_stats.get_mean().tolist(),
+            feature_std=running_stats.std.tolist(),
+            unet_base_width=config.unet_base_width,
+            unet_depth=config.unet_depth,
+            unet_time_embed_dim=config.unet_time_embed_dim,
+            unet_dropout=config.unet_dropout,
+            diffusion_timesteps=config.diffusion_timesteps,
+            beta_schedule=config.beta_schedule,
+            beta_start=config.beta_start,
+            beta_end=config.beta_end,
+            weights_path=config.weights_path,
+        )
+        _save_json(config_path, config.to_dict())
         epoch_loss = float(loss_metric.result())
         is_best = epoch_loss < history.best_loss
         logger.info("Epoch %d/%s - loss=%.6f%s - saved weights: %s",
                     epoch, epochs_display, epoch_loss,
                     " (NEW BEST)" if is_best else f" (best: {history.best_loss:.6f} @ epoch {history.best_epoch})",
                     weights_path)
+
+        # Validation evaluation
+        if val_paths:
+            val_loss_metric = tf.keras.metrics.Mean()
+            val_acc_metric = tf.keras.metrics.Mean()
+            try:
+                for vstart in range(0, len(val_paths), recordings_per_batch):
+                    vbatch_paths = val_paths[vstart:vstart + recordings_per_batch]
+                    val_batch = load_training_windows(
+                        vbatch_paths,
+                        duration_seconds=duration_seconds,
+                        target_sfreq_hz=target_sfreq_hz,
+                        segments_per_recording=segments_per_recording,
+                        seed=seed + epoch,
+                        deconvolution=deconvolution,
+                        max_recordings=None,
+                        normalize=False,
+                    )
+                    val_windows_norm = standardize_with_stats(
+                        val_batch.windows,
+                        running_stats.get_mean(),
+                        running_stats.std,
+                    )
+                    val_windows_padded = _pad_time(val_windows_norm, model_len)
+                    val_dataset = (
+                        tf.data.Dataset.from_tensor_slices(val_windows_padded)
+                        .batch(batch_size, drop_remainder=False)
+                        .prefetch(tf.data.AUTOTUNE)
+                    )
+                    for val_data in val_dataset:
+                        v_loss, v_acc = val_step(val_data)
+                        val_loss_metric.update_state(v_loss)
+                        val_acc_metric.update_state(v_acc)
+
+                val_loss_epoch = float(val_loss_metric.result())
+                val_acc_epoch = float(val_acc_metric.result())
+                history.add_val_metrics(val_loss_epoch, val_acc_epoch, epoch, history._global_batch)
+                logger.info(
+                    "Epoch %d/%s — val_loss=%.6f, val_accuracy=%.1f%%",
+                    epoch, epochs_display, val_loss_epoch, val_acc_epoch,
+                )
+            except Exception as val_err:
+                logger.warning("Val evaluation failed at epoch %d: %s", epoch, val_err)
 
         # Record epoch loss in training history and update current epoch for resume support
         history.add_epoch_loss(epoch_loss, epoch)
