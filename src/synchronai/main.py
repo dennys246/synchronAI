@@ -157,6 +157,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Generate heatmaps every N batches during training (0 = disabled).",
     )
     parser.add_argument(
+        "--batch-plot-interval",
+        type=int,
+        default=10,
+        help="Update batch_progress.png and history.json every N batches (0 = disabled).",
+    )
+    parser.add_argument(
         "--heatmap-video",
         help="Path to sample video for heatmap generation during training.",
     )
@@ -217,9 +223,9 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # ========================
     parser.add_argument("--xla", action="store_true", help="Enable XLA JIT in TensorFlow.")
     parser.add_argument("--data-dir", help="BIDS root or a single fNIRS recording path.")
-    parser.add_argument("--duration-seconds", type=float, default=120.0)
+    parser.add_argument("--duration-seconds", type=float, default=60.0)
     parser.add_argument("--sfreq-hz", type=float, default=None, help="Optionally resample to a fixed Hz.")
-    parser.add_argument("--segments-per-recording", type=int, default=8)
+    parser.add_argument("--segments-per-recording", type=int, default=4)
     parser.add_argument("--max-recordings", type=int, default=0)
     parser.add_argument("--recordings-per-batch", type=int, default=4)
     parser.add_argument("--deconvolution", action="store_true")
@@ -228,10 +234,14 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--beta-schedule", default="cosine", choices=["linear", "cosine"])
     parser.add_argument("--beta-start", type=float, default=1e-4)
     parser.add_argument("--beta-end", type=float, default=2e-2)
-    parser.add_argument("--unet-base-width", type=int, default=64)
+    parser.add_argument("--unet-base-width", type=int, default=32)
     parser.add_argument("--unet-depth", type=int, default=3)
     parser.add_argument("--unet-time-embed-dim", type=int, default=128)
-    parser.add_argument("--unet-dropout", type=float, default=0.0)
+    parser.add_argument("--unet-dropout", type=float, default=0.15)
+    parser.add_argument("--val-fraction", type=float, default=0.2,
+                        help="Fraction of recordings held out for validation (0 to disable).")
+    parser.add_argument("--lr-schedule", default="constant", choices=["constant", "cosine_restarts"],
+                        help="LR schedule: constant or cosine decay with warm restarts.")
     parser.add_argument("--n-samples", type=int, default=1)
     parser.add_argument("--config-path", default=None)
     parser.add_argument("--out-path", default=None)
@@ -431,6 +441,7 @@ def _run_video_training(args: argparse.Namespace) -> None:
         heatmap_video_path=args.heatmap_video,
         heatmap_use_gradcam=getattr(args, "heatmap_use_gradcam", True) and not getattr(args, "no_heatmap_gradcam", False),
         heatmap_gradcam_aggregate=getattr(args, "heatmap_gradcam_aggregate", "max"),
+        batch_plot_interval=args.batch_plot_interval,
     )
 
     data_config = VideoDatasetConfig(
@@ -570,6 +581,8 @@ def _run_fnirs_training(args: argparse.Namespace) -> None:
         seed=args.seed,
         deconvolution=args.deconvolution,
         signal_type=args.signal_type,
+        val_fraction=args.val_fraction,
+        lr_schedule=args.lr_schedule,
     )
 
 
