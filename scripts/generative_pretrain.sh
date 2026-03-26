@@ -19,6 +19,7 @@ DEFAULT_DISABLE_NUMBA=0
 DEFAULT_DURATION_SECONDS=60.0
 DEFAULT_VAL_FRACTION=0.2
 DEFAULT_LR_SCHEDULE=cosine_restarts
+DEFAULT_EVAL_GEN_EVERY=10
 
 EPOCHS="$DEFAULT_EPOCHS"
 LR="$DEFAULT_LR"
@@ -35,6 +36,7 @@ DISABLE_NUMBA="$DEFAULT_DISABLE_NUMBA"
 DURATION_SECONDS="$DEFAULT_DURATION_SECONDS"
 VAL_FRACTION="$DEFAULT_VAL_FRACTION"
 LR_SCHEDULE="$DEFAULT_LR_SCHEDULE"
+EVAL_GEN_EVERY="$DEFAULT_EVAL_GEN_EVERY"
 SAVE_ROOT="${SYNCHRONAI_DIR:-$(dirname "$(dirname "$(realpath "$0")")")}/runs/fnirs_diffusion"
 
 usage() {
@@ -107,6 +109,11 @@ while [[ $# -gt 0 ]]; do
       UNET_BASE_WIDTH="$2"
       shift 2
       ;;
+    --eval-gen-every)
+      require_arg "$1" "${2:-}"
+      EVAL_GEN_EVERY="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -174,6 +181,7 @@ CMD=(
   --duration-seconds "$DURATION_SECONDS"
   --val-fraction "$VAL_FRACTION"
   --lr-schedule "$LR_SCHEDULE"
+  --eval-gen-every "$EVAL_GEN_EVERY"
 )
 if [[ "$VERBOSEE" -eq 1 ]]; then
   CMD+=(--verbosee)

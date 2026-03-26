@@ -242,6 +242,8 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="Fraction of recordings held out for validation (0 to disable).")
     parser.add_argument("--lr-schedule", default="constant", choices=["constant", "cosine_restarts"],
                         help="LR schedule: constant or cosine decay with warm restarts.")
+    parser.add_argument("--eval-gen-every", type=int, default=10,
+                        help="Compute FID/MMD generative metrics every N epochs (0 to disable).")
     parser.add_argument("--n-samples", type=int, default=1)
     parser.add_argument("--config-path", default=None)
     parser.add_argument("--out-path", default=None)
@@ -583,6 +585,7 @@ def _run_fnirs_training(args: argparse.Namespace) -> None:
         signal_type=args.signal_type,
         val_fraction=args.val_fraction,
         lr_schedule=args.lr_schedule,
+        eval_gen_every=args.eval_gen_every,
     )
 
 
