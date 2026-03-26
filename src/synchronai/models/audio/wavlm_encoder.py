@@ -298,11 +298,48 @@ class WavLMEncoderFeatures(nn.Module):
         elif pool == "last":
             features = features[:, content_frames - 1, :]
         elif pool == "none":
-            pass  # Keep full sequence
+            features = features[:, :content_frames, :]
         else:
             raise ValueError(f"Unknown pooling strategy: {pool}")
 
         return features
+
+    def extract_all_layers(
+        self,
+        audio: Union[np.ndarray, torch.Tensor],
+        chunk_duration: float = 1.0,
+    ) -> torch.Tensor:
+        """Extract per-layer hidden states without blending.
+
+        Saves all transformer layer outputs separately so downstream training
+        can learn which layers matter. Useful for sweeps where the layer
+        weighting itself is a hyperparameter.
+
+        Args:
+            audio: Audio waveform, shape (batch, n_samples) or (n_samples,)
+            chunk_duration: Duration of audio content in seconds
+
+        Returns:
+            (batch, num_layers+1, n_content_frames, encoder_dim) tensor
+        """
+        self._load_model()
+
+        if isinstance(audio, np.ndarray):
+            audio = torch.from_numpy(audio).float()
+        if audio.ndim == 1:
+            audio = audio.unsqueeze(0)
+        audio = audio.to(self._device)
+
+        with torch.no_grad():
+            outputs = self.wavlm(audio, output_hidden_states=True)
+            # (num_layers+1, batch, T, D)
+            hidden_states = torch.stack(outputs.hidden_states)
+
+        total_frames = hidden_states.shape[2]
+        content_frames = max(1, min(total_frames, int(50 * chunk_duration)))
+        # Trim and transpose to (batch, num_layers+1, content_frames, D)
+        hidden_states = hidden_states[:, :, :content_frames, :]
+        return hidden_states.permute(1, 0, 2, 3)
 
     def forward(
         self,

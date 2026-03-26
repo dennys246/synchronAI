@@ -310,16 +310,20 @@ def load_audio(
 ) -> np.ndarray:
     """Load entire audio file as numpy array.
 
+    Handles both audio files (WAV, FLAC, etc.) and video files (MP4, MOV,
+    etc.) by extracting audio via ffmpeg when soundfile/wave can't read
+    the format directly.
+
     Args:
-        audio_path: Path to audio file
-        sample_rate: Expected sample rate
+        audio_path: Path to audio or video file
+        sample_rate: Target sample rate
 
     Returns:
         Audio samples as float32 array normalized to [-1, 1]
     """
     audio_path = Path(audio_path)
 
-    # Try soundfile first (handles many formats)
+    # Try soundfile first (handles WAV, FLAC, OGG, etc.)
     try:
         import soundfile as sf
 
@@ -329,6 +333,8 @@ def load_audio(
         return audio
     except ImportError:
         pass
+    except Exception:
+        pass  # soundfile can't read this format, try fallbacks
 
     # Fallback to wave module for WAV files
     if audio_path.suffix.lower() == ".wav":
@@ -337,7 +343,30 @@ def load_audio(
             audio = np.frombuffer(frames, dtype=np.int16)
             return audio.astype(np.float32) / 32768.0
 
-    raise RuntimeError(f"Could not load audio: {audio_path}")
+    # Fallback: extract audio from video/other format via ffmpeg to a
+    # cached WAV, then load the WAV.  This handles MP4, MOV, AVI, etc.
+    if _check_ffmpeg():
+        cache_dir = get_audio_cache_dir()
+        # Deterministic cache filename based on source path
+        import hashlib
+        path_hash = hashlib.md5(str(audio_path.resolve()).encode()).hexdigest()[:16]
+        cached_wav = cache_dir / f"{audio_path.stem}_{path_hash}.wav"
+
+        if not cached_wav.exists():
+            logger.info(f"Extracting audio from video: {audio_path.name}")
+            extract_audio(audio_path, cached_wav, sample_rate=sample_rate)
+
+        # Now load the cached WAV
+        with wave.open(str(cached_wav), "rb") as wf:
+            frames = wf.readframes(wf.getnframes())
+            audio = np.frombuffer(frames, dtype=np.int16)
+            return audio.astype(np.float32) / 32768.0
+
+    raise RuntimeError(
+        f"Could not load audio from {audio_path}. "
+        f"Install soundfile (pip install soundfile) for audio files, "
+        f"or ffmpeg for video files."
+    )
 
 
 def load_audio_chunk(
@@ -346,13 +375,17 @@ def load_audio_chunk(
     duration: float = 1.0,
     sample_rate: int = 16000,
 ) -> np.ndarray:
-    """Load a specific chunk of audio.
+    """Load a specific chunk of audio from an audio or video file.
+
+    For audio files, uses soundfile for efficient seeking. For video files
+    (MP4, MOV, etc.), extracts audio via ffmpeg to a cached WAV first,
+    then reads the chunk.
 
     Args:
-        audio_path: Path to audio file
+        audio_path: Path to audio or video file
         start_sec: Start time in seconds
         duration: Duration in seconds
-        sample_rate: Expected sample rate
+        sample_rate: Target sample rate
 
     Returns:
         Audio chunk as float32 array, shape (n_samples,)
@@ -361,7 +394,7 @@ def load_audio_chunk(
     start_sample = int(start_sec * sample_rate)
     n_samples = int(duration * sample_rate)
 
-    # Try soundfile first
+    # Try soundfile first (efficient random access for WAV/FLAC/OGG)
     try:
         import soundfile as sf
 
@@ -373,14 +406,15 @@ def load_audio_chunk(
         )
         if sr != sample_rate:
             logger.warning(f"Sample rate mismatch: {sr} != {sample_rate}")
-        # Ensure we have exactly n_samples
         if len(audio) < n_samples:
             audio = np.pad(audio, (0, n_samples - len(audio)))
         return audio[:n_samples]
     except ImportError:
         pass
+    except Exception:
+        pass  # soundfile can't read this format, try fallbacks
 
-    # Fallback: load entire file and slice
+    # Fallback: load_audio handles video→ffmpeg→WAV caching automatically
     audio = load_audio(audio_path, sample_rate)
     end_sample = start_sample + n_samples
 
