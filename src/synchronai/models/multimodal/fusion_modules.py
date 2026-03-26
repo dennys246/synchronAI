@@ -60,14 +60,19 @@ class ConcatFusion(nn.Module):
 
 class CrossModalAttention(nn.Module):
     """
-    Cross-modal attention fusion using multi-head attention.
+    Temporal cross-modal attention fusion using multi-head attention.
 
-    Video features attend to audio features and vice versa,
-    then both are combined.
+    Operates on temporal token sequences (B, T, D) from each modality so
+    that attention can meaningfully weight across time steps. Video and
+    audio may have different sequence lengths (T_v != T_a).
+
+    After cross-attention, each modality's attended sequence is mean-pooled
+    to produce a single vector per sample, then both are concatenated and
+    projected to the output dimension.
 
     Args:
-        video_dim: Video feature dimension
-        audio_dim: Audio feature dimension
+        video_dim: Video per-frame feature dimension
+        audio_dim: Audio per-frame feature dimension
         hidden_dim: Output hidden dimension
         num_heads: Number of attention heads
         dropout: Dropout probability
@@ -102,6 +107,10 @@ class CrossModalAttention(nn.Module):
             batch_first=True
         )
 
+        # Layer norms for residual connections
+        self.video_norm = nn.LayerNorm(hidden_dim)
+        self.audio_norm = nn.LayerNorm(hidden_dim)
+
         # Fusion layer
         self.fusion = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
@@ -110,37 +119,46 @@ class CrossModalAttention(nn.Module):
             nn.Dropout(dropout)
         )
 
-    def forward(self, video_features: torch.Tensor, audio_features: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        video_features: torch.Tensor,
+        audio_features: torch.Tensor
+    ) -> torch.Tensor:
         """
         Args:
-            video_features: (batch, video_dim)
-            audio_features: (batch, audio_dim)
+            video_features: (batch, T_video, video_dim) temporal sequence
+            audio_features: (batch, T_audio, audio_dim) temporal sequence
 
         Returns:
             fused_features: (batch, hidden_dim)
         """
-        # Project to common dimension
-        video_proj = self.video_proj(video_features).unsqueeze(1)  # (batch, 1, hidden_dim)
-        audio_proj = self.audio_proj(audio_features).unsqueeze(1)  # (batch, 1, hidden_dim)
+        # Project to common dimension: (B, T, hidden_dim)
+        video_proj = self.video_proj(video_features)
+        audio_proj = self.audio_proj(audio_features)
 
-        # Video attends to audio
+        # Video attends to audio (video queries look at audio keys)
         video_attended, _ = self.video_to_audio_attn(
             query=video_proj,
             key=audio_proj,
             value=audio_proj
         )
-        video_attended = video_attended.squeeze(1)  # (batch, hidden_dim)
+        # Residual + LayerNorm
+        video_attended = self.video_norm(video_proj + video_attended)
 
-        # Audio attends to video
+        # Audio attends to video (audio queries look at video keys)
         audio_attended, _ = self.audio_to_video_attn(
             query=audio_proj,
             key=video_proj,
             value=video_proj
         )
-        audio_attended = audio_attended.squeeze(1)  # (batch, hidden_dim)
+        audio_attended = self.audio_norm(audio_proj + audio_attended)
 
-        # Combine attended features
-        combined = torch.cat([video_attended, audio_attended], dim=1)
+        # Mean-pool over time after cross-attention
+        video_pooled = video_attended.mean(dim=1)  # (batch, hidden_dim)
+        audio_pooled = audio_attended.mean(dim=1)   # (batch, hidden_dim)
+
+        # Combine and project
+        combined = torch.cat([video_pooled, audio_pooled], dim=1)
         fused = self.fusion(combined)
 
         return fused

@@ -35,7 +35,7 @@ class VideoClassifierConfig:
     frame_width: int = 224
 
     # Backbone configuration
-    backbone: str = "dinov2-base"
+    backbone: str = "dinov2-small"
     backbone_task: str = "detect"  # Only used for YOLO backbones
     backbone_weights: Optional[str] = None
     freeze_backbone: bool = True
