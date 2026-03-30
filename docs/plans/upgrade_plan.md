@@ -2,17 +2,17 @@
 
 ## Current State Summary
 
-*Updated: 2026-03-23*
+*Updated: 2026-03-26*
 
 The system predicts binary dyadic synchrony (sync/async) at 1-second resolution from
 adult-child interaction video. Three modality pipelines exist:
 
 | Modality | Backbone | Framework | Status |
 |----------|----------|-----------|--------|
-| Video | DINOv2-small (default) → LSTM → MLP | PyTorch | Working |
-| Audio | Whisper large-v3 encoder → projection → heads | PyTorch | Working |
-| fNIRS | 1D U-Net DDPM (base_width=64, cosine schedule) | TensorFlow | Standalone (v3 training) |
-| Multimodal | Video + Audio temporal cross-attention fusion | PyTorch | Working |
+| Video | DINOv2-small → LSTM → MLP | PyTorch | Sweep done (best AUC 0.697). Multi-rez stage 1 running. |
+| Audio | WavLM-base-plus (768-dim, 12 layers) | PyTorch | Sweep v1 done (AUC ~0.678). Sweep v2 (per-layer + projection) submitted. |
+| fNIRS | 1D U-Net DDPM (base_width=64, cosine schedule) | TensorFlow | Converged (epoch 621, best val loss 0.003452). Transfer plan ready. |
+| Multimodal | Video + Audio temporal cross-attention fusion | PyTorch | Working (cross-attention fix applied) |
 
 **Dataset**: 59,250 labeled seconds across subjects 50001-50581, all session V0.
 Class distribution: ~44% async (0) / ~56% sync (1) -- mild imbalance.
@@ -362,92 +362,47 @@ fNIRS at ~8Hz) and missing modalities (just don't pass that input).
 
 ---
 
-## Phase 3: Audio Backbone Upgrade -- WavLM (IMPLEMENTED, not yet default)
+## Phase 3: Audio Backbone Upgrade -- WavLM-base-plus (BENCHMARKED)
 
-**Status**: WavLM encoder implemented in `src/synchronai/models/audio/wavlm_encoder.py`
-with learnable layer-wise weighted sum. Available via `encoder_type="wavlm"` in
-AudioClassifierConfig. Whisper remains the default. Not yet benchmarked against Whisper
-on this dataset.
+**Status**: WavLM-base-plus (768-dim, 12 layers) implemented and benchmarked.
+Feature extraction pipeline operational (`scripts/extract_audio_features.py`).
 
-**Goal**: Replace Whisper with WavLM, which is better suited for paralinguistic features
-(prosody, emotion, turn-taking, overlapping speakers).
+### Sweep v1 Results (2026-03-23)
 
-### 3.1 WavLM-large as Primary Audio Backbone
+Pre-extracted WavLM-base-plus features with equal-weight layer blending, 8 head variants:
 
-Whisper is optimized for ASR (transcription). For synchrony, the *how* of speaking
-(prosody, rhythm, emotional tone, turn-taking) matters more than the *what* (words).
+| Run | Best AUC | Best Epoch | Notes |
+|-----|----------|------------|-------|
+| attention | 0.6787 | 1 | All peaked at epoch 1 |
+| label_smooth | 0.6775 | 1 | |
+| mixup | 0.6775 | 1 | |
+| baseline | 0.6773 | 1 | |
+| heavy_reg | 0.6770 | 1 | |
+| small_cap | 0.6755 | 1 | |
+| lstm | 0.6706 | 2 | |
 
-WavLM-large (`microsoft/wavlm-large`) was explicitly trained with **utterance mixing**
-(overlapping speakers during pre-training), making it ideal for dyadic conversation.
+**Diagnosis**: All models peak at epoch 1, val accuracy stuck at ~0.627 (near majority
+class ratio). The equal-weight blended 768-dim features lack discriminative signal and
+heads overfit immediately.
 
-**Key advantages over Whisper**:
-- Handles 1-second chunks **natively** (50 frames, no 30s padding waste)
-- Utterance mixing = designed for overlapping speakers in dyadic interaction
-- Layer-wise weighted sum across 25 transformer layers lets the model discover which
-  layers matter most for synchrony (~2-5% relative improvement on paralinguistic tasks)
-- ~316M params, ~3-5 GB VRAM (tractable on single GPU)
-- Fallback: **WavLM-Base+** (~94M params, ~1.5 GB) if memory is tight
+### Sweep v2 (Submitted 2026-03-24, In Progress)
 
-**New file**: `src/synchronai/models/audio/wavlm_encoder.py`
+Two improvements:
+1. **Per-layer extraction**: Save all 12 hidden states separately `(13, 50, 768)`.
+   Learnable `layer_weights` in the classifier discover which layers matter.
+2. **Projection bottleneck**: Compress 768→32/64/128/256 before temporal aggregation,
+   forcing compact representations.
 
-```python
-class WavLMEncoder(nn.Module):
-    """
-    WavLM-large feature extractor with learnable layer-wise weighted sum.
+10 training jobs: 5 per-layer variants + 5 blended-with-projection variants.
+Submit: `sh scripts/bsub/pre_wavlm_audio_sweep_v2_bsub.sh`
 
-    Different transformer layers encode different information:
-      - Lower layers: acoustic/phonetic features
-      - Middle layers: prosodic features (pitch, rhythm, stress)
-      - Upper layers: semantic/speaker identity features
+### Key Implementation Files
 
-    The learnable weighted sum lets the model discover which layers
-    matter most for synchrony prediction.
-    """
-    def __init__(self, model_name="microsoft/wavlm-large", freeze=True):
-        from transformers import WavLMModel
-        self.wavlm = WavLMModel.from_pretrained(model_name)
-        self.encoder_dim = 1024  # WavLM-large hidden size
-
-        # Learnable layer weights (25 transformer layers for large)
-        n_layers = 25
-        self.layer_weights = nn.Parameter(torch.ones(n_layers) / n_layers)
-
-        if freeze:
-            for param in self.wavlm.parameters():
-                param.requires_grad = False
-
-    def forward(self, audio, return_sequence=False):
-        # audio: (B, n_samples) at 16kHz
-        outputs = self.wavlm(audio, output_hidden_states=True)
-        hidden_states = torch.stack(outputs.hidden_states[1:])  # (n_layers, B, T, D)
-
-        # Learnable weighted sum across layers
-        weights = F.softmax(self.layer_weights, dim=0)
-        weighted = (hidden_states * weights[:, None, None, None]).sum(dim=0)  # (B, T, D)
-
-        if return_sequence:
-            return weighted  # (B, T, 1024) -- for temporal fusion
-        return weighted.mean(dim=1)  # (B, 1024) -- pooled
-
-    def freeze_encoder(self):
-        for param in self.wavlm.parameters():
-            param.requires_grad = False
-
-    def unfreeze_encoder(self):
-        for param in self.wavlm.parameters():
-            param.requires_grad = True
-
-    def get_parameter_groups(self, encoder_lr, head_lr):
-        encoder_params = [p for p in self.wavlm.parameters() if p.requires_grad]
-        groups = []
-        if encoder_params:
-            groups.append({"params": encoder_params, "lr": encoder_lr})
-        # layer_weights always trainable
-        groups.append({"params": [self.layer_weights], "lr": head_lr})
-        return groups
-```
-
-**Install**: `pip install transformers` (WavLM is in HuggingFace transformers)
+- Encoder: `src/synchronai/models/audio/wavlm_encoder.py` (frozen, with `extract_all_layers()`)
+- Extraction: `scripts/extract_audio_features.py` (`--save-all-layers` flag)
+- Feature dataset: `src/synchronai/data/audio/feature_dataset.py`
+- Training: `scripts/train_audio_from_features.py` (`--project-dim` flag)
+- Cluster: `scripts/bsub/pre_wavlm_audio_sweep_v2_bsub.sh`
 
 ### 3.2 Speaker Diarization
 
@@ -478,9 +433,11 @@ explicit speaker labels help, and invest in fine-tuning it.
 ## Phase 4: Video Backbone Upgrade -- DONE
 
 **Status**: DINOv2 implemented as primary backbone (2026-03). Default switched to
-`dinov2-small` based on hyperparameter sweep results (AUC 0.697 vs 0.66 for dinov2-base).
-YOLO remains available as a legacy option. Progressive resolution training implemented
-in `scripts/train_progressive_features.py`.
+`dinov2-small` based on hyperparameter sweep results (best: `small_heavy_reg`,
+AUC 0.697, dropout=0.7, wd=0.01). DINOv2-base overfits more (AUC 0.66). YOLO remains
+available as legacy option. Progressive resolution training implemented in
+`scripts/train_progressive_features.py`. Multi-resolution stage 1 currently running
+(2026-03-26).
 
 **Goal**: Replace YOLO26s feature extraction with a model that provides richer visual
 representations for synchrony.
@@ -539,219 +496,36 @@ def create_backbone(name, **kwargs):
 
 ---
 
-## Phase 5: fNIRS Integration
+## Phase 5: fNIRS Integration -- PLAN READY
 
-### 5.1 Use Trained DDPM as Feature Extractor
+**Status**: fNIRS DDPM v3 converged (epoch 621, best val loss 0.003452 at epoch 491).
+Detailed transfer learning plan in `docs/plans/fnirs_transfer_plan.md`.
 
-The plan to use the generative DDPM model as a pre-trained feature extractor is sound.
-If the U-Net learns to denoise fNIRS signals, its intermediate representations capture
-the structure of hemodynamic activity.
+**Summary**: Three-stage transfer learning pipeline:
+1. **Stage A**: Train child vs adult classifier on U-Net encoder features (sweep)
+2. **Stage B**: Transfer learned representations to synchrony classification
+3. **Stage C**: Three-way fusion (video + audio + fNIRS) joined by subject_id
 
-**How to extract features from a trained DDPM**:
+**Architecture**: Each modality has an independent extraction pipeline producing
+`feature_index.csv` files keyed by `(subject_id, second)`. Fusion joins on
+subject_id at training time — no cross-dependencies during extraction.
 
-```python
-def extract_ddpm_features(unet, fnirs_signal, t=200, schedule):
-    """Extract U-Net bottleneck features as fNIRS representation.
+**Key dimensions**: U-Net depth=3 downsamples 472 timesteps (60s @ 7.8Hz) to
+59 bottleneck timesteps (~1 per second). Bottleneck dim=512, multiscale=960.
 
-    Timestep selection: t=100-300 is the sweet spot.
-    t=0 is too raw, t=1000 is pure noise. Must tune per application.
-    """
-    noise = tf.random.normal(shape=fnirs_signal.shape)
-    noisy = schedule.sqrt_alpha_bars[t] * fnirs_signal + \
-            schedule.sqrt_one_minus_alpha_bars[t] * noise
+**Current status**: Phases 1-2 implemented. Child/adult sweep ready to run.
 
-    # Extract after the bottleneck layers (before up-path)
-    bottleneck_features = unet.get_bottleneck(noisy, t)
-    return bottleneck_features  # (batch, reduced_time, bottleneck_dim)
-```
-
-**Improvements to the DDPM**:
-1. **Cosine schedule** (already implemented): good choice
-2. **Class-conditional generation**: Condition on synchrony label during training so the
-   model learns synchrony-relevant features:
-   ```python
-   label_in = tf.keras.layers.Input(shape=(), dtype=tf.int32, name="label")
-   label_emb = tf.keras.layers.Embedding(2, time_embed_dim)(label_in)
-   temb = temb + label_emb  # Condition on sync/async label
-   ```
-3. **Evaluation**: Track FID-equivalent metrics for 1D signals (e.g., compare power
-   spectral density, wavelet coherence statistics between real and generated)
-
-**Note**: If the DDPM is already trained, extracting bottleneck features at t~200 is
-worth trying. But do NOT build a DDPM from scratch just for feature extraction -- a
-simple 1D autoencoder or contrastive model (TS2Vec, TFC) would be more practical.
-
-### 5.2 Bridge TensorFlow to PyTorch
-
-**Option A -- Export features offline** (recommended to start):
-- Run the trained TF DDPM on all fNIRS data, save extracted features as `.npy`
-- Load these features in the PyTorch multimodal dataset
-- No framework mixing at training time
-
-**Option B -- Rewrite in PyTorch** (cleanest long-term):
-- Port the 1D U-Net + diffusion schedule to PyTorch
-- Use `diffusers` library (HuggingFace) which has 1D U-Net support
-- Enables native integration with the multimodal model
-
-### 5.3 Hyperscanning-Aware fNIRS Processing
-
-If your fNIRS data is from hyperscanning (simultaneous recording from both participants),
-the inter-brain synchrony signal is itself a powerful predictor:
-
-```python
-class HyperscanningEncoder(nn.Module):
-    """Process fNIRS from both participants with cross-brain attention."""
-    def __init__(self, n_channels=24, d_model=128, n_heads=4):
-        self.intra_attn = nn.TransformerEncoder(...)  # Within each brain
-        self.inter_attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-
-    def forward(self, fnirs_a, fnirs_b):
-        a_repr = self.intra_attn(fnirs_a)
-        b_repr = self.intra_attn(fnirs_b)
-        coupled, attn_weights = self.inter_attn(a_repr, b_repr, b_repr)
-        return coupled  # attn_weights reveal inter-brain connectivity
-```
-
-### 5.4 Per-Second Feature Extraction from 120s DDPM (Recommended)
-
-The DDPM is trained on 120-second windows (~938 timepoints at 7.8 Hz). Rather than
-training a separate 1-second model (too few timepoints for meaningful hemodynamics),
-extract per-second features from the full 120s model to match video/audio resolution.
-
-**Why 120s training, 1s features**: The hemodynamic response function (HRF) peaks at
-5-6 seconds and takes ~15 seconds to resolve. A 1-second window captures almost no
-meaningful hemodynamic variation. The 120s model learns the full temporal structure,
-then we slice its internal representations at 1-second intervals.
-
-```python
-def extract_per_second_features(unet, fnirs_window, t=200, schedule, sfreq_hz=7.8125):
-    """Extract per-second bottleneck features from a 120s fNIRS window.
-
-    Args:
-        unet: Trained DDPM U-Net
-        fnirs_window: (batch, 938, n_channels) -- 120s window
-        t: Diffusion timestep (100-300 sweet spot)
-        schedule: Noise schedule
-        sfreq_hz: Sampling frequency
-
-    Returns:
-        per_second_features: (batch, 120, bottleneck_dim) -- 1 feature per second
-    """
-    noise = tf.random.normal(shape=fnirs_window.shape)
-    noisy = schedule.sqrt_alpha_bars[t] * fnirs_window + \
-            schedule.sqrt_one_minus_alpha_bars[t] * noise
-
-    # Extract bottleneck features (full temporal resolution at bottleneck)
-    bottleneck = unet.get_bottleneck(noisy, t)  # (batch, reduced_time, D)
-
-    # Interpolate to exactly 120 features (one per second)
-    # bottleneck reduced_time = 938 / (2^depth) = ~117 at depth=3
-    per_second = tf.image.resize(
-        bottleneck[:, :, tf.newaxis, :],
-        [120, bottleneck.shape[-1]]
-    )[:, :, 0, :]  # (batch, 120, D)
-
-    return per_second
-```
-
-**Offline extraction pipeline**:
-1. Run trained DDPM on all fNIRS sessions, extracting per-second features
-2. Save as `.npy` files alongside fNIRS data (one file per session)
-3. Load in PyTorch multimodal dataset at training time -- no TF dependency
-
-### 5.5 Standalone fNIRS Synchrony Classifier
-
-Before integrating fNIRS into multimodal fusion, establish how much synchrony signal
-fNIRS carries independently. This baseline determines whether fNIRS adds value to the
-multimodal model or just adds noise.
-
-**New file**: `src/synchronai/models/fnirs/classifier.py`
-
-```python
-class FNIRSSynchronyClassifier(nn.Module):
-    """Classify synchrony from per-second DDPM features.
-
-    Input: pre-extracted per-second features (offline from DDPM)
-    Architecture: LSTM over per-second features → per-second predictions
-
-    This is a lightweight model (~100K params) that trains in minutes
-    since features are pre-extracted.
-    """
-    def __init__(self, feature_dim, hidden_dim=128, dropout=0.3):
-        super().__init__()
-        self.lstm = nn.LSTM(
-            feature_dim, hidden_dim, num_layers=2,
-            batch_first=True, dropout=dropout, bidirectional=True
-        )
-        self.head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1)
-        )
-
-    def forward(self, features):
-        # features: (batch, T_seconds, feature_dim) -- per-second DDPM features
-        lstm_out, _ = self.lstm(features)  # (batch, T, hidden_dim*2)
-        return self.head(lstm_out)  # (batch, T, 1) -- per-second predictions
-```
-
-**Evaluation**: Compare fNIRS-only performance against:
-- Chance baseline (56% majority class)
-- Video-only DINOv2 baseline
-- Audio-only WavLM baseline
-
-If fNIRS-only performance is above chance, proceed with multimodal integration (5.6).
-If at chance, fNIRS features may need the hyperscanning approach (5.3) or the DDPM
-may need class-conditional retraining (5.1).
-
-### 5.6 Multimodal Integration (Three-Way Fusion)
-
-Once the fNIRS-only baseline is established, integrate per-second DDPM features into
-the multimodal fusion pipeline alongside video and audio:
-
-```
-Video:  DINOv2 → (B, T, 768)        — 1s resolution
-Audio:  WavLM  → (B, T, 1024)       — 1s resolution
-fNIRS:  DDPM   → (B, T, D_bottleneck) — 1s resolution
-                    ↓
-         Cross-modal fusion → synchrony
-```
-
-All three modalities at matched 1-second temporal resolution. The existing fusion
-modules (concat, gated, cross-attention) work directly -- just add `fnirs_dim` as
-a third input dimension.
-
-**Optional -- Continuous regression**: Instead of binary sync/async, regress to a
-continuous synchrony score (0.0-1.0) using annotator agreement proportion as soft
-labels (e.g., 3/4 annotators say sync → 0.75). The DDPM features capture graded
-hemodynamic variation that binary labels discard.
-
-### 5.7 Alternative: Direct fNIRS Transformer Classifier
-
-If the DDPM proves difficult to train or extract useful features from:
-
-```python
-class fNIRSTransformer(nn.Module):
-    """Direct fNIRS classification without generative pre-training."""
-    def __init__(self, n_channels=20, seq_len=944, d_model=128):
-        self.channel_embed = nn.Linear(1, d_model)
-        self.pos_embed = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.02)
-        self.transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(d_model, nhead=4, batch_first=True),
-            num_layers=4
-        )
-        self.head = nn.Linear(d_model, 1)
-```
+See `docs/plans/fnirs_transfer_plan.md` for full phased implementation plan.
 
 ---
 
 ## Phase 6: Progressive Growing & Curriculum Training -- IN PROGRESS
 
 **Status**: Progressive resolution training script implemented
-(`scripts/train_progressive_features.py`). Multi-resolution stage 1 is currently running
-(2026-03-23). DINOv2 hyperparameter sweep completed — best: `small_heavy_reg` (AUC 0.697,
-dropout=0.7, wd=0.01).
+(`scripts/train_progressive_features.py`). Multi-resolution stage 1 currently running
+(2026-03-26). DINOv2 hyperparameter sweep completed — best: `small_heavy_reg` (AUC 0.697,
+dropout=0.7, wd=0.01). DINOv2-small confirmed as optimal backbone (smaller generalizes
+better than base on this dataset size).
 
 **Goal**: Combat overfitting and improve convergence by progressively increasing model
 complexity, input resolution, and data difficulty. The DINOv2 sweep (small backbone)

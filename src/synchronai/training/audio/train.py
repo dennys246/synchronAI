@@ -33,6 +33,13 @@ from synchronai.models.audio.audio_classifier import (
     build_audio_classifier,
     save_audio_classifier,
 )
+from synchronai.utils.wandb_utils import (
+    init_wandb,
+    log_metrics,
+    log_summary,
+    log_artifact,
+    finish_wandb,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -506,6 +513,15 @@ def train_audio_classifier(
     with open(save_dir / "training_config.json", "w") as f:
         json.dump(asdict(training_config), f, indent=2)
 
+    # Initialize wandb
+    init_wandb(
+        config={"model": asdict(model_config), "training": asdict(training_config)},
+        name=f"audio-{model_config.model_name}",
+        tags=["audio-classifier", model_config.model_name],
+        group="audio-training",
+        save_dir=save_dir,
+    )
+
     # Mixed precision
     use_amp = training_config.use_amp and device == "cuda"
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
@@ -583,6 +599,17 @@ def train_audio_classifier(
             f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2%} | "
             f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2%} | LR: {current_lr:.2e}"
         )
+
+        # Log to wandb
+        log_metrics({
+            "train/loss": train_loss,
+            "train/accuracy": train_acc,
+            "val/loss": val_loss,
+            "val/accuracy": val_acc,
+            "lr": current_lr,
+            "stage": 1,
+            "epoch": epoch,
+        })
 
         is_best = val_loss < history.best_val_loss
         if is_best:
@@ -703,6 +730,17 @@ def train_audio_classifier(
                 f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2%} | LR: {current_lr:.2e}"
             )
 
+            # Log to wandb
+            log_metrics({
+                "train/loss": train_loss,
+                "train/accuracy": train_acc,
+                "val/loss": val_loss,
+                "val/accuracy": val_acc,
+                "lr": current_lr,
+                "stage": 2,
+                "epoch": global_epoch,
+            })
+
             is_best = val_loss < history.best_val_loss
             if is_best:
                 history.best_val_loss = val_loss
@@ -770,6 +808,15 @@ def train_audio_classifier(
         title="Audio Classifier Batch Progress (Final)",
     )
     history.save(save_dir / "history.json")
+
+    # Log final summary and artifact to wandb
+    log_summary({
+        "best_val_loss": history.best_val_loss,
+        "best_val_acc": history.best_val_acc,
+        "best_epoch": history.best_epoch,
+    })
+    log_artifact(save_dir / "best.pt", artifact_type="model")
+    finish_wandb()
 
     logger.info(f"Training complete! Best val_loss: {history.best_val_loss:.4f} at epoch {history.best_epoch + 1}")
     logger.info(f"Checkpoints saved to: {save_dir}")

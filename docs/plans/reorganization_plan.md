@@ -4,7 +4,7 @@ This plan documents structural improvements to the synchronAI repo. Changes shou
 
 ---
 
-## 1. Move Pretrained Weights Out of Repo Root (DONE: docs/)
+## 1. Move Pretrained Weights Out of Repo Root
 
 **Status:** Pending (waiting for runs to finish)
 
@@ -27,6 +27,8 @@ Optional: add a `scripts/download_weights.sh` that pulls weights from shared sto
 
 ## 2. Consolidate Documentation into docs/ (DONE)
 
+**Status:** Complete (2026-03-23)
+
 Moved all non-README docs from root and `src/` into `docs/`:
 
 ```
@@ -37,7 +39,10 @@ docs/
 ├── MULTIMODAL_HEATMAPS.md
 ├── audio_synchrony.md
 ├── transcript_synchrony.md
-└── upgrade_plan.md
+└── plans/
+    ├── upgrade_plan.md
+    ├── reorganization_plan.md
+    └── fnirs_transfer_plan.md
 ```
 
 Only `README.md` and `AGENTS.md` remain at root.

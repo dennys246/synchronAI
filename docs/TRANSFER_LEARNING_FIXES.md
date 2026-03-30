@@ -350,7 +350,7 @@ All fixes maintain backward compatibility while enabling proper transfer learnin
 
 ---
 
-## Additional Fix: Cross-Attention Fusion (2026-03-23)
+## ✅ Additional Fix: Cross-Attention Fusion (2026-03-23)
 
 **Problem**: `CrossModalAttention` in `fusion_modules.py` operated on single pooled vectors
 `(B, 1, D)`, making attention a no-op (softmax over 1 key = always 1.0).
@@ -363,3 +363,5 @@ connections and LayerNorm for training stability.
 **Also**: Default video backbone changed from `dinov2-base` to `dinov2-small` based on
 hyperparameter sweep results (AUC 0.697 vs 0.66 for base). `AudioClassifier.forward()` now
 accepts `return_sequence=True` to provide frame-level encoder features for temporal fusion.
+
+**Status**: Fixed and verified. See `upgrade_plan.md` Phase 0.1 and Phase 2 for details.
