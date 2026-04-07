@@ -1,6 +1,6 @@
 # fNIRS Diffusion Transfer Learning Plan
 
-*Created: 2026-03-26, Updated: 2026-03-27*
+*Created: 2026-03-26, Updated: 2026-03-31 (added Phase 3c: quality-tiered holdout)*
 
 ## Overview
 
@@ -241,23 +241,183 @@ zero-padding + modality mask.
 
 ---
 
+## Phase 3 Results: 20-Channel Sweep (COMPLETED)
+
+**Best model: bn_lstm64 — AUC 0.974, Accuracy 92.4%, F1 0.926**
+
+| Rank | Model | Features | AUC | Accuracy | F1 |
+|------|-------|----------|-----|----------|-----|
+| 1 | bn_lstm64 | Bottleneck (512) | **0.974** | **0.924** | **0.926** |
+| 2 | bn_lstm_proj | Bottleneck (512) | 0.971 | 0.914 | 0.906 |
+| 3 | bn_mlp32 | Bottleneck (512) | 0.915 | 0.831 | 0.835 |
+| 10 | bn_linear | Bottleneck (512) | 0.860 | 0.788 | 0.780 |
+| 11 | ms_linear | Multiscale (960) | 0.852 | 0.774 | 0.764 |
+
+Key findings:
+- LSTM temporal modeling is critical (+5.9% AUC over mean pool)
+- Bottleneck > Multiscale consistently
+- Linear probe at 0.860 proves linear separability
+- Minimal overfitting (2.3% train-val gap)
+- Ablation with random encoder pending (expected ~0.5 AUC)
+
+See `docs/fnirs_generative_methods_results.md` for full methods/results writeup.
+
+---
+
+## Phase 3b: Per-Pair Generative Pretraining (NEW)
+
+**Motivation**: The 20-channel model requires exactly 10 source-detector pairs in a
+fixed montage. Real-world users have variable numbers of channels. A per-pair model
+(feature_dim=2, one HbO/HbR pair) learns universal hemodynamic dynamics that
+generalize to any montage configuration.
+
+### 3b.1 Architecture
+
+Same U-Net DDPM architecture but with `feature_dim=2` (HbO + HbR per pair):
+- Input: `(472, 2)` — one pair from one 60s window
+- Each 60s window produces 10 training samples (one per pair)
+- Total: ~674K samples from ~67K windows (10× more than 20-channel)
+
+**Pretraining sweep** (3 width variants, all depth=3):
+
+| Model | Base Width | Approx Params | Bottleneck Dim |
+|-------|-----------|---------------|----------------|
+| Small | 16 | ~100K | 128 |
+| Medium | 32 | ~800K | 256 |
+| Large | 64 | ~3.5M | 512 |
+
+Training: 200 epochs with early stopping, cosine restarts LR, eval every 10 epochs.
+
+### 3b.2 Flexible Channel Loading
+
+The per-pair extraction (`--per-pair`, default) accepts **any number of channels**.
+Unlike the 20-channel mode which aligns to a fixed 10-pair montage, per-pair mode
+iterates over whatever pairs are present in the recording. A recording with 3 pairs
+produces 3 features per window; one with 15 pairs produces 15. This is the key
+generalizability advantage — no montage-specific preprocessing.
+
+### 3b.3 Transfer Learning: Per-Pair Classification
+
+For each pretrained model, extract bottleneck features and classify child/adult:
+
+**Strategy A — Per-pair** (headline result):
+- Each pair classified independently
+- 10 predictions averaged per person
+- Tests if per-pair features carry discriminative signal
+
+**Strategy B — Aggregated**:
+- All 10 pair features concatenated/pooled into one vector
+- Single prediction per person
+- More comparable to 20-channel baseline
+
+### 3b.4 Pipeline Commands
+
+```bash
+# Step 1: Pretraining (3 models, ~1-2 days each)
+sh scripts/bsub/pre_fnirs_perpair_pretrain_bsub.sh
+
+# Step 2: Transfer learning (after pretraining completes)
+sh scripts/bsub/pre_fnirs_perpair_transfer_bsub.sh
+```
+
+### 3b.5 Success Criteria
+
+- Per-pair AUC > 0.80: Features are useful despite losing inter-channel correlations
+- Per-pair AUC > 0.90: Per-pair model is viable alternative to 20-channel
+- Smaller model (base=16/32) matching larger: simpler signal = less capacity needed
+
+---
+
+## Phase 3c: Quality-Tiered Holdout Comparison (NEW)
+
+**Motivation**: The best child/adult classifier (bn_lstm64, AUC 0.974) was trained on
+QC-passed data (SCI ≥ 0.75, SNR ≥ 5.0). But we don't know: (a) whether pristine
+low-motion data alone is sufficient, or (b) how much classifier performance degrades
+on high-motion data that's normally excluded. This comparison provides both a
+quality ceiling and a robustness floor.
+
+### 3c.1 Quality Tier Definitions
+
+The QC pipeline now classifies each recording into one of four tiers based on
+aggregate metrics (mean SCI, scan SNR, cardiac presence):
+
+| Tier | Mean SCI | SNR | Cardiac | Description |
+|------|----------|-----|---------|-------------|
+| **gold** | ≥ 0.90 | ≥ 10.0 | All pairs | Pristine, low-motion |
+| **standard** | ≥ 0.75 | ≥ 5.0 | — | Normal QC pass (current default) |
+| **salvageable** | ≥ 0.40 | ≥ 2.0 | — | High-motion, normally rejected |
+| **rejected** | < 0.40 | < 2.0 | — | Too noisy for any use |
+
+### 3c.2 Design: Single Training Run with Holdout Evaluation
+
+Instead of training separate models on each tier, we train **one model** on
+gold+standard data and evaluate on tier-specific val subsets each epoch.
+This gives per-epoch learning curves for each tier in a single `history.json`:
+
+| Metric key | Data | Purpose |
+|-----------|------|---------|
+| `val_aucs` | gold + standard val split | Standard val (early stopping target) |
+| `holdout_gold_aucs` | gold-only val subset | Quality ceiling — pristine data |
+| `holdout_salvageable_aucs` | salvageable-only val subset | Robustness floor — high motion |
+
+The holdout tiers are **evaluation-only** — never trained on, never used for
+early stopping. Subjects in holdout tiers come from the val split only, so
+there's no leakage between train and holdout evaluation.
+
+### 3c.3 Expected Outcomes
+
+- **Gold AUC ≥ val AUC throughout training**: Pristine data is easier to
+  classify — model generalizes best to clean signals. Expected outcome.
+- **Gold AUC < val AUC**: Surprising — would suggest the model relies on
+  artifacts or noise patterns present in standard-tier data.
+- **Salvageable AUC > 0.7**: Even high-motion data carries discriminative signal.
+  The encoder learned representations robust to motion artifacts.
+- **Salvageable AUC < 0.6**: Motion artifacts destroy the child/adult signal.
+  This confirms QC filtering is essential, not just precautionary.
+- **Salvageable AUC diverges from val AUC over epochs**: The model is
+  specializing to clean data and losing generalization to noisy data.
+  May indicate overfitting to quality-specific patterns.
+
+### 3c.4 Implementation: Integrated into All Classifier Jobs
+
+Rather than a standalone script, holdout-tier evaluation is built into every
+fNIRS classifier training job via `--holdout-tiers "gold,salvageable"`. All
+BSub scripts now:
+
+1. **Extract with relaxed QC** (SCI ≥ 0.40, SNR ≥ 2.0, `--include-tiers gold,standard,salvageable`)
+   to populate the `quality_tier` column in `feature_index.csv`.
+2. **Train on gold+standard** (`--include-tiers gold,standard`) — same data as before.
+3. **Evaluate on tier subsets** (`--holdout-tiers gold,salvageable`) — per-epoch
+   AUC/loss for gold-only and salvageable-only val subsets, saved in `history.json`.
+
+Scripts updated:
+- `pre_fnirs_child_adult_sweep_bsub.sh` — 11 sweep jobs
+- `pre_fnirs_perpair_transfer_bsub.sh` — 9 transfer jobs (3 sizes × 3 classifiers)
+- `pre_fnirs_ablation_random_bsub.sh` — random encoder ablation
+
+No separate holdout script needed — every `history.json` now contains
+`holdout_gold_aucs` and `holdout_salvageable_aucs` alongside the standard metrics.
+
+---
+
 ## Implementation Order
 
 ```
-Phase 1 (PT encoder) ──── DONE
+Phase 1 (PT encoder)           ──── DONE
+Phase 2 (extraction)           ──── DONE
+Phase 3 (20-ch child/adult)    ──── DONE (AUC 0.974)
+Phase 3b (per-pair pretrain)   ──── NEXT (3 architectures)
+Phase 3b (per-pair transfer)   ──── after 3b pretrain (includes 3c holdout eval)
+Ablation (random encoder)      ──── RUNNING
          │
-Phase 2 (extraction)  ──── DONE (needs windowing update)
+         ├── Phase 4 (synchrony transfer)
+         │          │
+         │   Phase 5 (trimodal fusion)
          │
-Phase 3 (child/adult sweep) ──── NEXT
-         │
-         ├── if AUC > 0.75 ──→ Phase 4 (synchrony transfer)
-         │                              │
-         │                     Phase 5 (trimodal fusion)
-         │
-         └── if AUC < 0.6 ──→ Fallbacks:
-                                - Multiscale features
-                                - Features at t > 0
-                                - Direct transformer (no DDPM)
+         └── Fallbacks if needed:
+              - Per-pair aggregation strategies
+              - Features at t > 0
+              - Direct transformer (no DDPM)
 ```
 
 ---

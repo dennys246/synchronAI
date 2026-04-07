@@ -213,7 +213,7 @@ experiments/
 .vscode/
 
 ml-env/
-runs/
+/runs/
 data/*.*
 **/*.pt
 
