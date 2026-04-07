@@ -1,4 +1,6 @@
 #!/bin/bash
+SCRIPT_VERSION="audio_synchrony_bsub-v1"
+echo "=== [$SCRIPT_VERSION] ==="
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general

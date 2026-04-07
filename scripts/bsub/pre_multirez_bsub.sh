@@ -1,4 +1,5 @@
 #!/bin/sh
+SCRIPT_VERSION="pre_multirez_bsub-v1"
 # =============================================================================
 # DINOv2 Progressive Growing Pipeline — Stage Launcher
 #
@@ -32,6 +33,7 @@ STAGE="${1:-}"
 BEST_RUN="${2:-prog_full}"
 
 if [ -z "$STAGE" ]; then
+    echo "=== [$SCRIPT_VERSION] ==="
     echo "Usage: bash scripts/bsub/pre_multirez_bsub.sh <stage> [best_run_name]"
     echo ""
     echo "Stages:"
@@ -264,6 +266,8 @@ elif [ "$STAGE" = "3" ]; then
     # Create a lightweight calibration bsub job inline
     cat > "/tmp/calibrate_${BEST_RUN}.sh" << 'CALIBRATE_EOF'
 #!/bin/bash
+SCRIPT_VERSION="pre_multirez_bsub-v1"
+echo "=== [pre_multirez_bsub-v1] ==="
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general

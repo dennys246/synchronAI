@@ -1,4 +1,5 @@
 #!/bin/bash
+SCRIPT_VERSION="dinov2_extract_multirez_bsub-v1"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -36,6 +37,7 @@ LABELS_CSV="data/labels.csv"
 SMALL_112_DIR="data/dinov2_features_small_112"
 
 if [ ! -f "${SMALL_112_DIR}/feature_index.csv" ]; then
+    echo "=== [$SCRIPT_VERSION] ==="
     echo ""
     echo "=== Extracting dinov2-small features at 112×112 ==="
 

@@ -1,4 +1,5 @@
 #!/bin/bash
+SCRIPT_VERSION="video_synchrony_bsub-v1"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -7,7 +8,9 @@
 #BSUB -n 40
 #BSUB -R 'select[mem>99GB && tmp>99GB] rusage[mem=99GB, tmp=99GB]'
 
-source /home/dennys/.bashrc
+echo "=== [$SCRIPT_VERSION] ==="
+
+source /home/$USER/.bashrc
 source $SYNCHRONAI_DIR/ml-env/bin/activate
 
 cd $SYNCHRONAI_DIR

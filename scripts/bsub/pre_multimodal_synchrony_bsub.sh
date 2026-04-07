@@ -1,4 +1,5 @@
 #!/bin/sh
+SCRIPT_VERSION="pre_multimodal_synchrony_bsub-v1"
 
 # Pre-submission script for multi-modal synchrony classifier training
 # Sets up environment and submits bsub job to LSF cluster
@@ -22,6 +23,8 @@ export LSF_DOCKER_PRESERVE_ENVIRONMENT=true
 
 # Generate date stamp for job naming
 export DATE=$(date +'%m-%d')
+
+echo "=== [$SCRIPT_VERSION] ==="
 
 # Submit job to LSF with bsub
 bsub \

@@ -1,4 +1,5 @@
 #!/bin/bash
+SCRIPT_VERSION="dinov2_sweep_bsub-v1"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -45,6 +46,7 @@ WEIGHT_DECAY="${SWEEP_WEIGHT_DECAY:-1e-3}"
 PATIENCE="${SWEEP_PATIENCE:-10}"
 OUTPUT_DIR="runs/dinov2_sweep/${RUN_NAME}"
 
+echo "=== [$SCRIPT_VERSION] ==="
 echo ""
 echo "=========================================="
 echo "  Sweep Run: ${RUN_NAME}"

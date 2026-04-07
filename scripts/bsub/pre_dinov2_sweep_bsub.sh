@@ -1,4 +1,5 @@
 #!/bin/sh
+SCRIPT_VERSION="pre_dinov2_sweep_bsub-v1"
 # =============================================================================
 # Submit DINOv2 Small Backbone Sweep — Focused on dinov2-small (384-dim)
 #
@@ -35,6 +36,7 @@ mkdir -p "$LOG_DIR"
 
 SMALL_FEATURES="data/dinov2_features_small_meanpatch"
 
+echo "=== [$SCRIPT_VERSION] ==="
 echo "=========================================="
 echo "  DINOv2 Small Backbone Sweep"
 echo "  All runs use dinov2-small (384-dim)"

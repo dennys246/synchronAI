@@ -1,4 +1,5 @@
 #!/bin/sh
+SCRIPT_VERSION="pre_audio_synchrony_bsub-v1"
 
 # export OUTPUT_DIRS
 export CONDA_ENVS_DIRS="/storage1/fs1/perlmansusan/Active/moochie/resources/conda/envs/"
@@ -14,6 +15,8 @@ export LSF_DOCKER_VOLUMES="/storage1/fs1/perlmansusan/Active:/storage1/fs1/perlm
 export LSF_DOCKER_PRESERVE_ENVIRONMENT=true
 
 export DATE=$(date +'%m-%d')
+
+echo "=== [$SCRIPT_VERSION] ==="
 
 bsub -J synchronai-audio-$DATE \
      -oo $SYNCHRONAI_DIR/scripts/bsub/logs/synchronai_audio_$DATE.log \

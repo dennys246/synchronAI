@@ -1,4 +1,5 @@
 #!/bin/bash
+SCRIPT_VERSION="wavlm_extract_bsub-v1"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -26,6 +27,7 @@ mkdir -p "$HF_HOME"
 # Step 1: Ensure ml-env has transformers (for WavLM)
 # =============================================================================
 
+echo "=== [$SCRIPT_VERSION] ==="
 echo "=== Checking ml-env ==="
 
 if [ ! -d "$SYNCHRONAI_DIR/ml-env" ]; then

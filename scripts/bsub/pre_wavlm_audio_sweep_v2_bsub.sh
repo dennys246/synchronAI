@@ -1,4 +1,5 @@
 #!/bin/sh
+SCRIPT_VERSION="pre_wavlm_audio_sweep_v2_bsub-v1"
 # =============================================================================
 # Submit WavLM Audio Sweep v2 — Per-Layer Features + Smaller Architectures
 #
@@ -45,6 +46,7 @@ PERLAYER_FEATURES="data/wavlm_baseplus_perlayer_features"
 BLENDED_FEATURES="data/wavlm_baseplus_features"
 EXTRACT_JOB_NAME="synchronai-wavlm-extract-v2-$DATE"
 
+echo "=== [$SCRIPT_VERSION] ==="
 echo "=========================================="
 echo "  WavLM Audio Sweep v2"
 echo "  Per-layer features + smaller architectures"

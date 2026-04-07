@@ -1,4 +1,5 @@
 #!/bin/bash
+SCRIPT_VERSION="dinov2_progressive_sweep_bsub-v1"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -51,6 +52,7 @@ FEAT_112="data/dinov2_features_small_112"
 FEAT_168="data/dinov2_features_small_168"
 FEAT_224="data/dinov2_features_small_meanpatch"
 
+echo "=== [$SCRIPT_VERSION] ==="
 echo ""
 echo "=========================================="
 echo "  Progressive Sweep Run: ${RUN_NAME}"

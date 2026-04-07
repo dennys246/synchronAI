@@ -1,4 +1,5 @@
 #!/bin/sh
+SCRIPT_VERSION="pre_dinov2_progressive_sweep_bsub-v1"
 # =============================================================================
 # Submit DINOv2 Progressive Growing Sweep
 #
@@ -36,6 +37,7 @@ SWEEP_SCRIPT="$SYNCHRONAI_DIR/scripts/bsub/dinov2_progressive_sweep_bsub.sh"
 LOG_DIR="$SYNCHRONAI_DIR/scripts/bsub/logs"
 mkdir -p "$LOG_DIR"
 
+echo "=== [$SCRIPT_VERSION] ==="
 echo "=========================================="
 echo "  DINOv2 Progressive Growing Sweep"
 echo "  Ablation: progressive vs flat + new regularization"

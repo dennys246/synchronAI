@@ -1,4 +1,5 @@
 #!/bin/bash
+SCRIPT_VERSION="wavlm_audio_sweep_bsub-v1"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -45,6 +46,7 @@ MIXUP_ALPHA="${SWEEP_MIXUP_ALPHA:-0.0}"
 PROJECT_DIM="${SWEEP_PROJECT_DIM:-0}"
 OUTPUT_DIR="${SWEEP_OUTPUT_BASE:-runs/audio_sweep}/${RUN_NAME}"
 
+echo "=== [$SCRIPT_VERSION] ==="
 echo ""
 echo "=========================================="
 echo "  Audio Sweep Run: ${RUN_NAME}"

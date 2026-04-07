@@ -1,4 +1,5 @@
 #!/bin/bash
+SCRIPT_VERSION="multimodal_synchrony_bsub-v1"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -16,6 +17,7 @@ cd $SYNCHRONAI_DIR
 # Install Dependencies for Multi-Modal Training
 # =============================================================================
 
+echo "=== [$SCRIPT_VERSION] ==="
 echo "=== Installing multi-modal dependencies ==="
 
 # Fix NumPy installation - reinstall to get proper binary dependencies

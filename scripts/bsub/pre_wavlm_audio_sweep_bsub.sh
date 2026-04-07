@@ -1,4 +1,5 @@
 #!/bin/sh
+SCRIPT_VERSION="pre_wavlm_audio_sweep_bsub-v1"
 # =============================================================================
 # Submit WavLM Audio Feature Extraction + Sweep
 #
@@ -36,6 +37,7 @@ mkdir -p "$LOG_DIR"
 WAVLM_FEATURES="data/wavlm_baseplus_features"
 EXTRACT_JOB_NAME="synchronai-wavlm-extract-$DATE"
 
+echo "=== [$SCRIPT_VERSION] ==="
 echo "=========================================="
 echo "  WavLM Audio Feature Sweep"
 echo "  Encoder: WavLM-base-plus (768-dim)"

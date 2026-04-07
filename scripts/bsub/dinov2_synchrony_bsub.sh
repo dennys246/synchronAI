@@ -1,4 +1,5 @@
 #!/bin/bash
+SCRIPT_VERSION="dinov2_synchrony_bsub-v1"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -20,6 +21,7 @@ mkdir -p "$HF_HOME"
 # Install Dependencies for DINOv2 Training
 # =============================================================================
 
+echo "=== [$SCRIPT_VERSION] ==="
 echo "=== Installing DINOv2 dependencies ==="
 
 # Fix NumPy installation - reinstall to get proper binary dependencies
