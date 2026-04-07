@@ -1,29 +1,26 @@
 #!/bin/sh
-SCRIPT_VERSION="pre_fnirs_child_adult_sweep-v2"
+SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v2"
 # =============================================================================
-# fNIRS Child/Adult Classification Sweep — Per-Pair Architecture
+# fNIRS Per-Pair Transfer Learning: Classification Sweep
 #
-# Runs AFTER per-pair pretraining (pre_fnirs_perpair_pretrain_bsub.sh).
+# Phase 2 of the per-pair pipeline. Runs AFTER pretraining completes.
 #
-# For each pretrained per-pair model (micro/small/medium/large):
-#   Step 1: Convert TF weights to PyTorch (if not done)
-#   Step 2: Extract per-pair features with relaxed QC (all tiers)
-#   Step 3: Train 5 classifier architectures with holdout-tier evaluation
+# For each pretrained model (small/medium/large):
+#   1. Convert TF weights to PyTorch encoder
+#   2. Extract per-pair bottleneck features (with QC filtering)
+#   3. Train child/adult classifiers (per-pair + aggregated)
 #
-# Sweep variants per model size:
-#   linear:     Linear probe (mean pool, hidden=0)
-#   mlp32:      Small MLP (mean pool, hidden=32)
-#   mlp64_proj: MLP with projection (mean pool, hidden=64, dropout=0.5)
-#   lstm64:     LSTM temporal model (hidden=64)
-#   lstm_proj:  LSTM with projection (hidden=64, dropout=0.5)
+# Quality control (matches pretraining pipeline):
+#   - SCI >= 0.75, SNR >= 5.0, cardiac band verification
+#   - Recordings that fail QC are excluded from feature extraction
 #
-# Total: 4 setup + 20 training jobs (4 models × 5 classifiers)
+# Per-pair classification: each pair classified independently, predictions
+# averaged across pairs for a per-person prediction.
 #
-# All training jobs include --holdout-tiers "gold,salvageable" for
-# per-epoch evaluation on pristine and high-motion val subsets.
+# Aggregated: all 10 pair features concatenated/pooled into one per-person
+# vector, then classified. More comparable to 20-channel baseline.
 #
-# Usage:
-#   sh scripts/bsub/pre_fnirs_child_adult_sweep_bsub.sh
+# Compare results against 20-channel baseline (AUC 0.974 with bn_lstm64).
 # =============================================================================
 
 # Shared environment
@@ -38,13 +35,10 @@ export PYTHONPATH="/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI/s
 export LSF_DOCKER_VOLUMES="/storage1/fs1/perlmansusan/Active:/storage1/fs1/perlmansusan/Active /home/$USER:/home/$USER"
 export LSF_DOCKER_PRESERVE_ENVIRONMENT=true
 
-export HF_HOME="/storage1/fs1/perlmansusan/Active/moochie/resources/huggingface"
-
 export DATE=$(date +'%m-%d')
 LOG_DIR="$SYNCHRONAI_DIR/scripts/bsub/logs"
 mkdir -p "$LOG_DIR"
 
-# Data directories
 FNIRS_DIRS="/storage1/fs1/perlmansusan/Active/moochie/study_data/CARE/NIRS_data/"
 FNIRS_DIRS="${FNIRS_DIRS}:/storage1/fs1/perlmansusan/Active/moochie/study_data/P-CAT/R56/NIRS_data/"
 FNIRS_DIRS="${FNIRS_DIRS}:/storage1/fs1/perlmansusan/Active/moochie/study_data/P-CAT/R01/data/PSU_share/PSU_data/T1/nirs_data/dbdos/"
@@ -54,20 +48,21 @@ FNIRS_DIRS="${FNIRS_DIRS}:/storage1/fs1/perlmansusan/Active/moochie/study_data/P
 FNIRS_DIRS="${FNIRS_DIRS}:/storage1/fs1/perlmansusan/Active/moochie/study_data/P-CAT/R01/data/PSU_share/WUSTL_data/T3/nirs_data/dbdos/"
 FNIRS_DIRS="${FNIRS_DIRS}:/storage1/fs1/perlmansusan/Active/moochie/study_data/P-CAT/R01/data/PSU_share/WUSTL_data/T5/nirs_data/dbdos/"
 
-SWEEP_DIR="$SYNCHRONAI_DIR/runs/fnirs_child_adult_sweep"
+SWEEP_DIR="$SYNCHRONAI_DIR/runs/fnirs_perpair_sweep"
 
+echo "=== [$SCRIPT_VERSION] ==="
 echo "=========================================="
-echo "  [$SCRIPT_VERSION]"
-echo "  fNIRS Child/Adult Sweep (Per-Pair)"
+echo "  fNIRS Per-Pair Transfer Learning Sweep"
 echo "  Date: $DATE"
 echo "=========================================="
 
 # =============================================================================
-# Per-model pipeline: convert + extract + sweep classifiers
+# For each pretrained model: convert + extract + classify
 # =============================================================================
 
-submit_model_sweep() {
-    local MODEL_NAME="$1"  # small, medium, large
+submit_pipeline() {
+    local MODEL_NAME="$1"       # small, medium, large
+    local BASE_WIDTH="$2"       # for model config
 
     local PRETRAIN_DIR="$SYNCHRONAI_DIR/runs/fnirs_perpair_${MODEL_NAME}"
     local CONFIG_JSON="${PRETRAIN_DIR}/fnirs_diffusion_config.json"
@@ -75,11 +70,11 @@ submit_model_sweep() {
     local ENCODER_PT="${PRETRAIN_DIR}/fnirs_unet_encoder.pt"
     local FEATURE_DIR="$SYNCHRONAI_DIR/data/fnirs_perpair_${MODEL_NAME}_features"
 
-    # --- Setup job: convert + extract ---
-    local SETUP_JOB="synchronai-sweep-setup-${MODEL_NAME}-$DATE"
+    # --- Step 1: Setup job (convert + extract) ---
+    local SETUP_JOB="synchronai-perpair-setup-${MODEL_NAME}-$DATE"
 
     echo ""
-    echo "=== $MODEL_NAME ==="
+    echo "=== $MODEL_NAME (base=$BASE_WIDTH) ==="
     echo "  Submitting setup (convert + extract)..."
 
     bsub -J "$SETUP_JOB" \
@@ -90,19 +85,23 @@ submit_model_sweep() {
          -a 'docker(continuumio/anaconda3)' \
          -n 8 \
          -R 'select[mem>16GB] rusage[mem=16GB]' \
-         -oo "$LOG_DIR/fnirs_sweep_setup_${MODEL_NAME}_$DATE.log" \
-         -g /$USER/fnirs_sweep \
+         -oo "$LOG_DIR/fnirs_perpair_setup_${MODEL_NAME}_$DATE.log" \
+         -g /$USER/fnirs_perpair_transfer \
          << SETUP_EOF
-echo "=== [$SCRIPT_VERSION] setup $MODEL_NAME ==="
-cd \$SYNCHRONAI_DIR
-. "\$SYNCHRONAI_DIR/ml-env/bin/activate"
+echo "=== [$SCRIPT_VERSION] ==="
+conda init
+source /home/$USER/.bashrc
+source $SYNCHRONAI_DIR/ml-env/bin/activate
+cd $SYNCHRONAI_DIR
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
+set -e
 
 CONFIG_JSON="$CONFIG_JSON"
 WEIGHTS_H5="$WEIGHTS_H5"
 ENCODER_PT="$ENCODER_PT"
 FEATURE_DIR="$FEATURE_DIR"
 
+# Check pretrained model exists
 if [ ! -f "\$WEIGHTS_H5" ]; then
     echo "ERROR: Pretrained weights not found: \$WEIGHTS_H5"
     echo "Run pre_fnirs_perpair_pretrain_bsub.sh first."
@@ -125,16 +124,16 @@ else
     echo "=== PyTorch encoder already exists ==="
 fi
 
-FNIRS_DIRS="$FNIRS_DIRS"
-
-# Extract per-pair features with relaxed QC (captures all tiers)
+# Extract per-pair features
 if [ ! -f "\${FEATURE_DIR}/feature_index.csv" ]; then
-    echo "=== Extracting per-pair features (all tiers) ==="
+    echo "=== Extracting per-pair features ==="
+
+    FNIRS_DIRS="$FNIRS_DIRS"
+
     python scripts/extract_fnirs_features.py \
         --encoder-weights "\$ENCODER_PT" \
         --data-dirs "\$FNIRS_DIRS" \
         --output-dir "\$FEATURE_DIR" \
-        --per-pair \
         --stride-seconds 60.0 \
         --enable-qc \
         --sci-threshold 0.40 \
@@ -151,8 +150,8 @@ SETUP_EOF
 
     echo "  Setup job: $SETUP_JOB"
 
-    # --- Classification sweep jobs ---
-    echo "  Submitting 5 classifier jobs..."
+    # --- Step 2: Classification sweep jobs ---
+    echo "  Submitting classification jobs..."
 
     submit_classifier() {
         local RUN_NAME="$1"
@@ -161,9 +160,9 @@ SETUP_EOF
         local POOL="$4"
         local LR="$5"
 
-        echo "    ${MODEL_NAME}_${RUN_NAME} (h=$HIDDEN_DIM, pool=$POOL)"
+        echo "    $RUN_NAME (h=$HIDDEN_DIM, pool=$POOL)"
 
-        bsub -J "synchronai-sweep-${MODEL_NAME}-${RUN_NAME}-$DATE" \
+        bsub -J "synchronai-perpair-${MODEL_NAME}-${RUN_NAME}-$DATE" \
              -G compute-perlmansusan \
              -q general \
              -m general \
@@ -172,12 +171,14 @@ SETUP_EOF
              -n 4 \
              -R 'select[mem>4GB] rusage[mem=4GB]' \
              -w "done($SETUP_JOB)" \
-             -oo "$LOG_DIR/fnirs_sweep_${MODEL_NAME}_${RUN_NAME}_$DATE.log" \
-             -g /$USER/fnirs_sweep \
+             -oo "$LOG_DIR/fnirs_perpair_${MODEL_NAME}_${RUN_NAME}_$DATE.log" \
+             -g /$USER/fnirs_perpair_transfer \
              << EOF
 echo "=== [$SCRIPT_VERSION] train ${MODEL_NAME}_${RUN_NAME} ==="
+conda init
+source /home/$USER/.bashrc
+source $SYNCHRONAI_DIR/ml-env/bin/activate
 cd $SYNCHRONAI_DIR
-. "$SYNCHRONAI_DIR/ml-env/bin/activate"
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
 
 # Force NFS metadata cache refresh and verify features exist
@@ -215,27 +216,26 @@ python scripts/train_fnirs_from_features.py \
 EOF
     }
 
-    submit_classifier "linear"     0   0.0 "mean" "1e-3"
-    submit_classifier "mlp32"      32  0.3 "mean" "3e-4"
-    submit_classifier "mlp64_proj" 64  0.5 "mean" "3e-4"
+    # Per-pair classifiers (each pair classified independently)
     submit_classifier "lstm64"     64  0.3 "lstm" "3e-4"
-    submit_classifier "lstm_proj"  64  0.5 "lstm" "3e-4"
+    submit_classifier "mlp32"      32  0.3 "mean" "3e-4"
+    submit_classifier "linear"     0   0.0 "mean" "1e-3"
 }
 
-# Submit for all 4 per-pair model sizes
-submit_model_sweep "micro"
-submit_model_sweep "small"
-submit_model_sweep "medium"
-submit_model_sweep "large"
+# Submit pipelines for all 4 pretrained model sizes
+submit_pipeline "micro"  8
+submit_pipeline "small"  16
+submit_pipeline "medium" 32
+submit_pipeline "large"  64
 
 echo ""
 echo "=========================================="
-echo "  4 setup + 20 training jobs submitted"
-echo "  Training jobs wait for their setup job"
+echo "  4 setup + 12 training jobs submitted"
+echo "  Training jobs wait for setup to finish"
 echo ""
-echo "  Monitor: bjobs -g /\$USER/fnirs_sweep"
+echo "  Monitor: bjobs -g /\$USER/fnirs_perpair_transfer"
 echo ""
 echo "  After all complete:"
-echo "    Compare across model sizes and classifiers"
-echo "    Previous 20-ch baseline: AUC 0.974 (bn_lstm64)"
+echo "    Compare per-pair results across model sizes"
+echo "    Best 20-channel baseline: AUC 0.974 (bn_lstm64)"
 echo "=========================================="
