@@ -142,6 +142,38 @@ def compute_metrics(logits, labels):
     return acc, auc, f1
 
 
+def _evaluate_loader(model, criterion, loader):
+    """Evaluate model on a dataloader. Returns (loss, acc, auc, f1) or None if empty."""
+    model.eval()
+    total_loss = 0.0
+    all_logits = []
+    all_labels = []
+
+    with torch.no_grad():
+        for batch in loader:
+            features = batch["features"]
+            labels = batch["label"]
+            valid_mask = labels >= 0
+            if valid_mask.sum() == 0:
+                continue
+            features = features[valid_mask]
+            labels = labels[valid_mask]
+            logits = model(features).squeeze(-1)
+            loss = criterion(logits, labels)
+            total_loss += loss.item() * features.size(0)
+            all_logits.append(logits)
+            all_labels.append(labels)
+
+    if not all_logits:
+        return None
+
+    total_loss /= sum(l.size(0) for l in all_labels)
+    all_logits = torch.cat(all_logits)
+    all_labels = torch.cat(all_labels)
+    acc, auc, f1 = compute_metrics(all_logits, all_labels)
+    return total_loss, acc, auc, f1
+
+
 def train_fnirs_from_features(
     feature_dir: str,
     save_dir: str,
@@ -159,10 +191,26 @@ def train_fnirs_from_features(
     val_split: float = 0.2,
     num_workers: int = 4,
     seed: int = 42,
+    include_tiers: list[str] | None = None,
+    holdout_tiers: list[str] | None = None,
 ) -> None:
-    """Train a classifier on pre-extracted fNIRS features."""
+    """Train a classifier on pre-extracted fNIRS features.
 
-    from synchronai.data.fnirs.feature_dataset import create_fnirs_feature_dataloaders
+    Args:
+        holdout_tiers: Additional quality tiers to evaluate each epoch as
+            separate test sets (e.g. ["gold", "salvageable"]). These are
+            evaluation-only — never used for training or early stopping.
+            Requires feature_index.csv to have a quality_tier column.
+    """
+
+    from synchronai.data.fnirs.feature_dataset import (
+        create_fnirs_feature_dataloaders,
+        filter_by_quality_tier,
+        load_fnirs_feature_index,
+        split_fnirs_feature_entries,
+        FnirsFeatureDataset,
+        _fnirs_feature_collate_fn,
+    )
 
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -184,12 +232,47 @@ def train_fnirs_from_features(
             label_map=label_map,
             num_workers=num_workers,
             seed=seed,
+            include_tiers=include_tiers,
         )
     )
 
     logger.info(f"Feature dim: {feature_dim}")
     logger.info(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
     logger.info(f"Pos weight: {pos_weight:.3f}")
+
+    # Build holdout-tier evaluation loaders (eval-only, never trained on)
+    holdout_loaders: dict[str, torch.utils.data.DataLoader] = {}
+    if holdout_tiers:
+        feature_dir_path = Path(feature_dir)
+        df = load_fnirs_feature_index(feature_dir_path)
+        # Filter to valid labels
+        if label_column in df.columns:
+            df = df[df[label_column].isin(label_map.keys())]
+        all_entries = df.to_dict("records")
+        # Use the same subject split as training so holdout tiers only
+        # contain subjects from the val set (prevents leakage)
+        _, val_entries = split_fnirs_feature_entries(all_entries, val_split, seed)
+
+        for tier in holdout_tiers:
+            tier_entries = filter_by_quality_tier(val_entries, [tier])
+            if not tier_entries:
+                logger.warning(f"Holdout tier '{tier}': no val entries, skipping")
+                continue
+            tier_dataset = FnirsFeatureDataset(
+                feature_dir_path, tier_entries, label_column, label_map
+            )
+            tier_loader = torch.utils.data.DataLoader(
+                tier_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=_fnirs_feature_collate_fn,
+            )
+            holdout_loaders[tier] = tier_loader
+            logger.info(
+                f"Holdout tier '{tier}': {len(tier_entries)} val entries, "
+                f"{len(tier_loader)} batches"
+            )
 
     if len(train_loader) == 0 or len(val_loader) == 0:
         logger.error(
@@ -348,6 +431,23 @@ def train_fnirs_from_features(
             f"AUC: {val_auc:.4f}, F1: {val_f1:.4f} | LR: {lr:.2e}"
         )
 
+        # Evaluate on holdout tiers (eval-only, no effect on early stopping)
+        for tier_name, tier_loader in holdout_loaders.items():
+            tier_result = _evaluate_loader(model, criterion, tier_loader)
+            if tier_result is None:
+                continue
+            t_loss, t_acc, t_auc, t_f1 = tier_result
+            history_key = f"holdout_{tier_name}"
+            history.setdefault(f"{history_key}_aucs", []).append(float(t_auc))
+            history.setdefault(f"{history_key}_accs", []).append(float(t_acc))
+            history.setdefault(f"{history_key}_f1s", []).append(float(t_f1))
+            history.setdefault(f"{history_key}_losses", []).append(float(t_loss))
+            logger.info(
+                f"  Holdout [{tier_name}] — "
+                f"Loss: {t_loss:.4f}, Acc: {t_acc:.4f}, "
+                f"AUC: {t_auc:.4f}, F1: {t_f1:.4f}"
+            )
+
         # Check for improvement
         if val_auc > best_auc:
             best_auc = val_auc
@@ -406,8 +506,19 @@ def main():
     parser.add_argument("--val-split", type=float, default=0.2)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--include-tiers", default=None,
+                        help="Comma-separated quality tiers to include for training "
+                             "(e.g. 'gold', 'gold,standard', 'salvageable'). "
+                             "Filters feature_index.csv by quality_tier column.")
+    parser.add_argument("--holdout-tiers", default=None,
+                        help="Comma-separated quality tiers to evaluate each epoch "
+                             "as separate test sets (e.g. 'gold,salvageable'). "
+                             "Eval-only — never trained on or used for early stopping.")
 
     args = parser.parse_args()
+
+    include_tiers = args.include_tiers.split(",") if args.include_tiers else None
+    holdout_tiers = args.holdout_tiers.split(",") if args.holdout_tiers else None
 
     train_fnirs_from_features(
         feature_dir=args.feature_dir,
@@ -426,6 +537,8 @@ def main():
         val_split=args.val_split,
         num_workers=args.num_workers,
         seed=args.seed,
+        include_tiers=include_tiers,
+        holdout_tiers=holdout_tiers,
     )
 
 

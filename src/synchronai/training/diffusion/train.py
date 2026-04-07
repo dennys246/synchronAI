@@ -378,8 +378,12 @@ class RunningStats:
 
     @property
     def std(self) -> np.ndarray:
-        """Return the current standard deviation estimate."""
-        return np.sqrt(np.maximum(self.variance, 1e-6)).astype(np.float32)
+        """Return the current standard deviation estimate.
+
+        Floor is 1e-12 (variance) / 1e-6 (std) to handle per-pair fNIRS
+        data where HbO/HbR concentrations have variance in the 1e-9 range.
+        """
+        return np.sqrt(np.maximum(self.variance, 1e-12)).astype(np.float32)
 
     def get_mean(self) -> np.ndarray:
         """Return the current mean estimate."""
@@ -646,6 +650,15 @@ def train_fnirs_diffusion(
     save_every_batches: int = 0,
     lr_schedule: str = "constant",
     eval_gen_every: int = 10,
+    per_pair: bool = False,
+    # Quality control parameters
+    enable_qc: bool = False,
+    sci_threshold: float = 0.5,
+    snr_threshold: float = 5.0,
+    cardiac_peak_ratio: float = 2.0,
+    require_cardiac: bool = True,
+    peak_power_low: Optional[float] = None,
+    peak_power_high: Optional[float] = None,
 ) -> FnirsDiffusionConfig:
     """
     Train a diffusion model on fNIRS windows and save weights + config.
@@ -657,6 +670,17 @@ def train_fnirs_diffusion(
         signal_type: Type of signal to train on - 'hemodynamic' (HbO/HbR) or 'neural' (deconvolved)
         stats_mode: "frozen" (precompute stats) or "streaming" (update during training)
         save_every_batches: Save checkpoints every N recording batches (0 = per-epoch only)
+        per_pair: If True, split each recording into individual source-detector pairs,
+            producing feature_dim=2 (HbO, HbR) instead of feature_dim=20 (10 pairs × 2).
+            Each window yields 10× more training samples. The model learns universal
+            hemodynamic dynamics that generalize to any montage configuration.
+        enable_qc: Enable multi-stage quality control pipeline.
+        sci_threshold: Minimum scalp coupling index (0-1).
+        snr_threshold: Minimum PSD-based SNR for scan rejection.
+        cardiac_peak_ratio: Min ratio of cardiac peak to median PSD.
+        require_cardiac: Reject channels without detectable cardiac signal.
+        peak_power_low: Min acceptable peak PSD.
+        peak_power_high: Max acceptable peak PSD.
     """
     logger = get_logger(__name__)
     trace("train_fnirs_diffusion: start")
@@ -667,6 +691,21 @@ def train_fnirs_diffusion(
         raise ValueError(f"stats_mode must be 'frozen' or 'streaming', got: {stats_mode}")
     if save_every_batches < 0:
         raise ValueError("save_every_batches must be >= 0")
+
+    # QC cache: persist results so each recording is only checked once
+    qc_cache_path = str(save_root / "qc_cache.csv") if enable_qc else None
+
+    # Quality control kwargs passed to every load_training_windows call
+    qc_kwargs = dict(
+        enable_qc=enable_qc,
+        sci_threshold=sci_threshold,
+        snr_threshold=snr_threshold,
+        cardiac_peak_ratio=cardiac_peak_ratio,
+        require_cardiac=require_cardiac,
+        peak_power_low=peak_power_low,
+        peak_power_high=peak_power_high,
+        qc_cache_path=qc_cache_path,
+    )
 
     # Initialize lazy discovery
     discovery = LazyFnirsDiscovery(
@@ -733,8 +772,41 @@ def train_fnirs_diffusion(
         deconvolution=deconvolution,
         max_recordings=None,  # Load all paths in the slice (which is just the first batch)
         normalize=False,  # Don't normalize yet - we'll use running stats
+        per_pair=per_pair,
+        **qc_kwargs,
     )
     trace("train_fnirs_diffusion: loaded initial training windows (raw)")
+
+    if training.windows.size == 0:
+        logger.warning(
+            "Initial batch yielded no valid windows (all QC-rejected). "
+            "Trying next batches of recordings..."
+        )
+        batch_start = initial_batch_size
+        while training.windows.size == 0 and batch_start < len(train_paths):
+            batch_end = min(batch_start + initial_batch_size, len(train_paths))
+            logger.info(f"Trying recordings {batch_start}–{batch_end} of {len(train_paths)}...")
+            training = load_training_windows(
+                train_paths[batch_start:batch_end],
+                duration_seconds=duration_seconds,
+                target_sfreq_hz=target_sfreq_hz,
+                segments_per_recording=segments_per_recording,
+                seed=seed,
+                deconvolution=deconvolution,
+                max_recordings=None,
+                normalize=False,
+                per_pair=per_pair,
+                **qc_kwargs,
+            )
+            batch_start = batch_end
+            if training.windows.size > 0:
+                logger.info(f"Found {training.windows.shape[0]} valid windows from batch {batch_start-initial_batch_size}–{batch_start}")
+        if training.windows.size == 0:
+            raise RuntimeError(
+                f"No valid windows found in any of {len(train_paths)} recordings. "
+                f"Check QC thresholds (sci={qc_kwargs.get('sci_threshold')}, "
+                f"snr={qc_kwargs.get('snr_threshold')})."
+            )
 
     target_len = int(training.windows.shape[1])
     feature_dim = int(training.windows.shape[2])
@@ -787,6 +859,8 @@ def train_fnirs_diffusion(
                         deconvolution=deconvolution,
                         max_recordings=None,
                         normalize=False,
+                        per_pair=per_pair,
+                        **qc_kwargs,
                     )
                     running_stats.update_batch(batch_training.windows)
                 except Exception as stats_err:
@@ -1032,6 +1106,8 @@ def train_fnirs_diffusion(
                     deconvolution=deconvolution,
                     max_recordings=None,  # Load all in this batch
                     normalize=False,  # Don't normalize - we'll use running stats
+                    per_pair=per_pair,
+                    **qc_kwargs,
                 )
 
                 # Update running statistics with this batch (streaming mode only)
@@ -1196,6 +1272,8 @@ def train_fnirs_diffusion(
                         deconvolution=deconvolution,
                         max_recordings=None,
                         normalize=False,
+                        per_pair=per_pair,
+                        **qc_kwargs,
                     )
                 except Exception as val_load_err:
                     logger.warning("Val: skipping batch at offset %d: %s", vstart, val_load_err)
@@ -1264,6 +1342,7 @@ def train_fnirs_diffusion(
                             deconvolution=deconvolution,
                             max_recordings=None,
                             normalize=False,
+                            **qc_kwargs,
                         )
                     except Exception:
                         continue

@@ -25,7 +25,7 @@ class HemoglobinMeta:
     hb_types: List[str]
     raw_channel_names: List[str]
 
-def _read_raw_fnirs(fnirs_path: str):
+def read_raw_fnirs(fnirs_path: str):
     logger = get_logger(__name__)
     if os.environ.get("SYNCHRONAI_VERBOSEE") == "1":
         mne.set_log_level("DEBUG")
@@ -71,7 +71,7 @@ def load_fnirs(fnirs_path: str, *, deconvolution: bool = False):
     """
     logger = get_logger(__name__)
     trace(f"load_fnirs: reading raw {fnirs_path}")
-    raw_scan = _read_raw_fnirs(fnirs_path)
+    raw_scan = read_raw_fnirs(fnirs_path)
     trace("load_fnirs: raw read complete")
 
     # Validate raw data before preprocessing to catch issues early

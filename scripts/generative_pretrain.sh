@@ -20,6 +20,9 @@ DEFAULT_DURATION_SECONDS=60.0
 DEFAULT_VAL_FRACTION=0.2
 DEFAULT_LR_SCHEDULE=cosine_restarts
 DEFAULT_EVAL_GEN_EVERY=10
+DEFAULT_SCI_THRESHOLD=0.5
+DEFAULT_SNR_THRESHOLD=5.0
+DEFAULT_CARDIAC_PEAK_RATIO=2.0
 
 EPOCHS="$DEFAULT_EPOCHS"
 LR="$DEFAULT_LR"
@@ -37,6 +40,14 @@ DURATION_SECONDS="$DEFAULT_DURATION_SECONDS"
 VAL_FRACTION="$DEFAULT_VAL_FRACTION"
 LR_SCHEDULE="$DEFAULT_LR_SCHEDULE"
 EVAL_GEN_EVERY="$DEFAULT_EVAL_GEN_EVERY"
+PER_PAIR=0
+ENABLE_QC=0
+SCI_THRESHOLD="$DEFAULT_SCI_THRESHOLD"
+SNR_THRESHOLD="$DEFAULT_SNR_THRESHOLD"
+CARDIAC_PEAK_RATIO="$DEFAULT_CARDIAC_PEAK_RATIO"
+REQUIRE_CARDIAC=1
+PEAK_POWER_LOW=""
+PEAK_POWER_HIGH=""
 SAVE_ROOT="${SYNCHRONAI_DIR:-$(dirname "$(dirname "$(realpath "$0")")")}/runs/fnirs_diffusion"
 
 usage() {
@@ -109,9 +120,51 @@ while [[ $# -gt 0 ]]; do
       UNET_BASE_WIDTH="$2"
       shift 2
       ;;
+    --unet-depth)
+      require_arg "$1" "${2:-}"
+      UNET_DEPTH="$2"
+      shift 2
+      ;;
     --eval-gen-every)
       require_arg "$1" "${2:-}"
       EVAL_GEN_EVERY="$2"
+      shift 2
+      ;;
+    --per-pair)
+      PER_PAIR=1
+      shift 1
+      ;;
+    --enable-qc)
+      ENABLE_QC=1
+      shift 1
+      ;;
+    --sci-threshold)
+      require_arg "$1" "${2:-}"
+      SCI_THRESHOLD="$2"
+      shift 2
+      ;;
+    --snr-threshold)
+      require_arg "$1" "${2:-}"
+      SNR_THRESHOLD="$2"
+      shift 2
+      ;;
+    --cardiac-peak-ratio)
+      require_arg "$1" "${2:-}"
+      CARDIAC_PEAK_RATIO="$2"
+      shift 2
+      ;;
+    --no-require-cardiac)
+      REQUIRE_CARDIAC=0
+      shift 1
+      ;;
+    --peak-power-low)
+      require_arg "$1" "${2:-}"
+      PEAK_POWER_LOW="$2"
+      shift 2
+      ;;
+    --peak-power-high)
+      require_arg "$1" "${2:-}"
+      PEAK_POWER_HIGH="$2"
       shift 2
       ;;
     -h|--help)
@@ -183,6 +236,24 @@ CMD=(
   --lr-schedule "$LR_SCHEDULE"
   --eval-gen-every "$EVAL_GEN_EVERY"
 )
+if [[ "$PER_PAIR" -eq 1 ]]; then
+  CMD+=(--per-pair)
+fi
+if [[ "$ENABLE_QC" -eq 1 ]]; then
+  CMD+=(--enable-qc)
+  CMD+=(--sci-threshold "$SCI_THRESHOLD")
+  CMD+=(--snr-threshold "$SNR_THRESHOLD")
+  CMD+=(--cardiac-peak-ratio "$CARDIAC_PEAK_RATIO")
+  if [[ "$REQUIRE_CARDIAC" -eq 0 ]]; then
+    CMD+=(--no-require-cardiac)
+  fi
+  if [[ -n "$PEAK_POWER_LOW" ]]; then
+    CMD+=(--peak-power-low "$PEAK_POWER_LOW")
+  fi
+  if [[ -n "$PEAK_POWER_HIGH" ]]; then
+    CMD+=(--peak-power-high "$PEAK_POWER_HIGH")
+  fi
+fi
 if [[ "$VERBOSEE" -eq 1 ]]; then
   CMD+=(--verbosee)
 fi

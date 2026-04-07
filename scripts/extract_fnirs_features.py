@@ -46,12 +46,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def feature_filename(fnirs_path: str, segment_idx: int = 0) -> str:
+def feature_filename(fnirs_path: str, segment_idx: int = 0, suffix: str = "") -> str:
     """Deterministic filename for a feature file."""
-    key = f"{fnirs_path}:{segment_idx}"
+    key = f"{fnirs_path}:{segment_idx}{suffix}"
     h = hashlib.md5(key.encode()).hexdigest()[:12]
     stem = Path(fnirs_path).stem[:30]
-    return f"{stem}_{segment_idx:03d}_{h}.pt"
+    return f"{stem}_{segment_idx:03d}{suffix}_{h}.pt"
 
 
 def extract_subject_id(path: str) -> str:
@@ -192,35 +192,67 @@ def load_and_normalize_recording(
     hb_types: list[str],
     target_sfreq: Optional[float] = None,
     duration_seconds: float = 60.0,
-) -> Optional[np.ndarray]:
+    per_pair: bool = False,
+    signal_type: str = "hemodynamic",
+) -> Optional[np.ndarray | list[tuple[str, np.ndarray]]]:
     """Load an fNIRS recording, preprocess, and normalize.
 
+    Args:
+        per_pair: If True, return a list of (pair_name, array) tuples where
+            each array is (time, 2) for one HbO/HbR pair. Uses whatever
+            pairs are available in the recording — no alignment to a fixed
+            target set. Normalization uses per-pair stats (mean/std over
+            the 2 HbO/HbR channels).
+        signal_type: 'hemodynamic' (default) or 'neural' (deconvolved).
+            When 'neural', the file is already deconvolved by HRfunc so
+            we skip re-running deconvolution.
+
     Returns:
-        Normalized array of shape (time, features) or None on failure.
+        If per_pair=False: (time, features) array or None.
+        If per_pair=True: list of (pair_name, (time, 2)) tuples or None.
     """
     try:
         from synchronai.data.fnirs.processing import extract_hemoglobin_pairs, load_fnirs
         from synchronai.data.fnirs.dataset import _align_pairs
 
+        # Neural (deconvolved) files are already preprocessed by HRfunc.
+        # We still run load_fnirs for consistent channel handling but
+        # skip deconvolution to avoid double-processing.
         raw = load_fnirs(fnirs_path, deconvolution=False)
         if target_sfreq is not None:
             raw = raw.copy().resample(target_sfreq)
 
         x, meta = extract_hemoglobin_pairs(raw)
 
-        # Align to target pair set
-        x = _align_pairs(x, meta, target_pairs)
+        if per_pair:
+            # Return each pair individually — flexible channel count
+            # x shape: (time, n_pairs, n_hb) where n_hb=2 (HbO, HbR)
+            pair_names = meta.pair_names if hasattr(meta, 'pair_names') else [
+                f"pair_{i}" for i in range(x.shape[1])
+            ]
+            pairs = []
+            for pair_idx, pair_name in enumerate(pair_names):
+                pair_data = x[:, pair_idx, :].astype(np.float32)  # (time, 2)
+                # Normalize per-pair using the per-pair training stats
+                std_safe = np.maximum(feature_std, 1e-8)
+                pair_data = (pair_data - feature_mean) / std_safe
+                pair_data = np.clip(pair_data, -6.0, 6.0)
+                pairs.append((pair_name, pair_data))
+            return pairs
+        else:
+            # Align to target pair set
+            x = _align_pairs(x, meta, target_pairs)
 
-        # Reshape to (time, features): (time, pairs, hb_types) -> (time, pairs*hb_types)
-        n_time, n_pairs, n_hb = x.shape
-        x = x.reshape(n_time, n_pairs * n_hb).astype(np.float32)
+            # Reshape to (time, features): (time, pairs, hb_types) -> (time, pairs*hb_types)
+            n_time, n_pairs, n_hb = x.shape
+            x = x.reshape(n_time, n_pairs * n_hb).astype(np.float32)
 
-        # Normalize using training statistics
-        std_safe = np.maximum(feature_std, 1e-8)
-        x = (x - feature_mean) / std_safe
-        x = np.clip(x, -6.0, 6.0)
+            # Normalize using training statistics
+            std_safe = np.maximum(feature_std, 1e-8)
+            x = (x - feature_mean) / std_safe
+            x = np.clip(x, -6.0, 6.0)
 
-        return x
+            return x
 
     except Exception as e:
         logger.warning(f"Failed to load {fnirs_path}: {e}")
@@ -275,8 +307,22 @@ def extract_features(
     device: str = "cpu",
     stride_seconds: float = 60.0,
     random_init: bool = False,
+    per_pair: bool = False,
+    enable_qc: bool = False,
+    sci_threshold: float = 0.75,
+    snr_threshold: float = 5.0,
+    cardiac_peak_ratio: float = 2.0,
+    require_cardiac: bool = True,
+    include_tiers: Optional[list[str]] = None,
 ) -> None:
-    """Extract fNIRS encoder features for all discovered recordings."""
+    """Extract fNIRS encoder features for all discovered recordings.
+
+    Args:
+        per_pair: If True, extract features for each source-detector pair
+            independently using a per-pair encoder (feature_dim=2). Each
+            recording produces N_pairs × N_windows features instead of
+            N_windows. Accepts recordings with any number of channels.
+    """
 
     output_dir = Path(output_dir)
     features_dir = output_dir / "features"
@@ -337,6 +383,18 @@ def extract_features(
         logger.error("No fNIRS recordings found!")
         return
 
+    # QC setup
+    n_qc_rejected = 0
+    tier_counts: dict[str, int] = {}
+    if enable_qc:
+        from synchronai.data.fnirs.processing import read_raw_fnirs, load_fnirs
+        from synchronai.data.fnirs.quality_control import run_quality_control, QUALITY_TIERS
+        logger.info(
+            "QC enabled: sci_threshold=%.2f, snr_threshold=%.1f, "
+            "require_cardiac=%s, cardiac_peak_ratio=%.1f",
+            sci_threshold, snr_threshold, require_cardiac, cardiac_peak_ratio,
+        )
+
     # Extract features
     index_rows = []
     n_success = 0
@@ -368,58 +426,160 @@ def extract_features(
                     "feature_dim": feat.shape[-1],
                     "n_frames": feat.shape[0] if feat.ndim == 2 else 1,
                     "multiscale": multiscale,
+                    "quality_tier": "unknown",  # tier not available on resume
                 })
                 seg_idx += 1
                 n_success += 1
             continue
 
-        # Load and normalize full recording
-        x = load_and_normalize_recording(
-            fnirs_path,
-            feature_mean=feature_mean,
-            feature_std=feature_std,
-            target_pairs=target_pairs,
-            hb_types=hb_types,
-            target_sfreq=target_sfreq,
-            duration_seconds=duration_seconds,
-        )
-        if x is None:
-            n_fail += 1
-            continue
+        # Quality control pre-check (also classifies quality tier)
+        recording_tier = "unknown"
+        if enable_qc:
+            try:
+                raw_scan = read_raw_fnirs(fnirs_path)
+                preprocessed = load_fnirs(fnirs_path, deconvolution=False)
+                qc_report = run_quality_control(
+                    raw_scan,
+                    preprocessed,
+                    sci_threshold=sci_threshold,
+                    snr_threshold=snr_threshold,
+                    cardiac_peak_ratio=cardiac_peak_ratio,
+                    require_cardiac=require_cardiac,
+                )
+                del raw_scan, preprocessed
+                recording_tier = qc_report.quality_tier
+                tier_counts[recording_tier] = tier_counts.get(recording_tier, 0) + 1
 
-        # Slice into windows
-        windows = window_recording(x, model_len, stride_seconds, target_sfreq)
+                # Tier-based filtering: if include_tiers is set, only keep
+                # recordings whose tier is in the list (overrides scan_passed).
+                if include_tiers is not None:
+                    if recording_tier not in include_tiers:
+                        logger.info(
+                            "Tier-filtered %s (tier=%s, want %s)",
+                            fnirs_path, recording_tier, include_tiers,
+                        )
+                        n_qc_rejected += 1
+                        n_fail += 1
+                        continue
+                elif not qc_report.scan_passed:
+                    logger.info(
+                        "QC rejected %s (tier=%s): %s", fnirs_path,
+                        recording_tier, "; ".join(qc_report.rejection_reasons),
+                    )
+                    n_qc_rejected += 1
+                    n_fail += 1
+                    continue
+            except Exception as qc_err:
+                logger.warning("QC failed for %s: %s", fnirs_path, qc_err)
+                n_fail += 1
+                continue
 
-        for seg_idx, window in enumerate(windows):
-            fname = feature_filename(fnirs_path, segment_idx=seg_idx)
-            feat_path = features_dir / fname
+        if per_pair:
+            # Per-pair mode: load all available pairs, extract each independently
+            pairs_data = load_and_normalize_recording(
+                fnirs_path,
+                feature_mean=feature_mean,
+                feature_std=feature_std,
+                target_pairs=target_pairs,
+                hb_types=hb_types,
+                target_sfreq=target_sfreq,
+                duration_seconds=duration_seconds,
+                per_pair=True,
+                signal_type=signal_type,
+            )
+            if pairs_data is None:
+                n_fail += 1
+                continue
 
-            x_tensor = torch.tensor(window, dtype=torch.float32).unsqueeze(0).to(device)
+            for pair_name, pair_array in pairs_data:
+                # Window this pair's data
+                pair_windows = window_recording(pair_array, model_len, stride_seconds, target_sfreq)
 
-            with torch.no_grad():
-                if multiscale:
-                    outputs = encoder(x_tensor, return_all_levels=True)
-                    pooled_parts = []
-                    for key in sorted(outputs.keys()):
-                        pooled_parts.append(outputs[key].squeeze(0).mean(dim=0))
-                    feat_to_save = torch.cat(pooled_parts).cpu()  # (960,)
-                else:
-                    features = encoder(x_tensor)  # (1, 59, 512)
-                    feat_to_save = features.squeeze(0).cpu()  # (59, 512)
+                for seg_idx, window in enumerate(pair_windows):
+                    fname = feature_filename(
+                        fnirs_path, segment_idx=seg_idx,
+                        suffix=f"_{pair_name}",
+                    )
+                    feat_path = features_dir / fname
 
-            torch.save(feat_to_save, feat_path)
+                    x_tensor = torch.tensor(window, dtype=torch.float32).unsqueeze(0).to(device)
 
-            index_rows.append({
-                "feature_file": fname,
-                "fnirs_path": fnirs_path,
-                "subject_id": subject_id,
-                "participant_type": participant_type,
-                "window_idx": seg_idx,
-                "feature_dim": feat_to_save.shape[-1] if feat_to_save.ndim > 1 else feat_to_save.shape[0],
-                "n_frames": feat_to_save.shape[0] if feat_to_save.ndim == 2 else 1,
-                "multiscale": multiscale,
-            })
-            n_success += 1
+                    with torch.no_grad():
+                        if multiscale:
+                            outputs = encoder(x_tensor, return_all_levels=True)
+                            pooled_parts = []
+                            for key in sorted(outputs.keys()):
+                                pooled_parts.append(outputs[key].squeeze(0).mean(dim=0))
+                            feat_to_save = torch.cat(pooled_parts).cpu()
+                        else:
+                            features = encoder(x_tensor)
+                            feat_to_save = features.squeeze(0).cpu()
+
+                    torch.save(feat_to_save, feat_path)
+
+                    index_rows.append({
+                        "feature_file": fname,
+                        "fnirs_path": fnirs_path,
+                        "subject_id": subject_id,
+                        "participant_type": participant_type,
+                        "window_idx": seg_idx,
+                        "pair_name": pair_name,
+                        "feature_dim": feat_to_save.shape[-1] if feat_to_save.ndim > 1 else feat_to_save.shape[0],
+                        "n_frames": feat_to_save.shape[0] if feat_to_save.ndim == 2 else 1,
+                        "multiscale": multiscale,
+                        "quality_tier": recording_tier,
+                    })
+                    n_success += 1
+        else:
+            # Standard mode: aligned 20-channel input
+            x = load_and_normalize_recording(
+                fnirs_path,
+                feature_mean=feature_mean,
+                feature_std=feature_std,
+                target_pairs=target_pairs,
+                hb_types=hb_types,
+                target_sfreq=target_sfreq,
+                duration_seconds=duration_seconds,
+                signal_type=signal_type,
+            )
+            if x is None:
+                n_fail += 1
+                continue
+
+            # Slice into windows
+            windows = window_recording(x, model_len, stride_seconds, target_sfreq)
+
+            for seg_idx, window in enumerate(windows):
+                fname = feature_filename(fnirs_path, segment_idx=seg_idx)
+                feat_path = features_dir / fname
+
+                x_tensor = torch.tensor(window, dtype=torch.float32).unsqueeze(0).to(device)
+
+                with torch.no_grad():
+                    if multiscale:
+                        outputs = encoder(x_tensor, return_all_levels=True)
+                        pooled_parts = []
+                        for key in sorted(outputs.keys()):
+                            pooled_parts.append(outputs[key].squeeze(0).mean(dim=0))
+                        feat_to_save = torch.cat(pooled_parts).cpu()
+                    else:
+                        features = encoder(x_tensor)
+                        feat_to_save = features.squeeze(0).cpu()
+
+                torch.save(feat_to_save, feat_path)
+
+                index_rows.append({
+                    "feature_file": fname,
+                    "fnirs_path": fnirs_path,
+                    "subject_id": subject_id,
+                    "participant_type": participant_type,
+                    "window_idx": seg_idx,
+                    "feature_dim": feat_to_save.shape[-1] if feat_to_save.ndim > 1 else feat_to_save.shape[0],
+                    "n_frames": feat_to_save.shape[0] if feat_to_save.ndim == 2 else 1,
+                    "multiscale": multiscale,
+                    "quality_tier": recording_tier,
+                })
+                n_success += 1
 
         if (i + 1) % 50 == 0:
             elapsed = time.time() - start_time
@@ -439,6 +599,14 @@ def extract_features(
 
     logger.info(f"Extraction complete in {elapsed:.1f}s")
     logger.info(f"  Success: {n_success}, Failed: {n_fail}")
+    if enable_qc:
+        logger.info(f"  QC rejected: {n_qc_rejected} recordings")
+        if tier_counts:
+            logger.info("  Quality tier distribution (recordings):")
+            for tier in ("gold", "standard", "salvageable", "rejected"):
+                count = tier_counts.get(tier, 0)
+                if count:
+                    logger.info(f"    {tier}: {count}")
     logger.info(f"  Features saved to: {features_dir}")
     logger.info(f"  Index saved to: {index_path}")
     if index_rows:
@@ -500,8 +668,36 @@ def main():
         help="Use randomly initialized encoder (no pretrained weights). "
              "For ablation: proves pretraining is necessary.",
     )
+    parser.add_argument(
+        "--per-pair", action="store_true", default=True,
+        help="Extract features per source-detector pair (default). "
+             "Each pair produces (time, 2) input. Accepts any channel count.",
+    )
+    parser.add_argument(
+        "--no-per-pair", action="store_true",
+        help="Disable per-pair mode. Use aligned 20-channel input instead.",
+    )
+
+    # Quality control arguments
+    parser.add_argument("--enable-qc", action="store_true",
+                        help="Enable multi-stage fNIRS quality control pipeline.")
+    parser.add_argument("--sci-threshold", type=float, default=0.75,
+                        help="Minimum scalp coupling index (0-1).")
+    parser.add_argument("--snr-threshold", type=float, default=5.0,
+                        help="Minimum PSD-based SNR.")
+    parser.add_argument("--cardiac-peak-ratio", type=float, default=2.0,
+                        help="Minimum ratio of cardiac-band peak to median PSD.")
+    parser.add_argument("--no-require-cardiac", action="store_true",
+                        help="Don't reject channels missing cardiac signal.")
+    parser.add_argument("--include-tiers", default=None,
+                        help="Comma-separated quality tiers to include "
+                             "(e.g. 'gold', 'gold,standard', 'salvageable'). "
+                             "Overrides default QC pass/fail gate. Requires --enable-qc.")
 
     args = parser.parse_args()
+
+    per_pair = args.per_pair and not args.no_per_pair
+    include_tiers = args.include_tiers.split(",") if args.include_tiers else None
 
     extract_features(
         data_dirs=args.data_dirs,
@@ -513,6 +709,13 @@ def main():
         device=args.device,
         stride_seconds=args.stride_seconds,
         random_init=args.random_init,
+        per_pair=per_pair,
+        enable_qc=args.enable_qc,
+        sci_threshold=args.sci_threshold,
+        snr_threshold=args.snr_threshold,
+        cardiac_peak_ratio=args.cardiac_peak_ratio,
+        require_cardiac=not args.no_require_cardiac,
+        include_tiers=include_tiers,
     )
 
 

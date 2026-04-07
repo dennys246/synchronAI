@@ -168,6 +168,39 @@ def split_fnirs_feature_entries(
     return train_entries, val_entries
 
 
+def filter_by_quality_tier(
+    entries: list[dict],
+    include_tiers: list[str] | None = None,
+) -> list[dict]:
+    """Filter feature entries by quality tier.
+
+    Args:
+        entries: Feature index rows (dicts with optional 'quality_tier' key).
+        include_tiers: List of tiers to keep (e.g. ["gold"], ["salvageable"]).
+            If None, all entries are kept (no filtering).
+
+    Returns:
+        Filtered list of entries.
+    """
+    if include_tiers is None:
+        return entries
+
+    before = len(entries)
+    filtered = [e for e in entries if e.get("quality_tier", "unknown") in include_tiers]
+    logger.info(
+        "Quality tier filter (keep=%s): %d → %d entries",
+        include_tiers, before, len(filtered),
+    )
+    # Log tier distribution of kept entries
+    tier_counts: dict[str, int] = {}
+    for e in filtered:
+        t = e.get("quality_tier", "unknown")
+        tier_counts[t] = tier_counts.get(t, 0) + 1
+    for t, c in sorted(tier_counts.items()):
+        logger.info("  %s: %d entries", t, c)
+    return filtered
+
+
 def create_fnirs_feature_dataloaders(
     feature_dir: Union[str, Path],
     batch_size: int = 32,
@@ -176,8 +209,14 @@ def create_fnirs_feature_dataloaders(
     label_map: dict[str, int] | None = None,
     num_workers: int = 4,
     seed: int = 42,
+    include_tiers: list[str] | None = None,
 ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, float, int]:
     """Create train/val dataloaders from pre-extracted fNIRS features.
+
+    Args:
+        include_tiers: If set, only include entries whose quality_tier is in
+            this list.  E.g. ["gold"] for low-motion holdout, ["salvageable"]
+            for high-motion holdout.
 
     Returns:
         (train_loader, val_loader, pos_weight, feature_dim)
@@ -207,8 +246,16 @@ def create_fnirs_feature_dataloaders(
         )
 
     entries = df.to_dict("records")
-    feature_dim = int(df["feature_dim"].iloc[0])
 
+    # Apply quality tier filtering before splitting
+    entries = filter_by_quality_tier(entries, include_tiers)
+    if not entries:
+        raise ValueError(
+            f"No entries remaining after quality tier filter "
+            f"(include_tiers={include_tiers}). Check feature_index.csv."
+        )
+
+    feature_dim = int(entries[0]["feature_dim"])
     logger.info(f"Loaded {len(entries)} fNIRS feature entries, dim={feature_dim}")
 
     train_entries, val_entries = split_fnirs_feature_entries(entries, val_split, seed)

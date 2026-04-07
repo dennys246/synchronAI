@@ -28,6 +28,13 @@ RECORDINGS_PER_BATCH="$DEFAULT_RECORDINGS_PER_BATCH"
 VERBOSEE=0
 DISABLE_NUMBA="$DEFAULT_DISABLE_NUMBA"
 SAVE_ROOT="runs/fnirs_neural_diffusion"
+ENABLE_QC=0
+SCI_THRESHOLD=0.5
+SNR_THRESHOLD=5.0
+CARDIAC_PEAK_RATIO=2.0
+REQUIRE_CARDIAC=1
+PEAK_POWER_LOW=""
+PEAK_POWER_HIGH=""
 
 usage() {
   cat <<'EOF'
@@ -80,6 +87,39 @@ while [[ $# -gt 0 ]]; do
     --disable-numba)
       DISABLE_NUMBA=1
       shift 1
+      ;;
+    --enable-qc)
+      ENABLE_QC=1
+      shift 1
+      ;;
+    --sci-threshold)
+      require_arg "$1" "${2:-}"
+      SCI_THRESHOLD="$2"
+      shift 2
+      ;;
+    --snr-threshold)
+      require_arg "$1" "${2:-}"
+      SNR_THRESHOLD="$2"
+      shift 2
+      ;;
+    --cardiac-peak-ratio)
+      require_arg "$1" "${2:-}"
+      CARDIAC_PEAK_RATIO="$2"
+      shift 2
+      ;;
+    --no-require-cardiac)
+      REQUIRE_CARDIAC=0
+      shift 1
+      ;;
+    --peak-power-low)
+      require_arg "$1" "${2:-}"
+      PEAK_POWER_LOW="$2"
+      shift 2
+      ;;
+    --peak-power-high)
+      require_arg "$1" "${2:-}"
+      PEAK_POWER_HIGH="$2"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -146,6 +186,21 @@ CMD=(
   --max-recordings "$MAX_RECORDINGS"
   --recordings-per-batch "$RECORDINGS_PER_BATCH"
 )
+if [[ "$ENABLE_QC" -eq 1 ]]; then
+  CMD+=(--enable-qc)
+  CMD+=(--sci-threshold "$SCI_THRESHOLD")
+  CMD+=(--snr-threshold "$SNR_THRESHOLD")
+  CMD+=(--cardiac-peak-ratio "$CARDIAC_PEAK_RATIO")
+  if [[ "$REQUIRE_CARDIAC" -eq 0 ]]; then
+    CMD+=(--no-require-cardiac)
+  fi
+  if [[ -n "$PEAK_POWER_LOW" ]]; then
+    CMD+=(--peak-power-low "$PEAK_POWER_LOW")
+  fi
+  if [[ -n "$PEAK_POWER_HIGH" ]]; then
+    CMD+=(--peak-power-high "$PEAK_POWER_HIGH")
+  fi
+fi
 if [[ "$VERBOSEE" -eq 1 ]]; then
   CMD+=(--verbosee)
 fi
