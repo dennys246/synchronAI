@@ -1,4 +1,5 @@
 #!/bin/sh
+SCRIPT_VERSION="pre_generative_fnirs_v2_bsub-v1"
 # =============================================================================
 # Submit fNIRS Diffusion v2 Training
 #
@@ -19,5 +20,7 @@ export LSF_DOCKER_VOLUMES="/storage1/fs1/perlmansusan/Active:/storage1/fs1/perlm
 export LSF_DOCKER_PRESERVE_ENVIRONMENT=true
 
 export DATE=$(date +'%m-%d')
+
+echo "=== [$SCRIPT_VERSION] ==="
 
 bsub -J synchronai-fnirs-gen-v2-$DATE -oo $SYNCHRONAI_DIR/scripts/bsub/logs/synchronai_fnirs_gen_v2_$DATE.log -g /$USER/preprocessing < /storage1/fs1/perlmansusan/Active/moochie/github/synchronAI/scripts/bsub/generative_fnirs_v2_bsub.sh

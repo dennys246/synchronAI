@@ -1,4 +1,5 @@
 #!/bin/sh
+SCRIPT_VERSION="pre_generative_fnirs_bsub-v1"
 
 # export OUTPUT_DIRS
 export CONDA_ENVS_DIRS="/storage1/fs1/perlmansusan/Active/moochie/resources/conda/envs/"
@@ -14,5 +15,7 @@ export LSF_DOCKER_VOLUMES="/storage1/fs1/perlmansusan/Active:/storage1/fs1/perlm
 export LSF_DOCKER_PRESERVE_ENVIRONMENT=true
 
 export DATE=$(date +'%m-%d')
+
+echo "=== [$SCRIPT_VERSION] ==="
 
 bsub -J synchronai-fnirs-generative-$DATE -oo $SYNCHRONAI_DIR/scripts/bsub/logs/synchronai_fnirs_gen_$DATE.log -g /$USER/preprocessing < /storage1/fs1/perlmansusan/Active/moochie/github/synchronAI/scripts/bsub/generative_fnirs_bsub.sh

@@ -1,4 +1,5 @@
 #!/bin/sh
+SCRIPT_VERSION="pre_generative_fnirs_v3_bsub-v1"
 # =============================================================================
 # Submit fNIRS Diffusion v3 Training
 #
@@ -24,5 +25,7 @@ export LSF_DOCKER_PRESERVE_ENVIRONMENT=true
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 
 export DATE=$(date +'%m-%d')
+
+echo "=== [$SCRIPT_VERSION] ==="
 
 bsub -J synchronai-fnirs-gen-v3-$DATE -oo $SYNCHRONAI_DIR/scripts/bsub/logs/synchronai_fnirs_gen_v3_$DATE.log -g /$USER/preprocessing < /storage1/fs1/perlmansusan/Active/moochie/github/synchronAI/scripts/bsub/generative_fnirs_v3_bsub.sh
