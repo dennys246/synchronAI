@@ -1,5 +1,5 @@
-#!/bin/sh
-SCRIPT_VERSION="pre_fnirs_child_adult_sweep-v3"
+#!/bin/bash
+SCRIPT_VERSION="pre_fnirs_child_adult_sweep-v4"
 # =============================================================================
 # fNIRS Child/Adult Classification Sweep — Per-Pair Architecture
 #
@@ -82,8 +82,7 @@ submit_model_sweep() {
     echo "=== $MODEL_NAME ==="
     echo "  Submitting setup (convert + extract)..."
 
-    local SETUP_OUTPUT
-    SETUP_OUTPUT=$(bsub -J "$SETUP_JOB" \
+    bsub -J "$SETUP_JOB" \
          -G compute-perlmansusan \
          -q general \
          -m general \
@@ -93,7 +92,7 @@ submit_model_sweep() {
          -R 'select[mem>16GB] rusage[mem=16GB]' \
          -oo "$LOG_DIR/fnirs_sweep_setup_${MODEL_NAME}_$DATE.log" \
          -g /$USER/fnirs_sweep \
-         << SETUP_EOF
+         << SETUP_EOF > /tmp/bsub_setup_${MODEL_NAME}_$$.out 2>&1
 echo "=== [$SCRIPT_VERSION] setup $MODEL_NAME ==="
 cd \$SYNCHRONAI_DIR
 . "\$SYNCHRONAI_DIR/ml-env/bin/activate"
@@ -150,9 +149,10 @@ fi
 echo "=== Setup complete for $MODEL_NAME ==="
 SETUP_EOF
 
-    echo "$SETUP_OUTPUT"
+    cat /tmp/bsub_setup_${MODEL_NAME}_$$.out
     local SETUP_JOBID
-    SETUP_JOBID=$(echo "$SETUP_OUTPUT" | grep -o 'Job <[0-9]*>' | grep -o '[0-9]*')
+    SETUP_JOBID=$(grep -o 'Job <[0-9]*>' /tmp/bsub_setup_${MODEL_NAME}_$$.out | grep -o '[0-9]*')
+    rm -f /tmp/bsub_setup_${MODEL_NAME}_$$.out
     echo "  Setup job: $SETUP_JOB (ID: $SETUP_JOBID)"
 
     # --- Classification sweep jobs ---

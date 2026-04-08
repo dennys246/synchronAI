@@ -1,5 +1,5 @@
 #!/bin/sh
-SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v3"
+SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v4"
 # =============================================================================
 # fNIRS Per-Pair Transfer Learning: Classification Sweep
 #
@@ -77,8 +77,7 @@ submit_pipeline() {
     echo "=== $MODEL_NAME (base=$BASE_WIDTH) ==="
     echo "  Submitting setup (convert + extract)..."
 
-    local SETUP_OUTPUT
-    SETUP_OUTPUT=$(bsub -J "$SETUP_JOB" \
+    bsub -J "$SETUP_JOB" \
          -G compute-perlmansusan \
          -q general \
          -m general \
@@ -88,7 +87,7 @@ submit_pipeline() {
          -R 'select[mem>16GB] rusage[mem=16GB]' \
          -oo "$LOG_DIR/fnirs_perpair_setup_${MODEL_NAME}_$DATE.log" \
          -g /$USER/fnirs_perpair_transfer \
-         << SETUP_EOF
+         << SETUP_EOF > /tmp/bsub_transfer_setup_${MODEL_NAME}_$$.out 2>&1
 echo "=== [$SCRIPT_VERSION] ==="
 conda init
 source /home/$USER/.bashrc
@@ -149,9 +148,10 @@ fi
 echo "=== Setup complete for $MODEL_NAME ==="
 SETUP_EOF
 
-    echo "$SETUP_OUTPUT"
+    cat /tmp/bsub_transfer_setup_${MODEL_NAME}_$$.out
     local SETUP_JOBID
-    SETUP_JOBID=$(echo "$SETUP_OUTPUT" | grep -o 'Job <[0-9]*>' | grep -o '[0-9]*')
+    SETUP_JOBID=$(grep -o 'Job <[0-9]*>' /tmp/bsub_transfer_setup_${MODEL_NAME}_$$.out | grep -o '[0-9]*')
+    rm -f /tmp/bsub_transfer_setup_${MODEL_NAME}_$$.out
     echo "  Setup job: $SETUP_JOB (ID: $SETUP_JOBID)"
 
     # --- Step 2: Classification sweep jobs ---
