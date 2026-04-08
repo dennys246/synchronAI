@@ -1,5 +1,5 @@
 #!/bin/sh
-SCRIPT_VERSION="pre_fnirs_child_adult_sweep-v2"
+SCRIPT_VERSION="pre_fnirs_child_adult_sweep-v3"
 # =============================================================================
 # fNIRS Child/Adult Classification Sweep — Per-Pair Architecture
 #
@@ -82,7 +82,8 @@ submit_model_sweep() {
     echo "=== $MODEL_NAME ==="
     echo "  Submitting setup (convert + extract)..."
 
-    bsub -J "$SETUP_JOB" \
+    local SETUP_OUTPUT
+    SETUP_OUTPUT=$(bsub -J "$SETUP_JOB" \
          -G compute-perlmansusan \
          -q general \
          -m general \
@@ -149,7 +150,10 @@ fi
 echo "=== Setup complete for $MODEL_NAME ==="
 SETUP_EOF
 
-    echo "  Setup job: $SETUP_JOB"
+    echo "$SETUP_OUTPUT"
+    local SETUP_JOBID
+    SETUP_JOBID=$(echo "$SETUP_OUTPUT" | grep -o 'Job <[0-9]*>' | grep -o '[0-9]*')
+    echo "  Setup job: $SETUP_JOB (ID: $SETUP_JOBID)"
 
     # --- Classification sweep jobs ---
     echo "  Submitting 5 classifier jobs..."
@@ -171,7 +175,7 @@ SETUP_EOF
              -a 'docker(continuumio/anaconda3)' \
              -n 4 \
              -R 'select[mem>4GB] rusage[mem=4GB]' \
-             -w "done($SETUP_JOB)" \
+             -w "done($SETUP_JOBID)" \
              -oo "$LOG_DIR/fnirs_sweep_${MODEL_NAME}_${RUN_NAME}_$DATE.log" \
              -g /$USER/fnirs_sweep \
              << EOF

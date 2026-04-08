@@ -1,5 +1,5 @@
 #!/bin/sh
-SCRIPT_VERSION="pre_fnirs_ablation_random_bsub-v2"
+SCRIPT_VERSION="pre_fnirs_ablation_random_bsub-v3"
 # =============================================================================
 # fNIRS Ablation: Random Per-Pair Encoder vs Pretrained
 #
@@ -71,7 +71,7 @@ export ABLATION_MODEL_NAME="$MODEL_NAME"
 echo ""
 echo "Submitting random extraction job..."
 
-bsub -J "$EXTRACT_JOB" \
+EXTRACT_OUTPUT=$(bsub -J "$EXTRACT_JOB" \
      -G compute-perlmansusan \
      -q general \
      -m general \
@@ -82,7 +82,7 @@ bsub -J "$EXTRACT_JOB" \
      -oo "$LOG_DIR/fnirs_random_extract_${MODEL_NAME}_$DATE.log" \
      -g /$USER/fnirs_ablation \
      << 'EXTRACT_EOF'
-echo "=== [pre_fnirs_ablation_random_bsub-v2] ==="
+echo "=== [pre_fnirs_ablation_random_bsub-v3] ==="
 cd $SYNCHRONAI_DIR
 . "$SYNCHRONAI_DIR/ml-env/bin/activate"
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
@@ -122,8 +122,10 @@ python scripts/extract_fnirs_features.py \
 
 echo "Random extraction complete."
 EXTRACT_EOF
-
-echo "  Extract job: $EXTRACT_JOB"
+)
+echo "$EXTRACT_OUTPUT"
+EXTRACT_JOBID=$(echo "$EXTRACT_OUTPUT" | grep -o 'Job <[0-9]*>' | grep -o '[0-9]*')
+echo "  Extract job: $EXTRACT_JOB (ID: $EXTRACT_JOBID)"
 
 # =============================================================================
 # Step 2: Train lstm64 on random features (same config as best classifier)
@@ -140,11 +142,11 @@ bsub -J "synchronai-fnirs-random-lstm64-${MODEL_NAME}-$DATE" \
      -a 'docker(continuumio/anaconda3)' \
      -n 4 \
      -R 'select[mem>4GB] rusage[mem=4GB]' \
-     -w "done($EXTRACT_JOB)" \
+     -w "done($EXTRACT_JOBID)" \
      -oo "$LOG_DIR/fnirs_ablation_random_lstm64_${MODEL_NAME}_$DATE.log" \
      -g /$USER/fnirs_ablation \
      << 'TRAIN_EOF'
-echo "=== [pre_fnirs_ablation_random_bsub-v2] train ==="
+echo "=== [pre_fnirs_ablation_random_bsub-v3] train ==="
 cd $SYNCHRONAI_DIR
 . "$SYNCHRONAI_DIR/ml-env/bin/activate"
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"

@@ -1,5 +1,5 @@
 #!/bin/sh
-SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v2"
+SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v3"
 # =============================================================================
 # fNIRS Per-Pair Transfer Learning: Classification Sweep
 #
@@ -77,7 +77,8 @@ submit_pipeline() {
     echo "=== $MODEL_NAME (base=$BASE_WIDTH) ==="
     echo "  Submitting setup (convert + extract)..."
 
-    bsub -J "$SETUP_JOB" \
+    local SETUP_OUTPUT
+    SETUP_OUTPUT=$(bsub -J "$SETUP_JOB" \
          -G compute-perlmansusan \
          -q general \
          -m general \
@@ -148,7 +149,10 @@ fi
 echo "=== Setup complete for $MODEL_NAME ==="
 SETUP_EOF
 
-    echo "  Setup job: $SETUP_JOB"
+    echo "$SETUP_OUTPUT"
+    local SETUP_JOBID
+    SETUP_JOBID=$(echo "$SETUP_OUTPUT" | grep -o 'Job <[0-9]*>' | grep -o '[0-9]*')
+    echo "  Setup job: $SETUP_JOB (ID: $SETUP_JOBID)"
 
     # --- Step 2: Classification sweep jobs ---
     echo "  Submitting classification jobs..."
@@ -170,7 +174,7 @@ SETUP_EOF
              -a 'docker(continuumio/anaconda3)' \
              -n 4 \
              -R 'select[mem>4GB] rusage[mem=4GB]' \
-             -w "done($SETUP_JOB)" \
+             -w "done($SETUP_JOBID)" \
              -oo "$LOG_DIR/fnirs_perpair_${MODEL_NAME}_${RUN_NAME}_$DATE.log" \
              -g /$USER/fnirs_perpair_transfer \
              << EOF
