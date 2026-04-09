@@ -318,7 +318,11 @@ def classify_quality_tier(
     if not sci_per_pair:
         return "rejected"
 
-    mean_sci = float(np.mean(list(sci_per_pair.values())))
+    sci_values = list(sci_per_pair.values())
+    if not all(np.isfinite(v) for v in sci_values):
+        return "rejected"
+
+    mean_sci = float(np.mean(sci_values))
     all_cardiac = (
         all(cardiac_per_pair.values())
         if cardiac_per_pair

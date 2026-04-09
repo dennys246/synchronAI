@@ -697,7 +697,7 @@ def main():
     args = parser.parse_args()
 
     per_pair = args.per_pair and not args.no_per_pair
-    include_tiers = args.include_tiers.split(",") if args.include_tiers else None
+    include_tiers = [t.strip() for t in args.include_tiers.split(",")] if args.include_tiers else None
 
     extract_features(
         data_dirs=args.data_dirs,

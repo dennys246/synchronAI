@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="pre_fnirs_child_adult_sweep-v4"
+SCRIPT_VERSION="pre_fnirs_child_adult_sweep-v5"
 # =============================================================================
 # fNIRS Child/Adult Classification Sweep — Per-Pair Architecture
 #
@@ -30,7 +30,7 @@ SCRIPT_VERSION="pre_fnirs_child_adult_sweep-v4"
 export CONDA_ENVS_DIRS="/storage1/fs1/perlmansusan/Active/moochie/resources/conda/envs/"
 export CONDA_PKGS_DIRS="/storage1/fs1/perlmansusan/Active/moochie/resources/conda/pkgs/"
 
-export SYNCHRONAI_DIR="/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI/"
+export SYNCHRONAI_DIR="/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI"
 
 export PATH="/opt/conda/bin:$PATH"
 export PYTHONPATH="/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI/src:/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI:$PYTHONPATH"
@@ -153,6 +153,10 @@ SETUP_EOF
     local SETUP_JOBID
     SETUP_JOBID=$(grep -o 'Job <[0-9]*>' /tmp/bsub_setup_${MODEL_NAME}_$$.out | grep -o '[0-9]*')
     rm -f /tmp/bsub_setup_${MODEL_NAME}_$$.out
+    if [ -z "$SETUP_JOBID" ]; then
+        echo "ERROR: Setup job submission failed for $MODEL_NAME"
+        return 1
+    fi
     echo "  Setup job: $SETUP_JOB (ID: $SETUP_JOBID)"
 
     # --- Classification sweep jobs ---
@@ -196,7 +200,7 @@ if [ ! -f "$FEATURE_DIR/feature_index.csv" ]; then
         exit 1
     fi
 fi
-echo "Found feature_index.csv: $(wc -l < "$FEATURE_DIR/feature_index.csv") lines"
+echo "Found feature_index.csv at $FEATURE_DIR"
 
 python scripts/train_fnirs_from_features.py \
     --feature-dir "$FEATURE_DIR" \

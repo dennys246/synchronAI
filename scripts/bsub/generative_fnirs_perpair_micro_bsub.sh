@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="generative_fnirs_perpair_micro_bsub-v1"
+SCRIPT_VERSION="generative_fnirs_perpair_micro_bsub-v2"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -27,11 +27,12 @@ SCRIPT_VERSION="generative_fnirs_perpair_micro_bsub-v1"
 echo "=== [$SCRIPT_VERSION] ==="
 echo "=== fNIRS Per-Pair Pretraining: micro (base=8, depth=2) ==="
 
+export SYNCHRONAI_DIR="${SYNCHRONAI_DIR:-/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI}"
+export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
 conda init
 source /home/$USER/.bashrc
 source $SYNCHRONAI_DIR/ml-env/bin/activate
 cd $SYNCHRONAI_DIR
-pip install -e .
 
 bash $SYNCHRONAI_DIR/scripts/generative_pretrain.sh \
     --save-dir "$SYNCHRONAI_DIR/runs/fnirs_perpair_micro" \

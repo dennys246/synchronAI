@@ -1,5 +1,5 @@
 #!/bin/sh
-SCRIPT_VERSION="pre_fnirs_ablation_random_bsub-v3"
+SCRIPT_VERSION="pre_fnirs_ablation_random_bsub-v4"
 # =============================================================================
 # fNIRS Ablation: Random Per-Pair Encoder vs Pretrained
 #
@@ -26,10 +26,10 @@ MODEL_NAME="${PERPAIR_MODEL:-large}"
 export CONDA_ENVS_DIRS="/storage1/fs1/perlmansusan/Active/moochie/resources/conda/envs/"
 export CONDA_PKGS_DIRS="/storage1/fs1/perlmansusan/Active/moochie/resources/conda/pkgs/"
 
-export SYNCHRONAI_DIR="/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI/"
+export SYNCHRONAI_DIR="/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI"
 
 export PATH="/opt/conda/bin:$PATH"
-export PYTHONPATH="/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI:$PYTHONPATH"
+export PYTHONPATH="/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI/src:/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI:$PYTHONPATH"
 
 export LSF_DOCKER_VOLUMES="/storage1/fs1/perlmansusan/Active:/storage1/fs1/perlmansusan/Active /home/$USER:/home/$USER"
 export LSF_DOCKER_PRESERVE_ENVIRONMENT=true
@@ -82,7 +82,7 @@ EXTRACT_OUTPUT=$(bsub -J "$EXTRACT_JOB" \
      -oo "$LOG_DIR/fnirs_random_extract_${MODEL_NAME}_$DATE.log" \
      -g /$USER/fnirs_ablation \
      << 'EXTRACT_EOF'
-echo "=== [pre_fnirs_ablation_random_bsub-v3] ==="
+echo "=== [pre_fnirs_ablation_random_bsub-v4] ==="
 cd $SYNCHRONAI_DIR
 . "$SYNCHRONAI_DIR/ml-env/bin/activate"
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
@@ -146,7 +146,7 @@ bsub -J "synchronai-fnirs-random-lstm64-${MODEL_NAME}-$DATE" \
      -oo "$LOG_DIR/fnirs_ablation_random_lstm64_${MODEL_NAME}_$DATE.log" \
      -g /$USER/fnirs_ablation \
      << 'TRAIN_EOF'
-echo "=== [pre_fnirs_ablation_random_bsub-v3] train ==="
+echo "=== [pre_fnirs_ablation_random_bsub-v4] train ==="
 cd $SYNCHRONAI_DIR
 . "$SYNCHRONAI_DIR/ml-env/bin/activate"
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
@@ -164,7 +164,7 @@ if [ ! -f "$FEAT_DIR/feature_index.csv" ]; then
         exit 1
     fi
 fi
-echo "Found feature_index.csv: $(wc -l < "$FEAT_DIR/feature_index.csv") lines"
+echo "Found feature_index.csv at $FEAT_DIR"
 
 python scripts/train_fnirs_from_features.py \
     --feature-dir "$SYNCHRONAI_DIR/data/fnirs_perpair_${ABLATION_MODEL_NAME}_random_features" \

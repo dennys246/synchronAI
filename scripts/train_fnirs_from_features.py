@@ -517,8 +517,8 @@ def main():
 
     args = parser.parse_args()
 
-    include_tiers = args.include_tiers.split(",") if args.include_tiers else None
-    holdout_tiers = args.holdout_tiers.split(",") if args.holdout_tiers else None
+    include_tiers = [t.strip() for t in args.include_tiers.split(",")] if args.include_tiers else None
+    holdout_tiers = [t.strip() for t in args.holdout_tiers.split(",")] if args.holdout_tiers else None
 
     train_fnirs_from_features(
         feature_dir=args.feature_dir,

@@ -1,5 +1,5 @@
 #!/bin/sh
-SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v4"
+SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v5"
 # =============================================================================
 # fNIRS Per-Pair Transfer Learning: Classification Sweep
 #
@@ -27,7 +27,7 @@ SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v4"
 export CONDA_ENVS_DIRS="/storage1/fs1/perlmansusan/Active/moochie/resources/conda/envs/"
 export CONDA_PKGS_DIRS="/storage1/fs1/perlmansusan/Active/moochie/resources/conda/pkgs/"
 
-export SYNCHRONAI_DIR="/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI/"
+export SYNCHRONAI_DIR="/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI"
 
 export PATH="/opt/conda/bin:$PATH"
 export PYTHONPATH="/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI/src:/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI:$PYTHONPATH"
@@ -152,6 +152,10 @@ SETUP_EOF
     local SETUP_JOBID
     SETUP_JOBID=$(grep -o 'Job <[0-9]*>' /tmp/bsub_transfer_setup_${MODEL_NAME}_$$.out | grep -o '[0-9]*')
     rm -f /tmp/bsub_transfer_setup_${MODEL_NAME}_$$.out
+    if [ -z "$SETUP_JOBID" ]; then
+        echo "ERROR: Setup job submission failed for $MODEL_NAME"
+        return 1
+    fi
     echo "  Setup job: $SETUP_JOB (ID: $SETUP_JOBID)"
 
     # --- Step 2: Classification sweep jobs ---
@@ -197,7 +201,7 @@ if [ ! -f "$FEATURE_DIR/feature_index.csv" ]; then
         exit 1
     fi
 fi
-echo "Found feature_index.csv: $(wc -l < "$FEATURE_DIR/feature_index.csv") lines"
+echo "Found feature_index.csv at $FEATURE_DIR"
 
 python scripts/train_fnirs_from_features.py \
     --feature-dir "$FEATURE_DIR" \

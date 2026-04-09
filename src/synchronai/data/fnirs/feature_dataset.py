@@ -185,6 +185,13 @@ def filter_by_quality_tier(
     if include_tiers is None:
         return entries
 
+    # Warn if quality_tier column appears to be missing
+    if entries and "quality_tier" not in entries[0]:
+        logger.warning(
+            "quality_tier column not found in entries — was --enable-qc used "
+            "during feature extraction? All entries will have tier='unknown'."
+        )
+
     before = len(entries)
     filtered = [e for e in entries if e.get("quality_tier", "unknown") in include_tiers]
     logger.info(
