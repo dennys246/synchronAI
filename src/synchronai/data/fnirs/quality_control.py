@@ -235,12 +235,19 @@ def compute_scan_snr(
         haemo_data = haemo_data[None, :]
 
     snrs = []
+    # Use longer segments for finer frequency resolution in the HRF band.
+    # At 7.8 Hz, nperseg=8*sfreq=62 gives 0.126 Hz resolution — only 1 bin
+    # in the 0.01-0.2 Hz HRF band, making trapezoid integration return 0.
+    # Use the full signal length (or 60s worth) for sub-0.02 Hz resolution.
+    nperseg_snr = min(len(haemo_data[0]), max(int(60 * sfreq), int(8 * sfreq)))
     for ch_data in haemo_data:
-        freqs, psd = welch(ch_data, fs=sfreq, nperseg=min(len(ch_data), int(8 * sfreq)))
+        freqs, psd = welch(ch_data, fs=sfreq, nperseg=min(len(ch_data), nperseg_snr))
         signal_mask = (freqs >= hrf_band[0]) & (freqs <= hrf_band[1])
         noise_mask = ~signal_mask & (freqs > 0)  # exclude DC
-        signal_power = float(np.trapezoid(psd[signal_mask], freqs[signal_mask])) if signal_mask.any() else 0.0
-        noise_power = float(np.trapezoid(psd[noise_mask], freqs[noise_mask])) if noise_mask.any() else 1.0
+        # Use sum * df instead of trapezoid to handle single-bin edge case
+        df = freqs[1] - freqs[0] if len(freqs) > 1 else 1.0
+        signal_power = float(np.sum(psd[signal_mask]) * df) if signal_mask.any() else 0.0
+        noise_power = float(np.sum(psd[noise_mask]) * df) if noise_mask.any() else 1.0
         if noise_power > 0:
             snrs.append(signal_power / noise_power)
     return float(np.mean(snrs)) if snrs else 0.0
