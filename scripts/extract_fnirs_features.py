@@ -314,6 +314,8 @@ def extract_features(
     cardiac_peak_ratio: float = 2.0,
     require_cardiac: bool = True,
     include_tiers: Optional[list[str]] = None,
+    qc_cache_path: Optional[str] = None,
+    encoder_batch_size: int = 32,
 ) -> None:
     """Extract fNIRS encoder features for all discovered recordings.
 
@@ -383,14 +385,28 @@ def extract_features(
         logger.error("No fNIRS recordings found!")
         return
 
-    # QC setup
+    # QC setup — either from cache (fast) or inline (slow)
     n_qc_rejected = 0
     tier_counts: dict[str, int] = {}
+    qc_tier_cache: dict[str, str] = {}  # fnirs_path -> quality_tier
+
+    if qc_cache_path and Path(qc_cache_path).exists():
+        import pandas as pd
+        qc_df = pd.read_csv(qc_cache_path)
+        for _, row in qc_df.iterrows():
+            qc_tier_cache[row["fnirs_path"]] = row["quality_tier"]
+        logger.info(
+            "Loaded QC tier cache: %d recordings from %s",
+            len(qc_tier_cache), qc_cache_path,
+        )
+        # When using cache, disable inline QC
+        enable_qc = False
+
     if enable_qc:
         from synchronai.data.fnirs.processing import read_raw_fnirs, load_fnirs
         from synchronai.data.fnirs.quality_control import run_quality_control, QUALITY_TIERS
         logger.info(
-            "QC enabled: sci_threshold=%.2f, snr_threshold=%.1f, "
+            "QC enabled (inline): sci_threshold=%.2f, snr_threshold=%.1f, "
             "require_cardiac=%s, cardiac_peak_ratio=%.1f",
             sci_threshold, snr_threshold, require_cardiac, cardiac_peak_ratio,
         )
@@ -432,9 +448,16 @@ def extract_features(
                 n_success += 1
             continue
 
-        # Quality control pre-check (also classifies quality tier)
+        # Quality control — from cache (instant) or inline (slow)
         recording_tier = "unknown"
-        if enable_qc:
+        if fnirs_path in qc_tier_cache:
+            recording_tier = qc_tier_cache[fnirs_path]
+            tier_counts[recording_tier] = tier_counts.get(recording_tier, 0) + 1
+            if include_tiers is not None and recording_tier not in include_tiers:
+                n_qc_rejected += 1
+                n_fail += 1
+                continue
+        elif enable_qc:
             try:
                 raw_scan = read_raw_fnirs(fnirs_path)
                 preprocessed = load_fnirs(fnirs_path, deconvolution=False)
@@ -475,7 +498,7 @@ def extract_features(
                 continue
 
         if per_pair:
-            # Per-pair mode: load all available pairs, extract each independently
+            # Per-pair mode: load all pairs, collect all windows, batch encode
             pairs_data = load_and_normalize_recording(
                 fnirs_path,
                 feature_mean=feature_mean,
@@ -491,45 +514,58 @@ def extract_features(
                 n_fail += 1
                 continue
 
+            # Collect all windows across all pairs for batched encoding
+            all_windows = []
+            all_metadata = []  # (pair_name, seg_idx) per window
             for pair_name, pair_array in pairs_data:
-                # Window this pair's data
                 pair_windows = window_recording(pair_array, model_len, stride_seconds, target_sfreq)
-
                 for seg_idx, window in enumerate(pair_windows):
-                    fname = feature_filename(
-                        fnirs_path, segment_idx=seg_idx,
-                        suffix=f"_{pair_name}",
-                    )
-                    feat_path = features_dir / fname
+                    all_windows.append(window)
+                    all_metadata.append((pair_name, seg_idx))
 
-                    x_tensor = torch.tensor(window, dtype=torch.float32).unsqueeze(0).to(device)
+            if not all_windows:
+                n_fail += 1
+                continue
 
-                    with torch.no_grad():
-                        if multiscale:
-                            outputs = encoder(x_tensor, return_all_levels=True)
-                            pooled_parts = []
-                            for key in sorted(outputs.keys()):
-                                pooled_parts.append(outputs[key].squeeze(0).mean(dim=0))
-                            feat_to_save = torch.cat(pooled_parts).cpu()
-                        else:
-                            features = encoder(x_tensor)
-                            feat_to_save = features.squeeze(0).cpu()
+            # Batched encoder forward pass
+            all_tensors = torch.tensor(np.stack(all_windows), dtype=torch.float32).to(device)
+            all_features = []
+            with torch.no_grad():
+                for batch_start in range(0, len(all_tensors), encoder_batch_size):
+                    batch = all_tensors[batch_start:batch_start + encoder_batch_size]
+                    if multiscale:
+                        outputs = encoder(batch, return_all_levels=True)
+                        pooled_parts = []
+                        for key in sorted(outputs.keys()):
+                            pooled_parts.append(outputs[key].mean(dim=1))
+                        batch_feats = torch.cat(pooled_parts, dim=-1).cpu()
+                    else:
+                        batch_feats = encoder(batch).cpu()
+                    all_features.append(batch_feats)
+            all_features = torch.cat(all_features, dim=0)
 
-                    torch.save(feat_to_save, feat_path)
+            # Save each feature individually
+            for idx, (pair_name, seg_idx) in enumerate(all_metadata):
+                fname = feature_filename(
+                    fnirs_path, segment_idx=seg_idx,
+                    suffix=f"_{pair_name}",
+                )
+                feat_to_save = all_features[idx]
+                torch.save(feat_to_save, features_dir / fname)
 
-                    index_rows.append({
-                        "feature_file": fname,
-                        "fnirs_path": fnirs_path,
-                        "subject_id": subject_id,
-                        "participant_type": participant_type,
-                        "window_idx": seg_idx,
-                        "pair_name": pair_name,
-                        "feature_dim": feat_to_save.shape[-1] if feat_to_save.ndim > 1 else feat_to_save.shape[0],
-                        "n_frames": feat_to_save.shape[0] if feat_to_save.ndim == 2 else 1,
-                        "multiscale": multiscale,
-                        "quality_tier": recording_tier,
-                    })
-                    n_success += 1
+                index_rows.append({
+                    "feature_file": fname,
+                    "fnirs_path": fnirs_path,
+                    "subject_id": subject_id,
+                    "participant_type": participant_type,
+                    "window_idx": seg_idx,
+                    "pair_name": pair_name,
+                    "feature_dim": feat_to_save.shape[-1] if feat_to_save.ndim > 1 else feat_to_save.shape[0],
+                    "n_frames": feat_to_save.shape[0] if feat_to_save.ndim == 2 else 1,
+                    "multiscale": multiscale,
+                    "quality_tier": recording_tier,
+                })
+                n_success += 1
         else:
             # Standard mode: aligned 20-channel input
             x = load_and_normalize_recording(
@@ -692,7 +728,13 @@ def main():
     parser.add_argument("--include-tiers", default=None,
                         help="Comma-separated quality tiers to include "
                              "(e.g. 'gold', 'gold,standard', 'salvageable'). "
-                             "Overrides default QC pass/fail gate. Requires --enable-qc.")
+                             "Requires --enable-qc or --qc-cache.")
+    parser.add_argument("--qc-cache", default=None,
+                        help="Path to pre-computed QC tier CSV (from compute_fnirs_qc.py). "
+                             "Skips inline QC — much faster extraction.")
+    parser.add_argument("--encoder-batch-size", type=int, default=32,
+                        help="Batch size for encoder forward passes (default: 32). "
+                             "Higher = faster but more memory.")
 
     args = parser.parse_args()
 
@@ -716,6 +758,8 @@ def main():
         cardiac_peak_ratio=args.cardiac_peak_ratio,
         require_cardiac=not args.no_require_cardiac,
         include_tiers=include_tiers,
+        qc_cache_path=args.qc_cache,
+        encoder_batch_size=args.encoder_batch_size,
     )
 
 

@@ -1,12 +1,13 @@
 #!/bin/bash
-SCRIPT_VERSION="pre_fnirs_extract_features_bsub-v1"
+SCRIPT_VERSION="pre_fnirs_extract_features_bsub-v2"
 # =============================================================================
 # fNIRS Per-Pair Feature Extraction — All Model Sizes
 #
-# Extraction-only script. Converts TF weights to PyTorch (if needed) and
-# extracts per-pair features for all 4 model sizes.
+# Uses pre-computed QC cache (from pre_fnirs_compute_qc_bsub.sh) for tier
+# filtering, and batched encoder for speed. No inline QC.
 #
-# Run BEFORE the training sweep (pre_fnirs_child_adult_sweep_bsub.sh).
+# Run AFTER: pre_fnirs_compute_qc_bsub.sh (produces qc_tiers.csv)
+# Run BEFORE: pre_fnirs_child_adult_sweep_bsub.sh (training)
 # =============================================================================
 
 export SYNCHRONAI_DIR="/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI"
@@ -26,6 +27,8 @@ FNIRS_DIRS="${FNIRS_DIRS}:/storage1/fs1/perlmansusan/Active/moochie/study_data/P
 FNIRS_DIRS="${FNIRS_DIRS}:/storage1/fs1/perlmansusan/Active/moochie/study_data/P-CAT/R01/data/PSU_share/WUSTL_data/T3/nirs_data/dbdos/"
 FNIRS_DIRS="${FNIRS_DIRS}:/storage1/fs1/perlmansusan/Active/moochie/study_data/P-CAT/R01/data/PSU_share/WUSTL_data/T5/nirs_data/dbdos/"
 
+QC_CACHE="$SYNCHRONAI_DIR/data/qc_tiers.csv"
+
 echo "=========================================="
 echo "  [$SCRIPT_VERSION]"
 echo "  fNIRS Per-Pair Feature Extraction"
@@ -34,6 +37,7 @@ echo "=========================================="
 
 submit_extraction() {
     local MODEL_NAME="$1"
+    local EXTRA_FLAGS="${2:-}"
     local PRETRAIN_DIR="$SYNCHRONAI_DIR/runs/fnirs_perpair_${MODEL_NAME}"
     local CONFIG_JSON="${PRETRAIN_DIR}/fnirs_diffusion_config.json"
     local WEIGHTS_H5="${PRETRAIN_DIR}/fnirs_unet.weights.h5"
@@ -41,7 +45,7 @@ submit_extraction() {
     local FEATURE_DIR="$SYNCHRONAI_DIR/data/fnirs_perpair_${MODEL_NAME}_features"
 
     echo ""
-    echo "=== $MODEL_NAME ==="
+    echo "=== $MODEL_NAME ${EXTRA_FLAGS} ==="
 
     bsub -J "synchronai-extract-${MODEL_NAME}-$DATE" \
          -G compute-perlmansusan \
@@ -77,7 +81,7 @@ if [ ! -f "$ENCODER_PT" ]; then
     fi
 fi
 
-# Clear any empty/stale feature directory
+# Clear stale feature directory
 rm -rf "$FEATURE_DIR"
 
 echo "=== Extracting per-pair features ==="
@@ -87,19 +91,15 @@ python scripts/extract_fnirs_features.py \
     --output-dir "$FEATURE_DIR" \
     --per-pair \
     --stride-seconds 60.0 \
-    --enable-qc \
-    --sci-threshold 0.40 \
-    --snr-threshold 2.0 \
-    --cardiac-peak-ratio 2.0 \
-    --no-require-cardiac \
-    --include-tiers "gold,standard,salvageable"
+    --qc-cache "$QC_CACHE" \
+    --include-tiers "gold,standard,salvageable" \
+    --encoder-batch-size 32 \
+    $EXTRA_FLAGS
 
 echo "=== Extraction complete for $MODEL_NAME ==="
-echo "Feature count:"
 if [ -f "$FEATURE_DIR/feature_index.csv" ]; then
+    echo "Feature count:"
     wc -l "$FEATURE_DIR/feature_index.csv"
-    echo "Tier distribution:"
-    tail -n +2 "$FEATURE_DIR/feature_index.csv" | awk -F',' '{print \$NF}' | sort | uniq -c
 else
     echo "ERROR: No feature_index.csv produced!"
     exit 1
