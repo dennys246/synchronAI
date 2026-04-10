@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="pre_fnirs_extract_features_bsub-v2"
+SCRIPT_VERSION="pre_fnirs_extract_features_bsub-v3"
 # =============================================================================
 # fNIRS Per-Pair Feature Extraction — All Model Sizes
 #
@@ -81,8 +81,9 @@ if [ ! -f "$ENCODER_PT" ]; then
     fi
 fi
 
-# Clear stale feature directory
-rm -rf "$FEATURE_DIR"
+# Don't wipe the directory — resume support uses existing .pt files
+# (Comment out the rm -rf so partial work from previous runs is preserved)
+# rm -rf "$FEATURE_DIR"
 
 echo "=== Extracting per-pair features ==="
 python scripts/extract_fnirs_features.py \

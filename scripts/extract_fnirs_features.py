@@ -544,14 +544,35 @@ def extract_features(
                     all_features.append(batch_feats)
             all_features = torch.cat(all_features, dim=0)
 
-            # Save each feature individually
+            # Save each feature individually with retry on transient NFS errors
+            save_failed = False
             for idx, (pair_name, seg_idx) in enumerate(all_metadata):
                 fname = feature_filename(
                     fnirs_path, segment_idx=seg_idx,
                     suffix=f"_{pair_name}",
                 )
                 feat_to_save = all_features[idx]
-                torch.save(feat_to_save, features_dir / fname)
+                # Retry up to 3 times on transient NFS write failures
+                for attempt in range(3):
+                    try:
+                        torch.save(feat_to_save, features_dir / fname)
+                        break
+                    except (RuntimeError, OSError) as save_err:
+                        if attempt < 2:
+                            logger.warning(
+                                "torch.save failed (attempt %d/3) for %s: %s — retrying",
+                                attempt + 1, fname, save_err,
+                            )
+                            time.sleep(2 ** attempt)
+                        else:
+                            logger.error(
+                                "torch.save failed permanently for %s: %s — skipping recording",
+                                fname, save_err,
+                            )
+                            save_failed = True
+                            break
+                if save_failed:
+                    break
 
                 index_rows.append({
                     "feature_file": fname,
@@ -566,6 +587,9 @@ def extract_features(
                     "quality_tier": recording_tier,
                 })
                 n_success += 1
+            if save_failed:
+                n_fail += 1
+                continue
         else:
             # Standard mode: aligned 20-channel input
             x = load_and_normalize_recording(
@@ -621,6 +645,19 @@ def extract_features(
             elapsed = time.time() - start_time
             rate = n_success / elapsed if elapsed > 0 else 0
             logger.info(f"  {n_success} windows from {i+1}/{len(fnirs_paths)} recordings ({rate:.1f}/sec, {n_fail} failures)")
+
+            # Periodic checkpoint: write feature_index.csv so partial progress
+            # is preserved if the job crashes
+            if index_rows:
+                index_path = output_dir / "feature_index.csv"
+                fieldnames = list(index_rows[0].keys())
+                try:
+                    with open(index_path, "w", newline="") as f:
+                        writer = csv.DictWriter(f, fieldnames=fieldnames)
+                        writer.writeheader()
+                        writer.writerows(index_rows)
+                except Exception as cp_err:
+                    logger.warning("Checkpoint write failed: %s", cp_err)
 
     elapsed = time.time() - start_time
 
