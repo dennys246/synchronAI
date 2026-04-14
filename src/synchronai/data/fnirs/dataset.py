@@ -13,7 +13,13 @@ from typing import List, Optional
 
 import numpy as np
 
-from synchronai.data.fnirs.processing import HemoglobinMeta, extract_hemoglobin_pairs, load_fnirs
+from synchronai.data.fnirs.processing import (
+    HemoglobinMeta,
+    extract_hemoglobin_pairs,
+    load_fnirs,
+    read_raw_fnirs,
+)
+from synchronai.data.fnirs.quality_control import QualityReport, run_quality_control
 from synchronai.utils.logging import get_logger
 
 
@@ -95,6 +101,18 @@ def load_training_windows(
     normalize: bool = True,
     external_mean: Optional[np.ndarray] = None,
     external_std: Optional[np.ndarray] = None,
+    per_pair: bool = False,
+    qc_cache_path: Optional[str] = None,
+    # Quality control parameters
+    enable_qc: bool = False,
+    sci_threshold: float = 0.5,
+    snr_threshold: float = 5.0,
+    cardiac_band: tuple = (0.8, 1.5),
+    cardiac_peak_ratio: float = 2.0,
+    require_cardiac: bool = True,
+    hrf_band: tuple = (0.01, 0.2),
+    peak_power_low: Optional[float] = None,
+    peak_power_high: Optional[float] = None,
 ) -> FnirsTrainingData:
     """
     Load recordings, preprocess via HRfunc, and return standardized windows.
@@ -110,6 +128,16 @@ def load_training_windows(
         normalize: Whether to normalize the windows (default True)
         external_mean: Optional pre-computed mean for normalization (requires normalize=True)
         external_std: Optional pre-computed std for normalization (requires normalize=True)
+        per_pair: Whether to explode windows into per-pair samples
+        enable_qc: Enable the multi-stage quality control pipeline
+        sci_threshold: Minimum SCI to keep a channel (0-1). Literature recommends 0.75-0.95
+        snr_threshold: Minimum scan-level SNR. Scans below this are rejected
+        cardiac_band: Frequency range for cardiac signal in Hz
+        cardiac_peak_ratio: Min ratio of cardiac peak to median PSD
+        require_cardiac: Reject channels without detectable cardiac signal
+        hrf_band: Frequency range for hemodynamic response (signal band for SNR)
+        peak_power_low: Min acceptable peak PSD (below = noise-dominated)
+        peak_power_high: Max acceptable peak PSD (above = motion artifact)
 
     Returns:
         FnirsTrainingData with windows and normalization statistics
@@ -130,11 +158,45 @@ def load_training_windows(
         str(target_sfreq_hz),
     )
 
+    # Load QC cache if available
+    qc_cache: Dict[str, Dict] = {}
+    if qc_cache_path:
+        from synchronai.data.fnirs.quality_control import load_qc_cache
+        qc_cache = load_qc_cache(qc_cache_path)
+        logger.info("Loaded QC cache with %d entries from %s", len(qc_cache), qc_cache_path)
+
+    if enable_qc:
+        logger.info(
+            "QC enabled: sci_threshold=%.2f, snr_threshold=%.1f, require_cardiac=%s, "
+            "cardiac_band=%s, hrf_band=%s",
+            sci_threshold, snr_threshold, require_cardiac,
+            str(cardiac_band), str(hrf_band),
+        )
+
     # First pass: determine target channel set + sampling rate.
-    first_raw = load_fnirs(paths[0], deconvolution=deconvolution)
-    if target_sfreq_hz is not None:
-        first_raw = first_raw.copy().resample(target_sfreq_hz)
-    first_x, first_meta = extract_hemoglobin_pairs(first_raw)
+    # Try paths until we find one that loads successfully.
+    first_meta = None
+    for first_path in paths:
+        try:
+            first_raw = load_fnirs(first_path, deconvolution=deconvolution)
+            if target_sfreq_hz is not None:
+                first_raw = first_raw.copy().resample(target_sfreq_hz)
+            first_x, first_meta = extract_hemoglobin_pairs(first_raw)
+            break
+        except (ValueError, RuntimeError) as e:
+            logger.warning("Skipping %s for config setup: %s", first_path, e)
+            continue
+    if first_meta is None:
+        logger.warning("No valid recordings found in this batch for config setup")
+        return FnirsTrainingData(
+            windows=np.zeros((0, 0, 0), dtype=np.float32),
+            sfreq_hz=target_sfreq_hz or 7.8125,
+            duration_seconds=duration_seconds,
+            pair_names=[],
+            hb_types=["hbo", "hbr"],
+            feature_mean=np.zeros(0, dtype=np.float32),
+            feature_std=np.ones(0, dtype=np.float32),
+        )
 
     target_pair_names = first_meta.pair_names
     hb_types = first_meta.hb_types
@@ -144,14 +206,94 @@ def load_training_windows(
         raise ValueError(f"Invalid duration_seconds={duration_seconds} for sfreq={sfreq_hz}.")
 
     windows: List[np.ndarray] = []
+    qc_reports: List[QualityReport] = []
+    n_qc_rejected = 0
 
     for idx, path in enumerate(paths):
         logger.debug("Loading fNIRS recording %d/%d: %s", idx + 1, len(paths), path)
-        try:
-            raw = load_fnirs(path, deconvolution=deconvolution)
-        except (ValueError, RuntimeError) as e:
-            logger.warning(f"Skipping recording {path}: {e}")
-            continue
+
+        # --- QC path: read raw first, run checks, then preprocess ---
+        if enable_qc:
+            # Check QC cache first — skip expensive processing for known-rejected
+            cached = qc_cache.get(path)
+            if cached is not None:
+                if not cached["scan_passed"]:
+                    logger.debug(
+                        "QC CACHED REJECT %d/%d %s (tier=%s)",
+                        idx + 1, len(paths), path, cached["quality_tier"],
+                    )
+                    n_qc_rejected += 1
+                    continue
+                # Cached pass — still need to load data, but skip QC
+                logger.debug("QC CACHED PASS %d/%d %s", idx + 1, len(paths), path)
+                try:
+                    raw = load_fnirs(path, deconvolution=deconvolution)
+                except (ValueError, RuntimeError) as e:
+                    logger.warning("Skipping recording %s (load failed): %s", path, e)
+                    continue
+            else:
+                # No cache entry — run full QC
+                try:
+                    raw_scan = read_raw_fnirs(path)
+                except (ValueError, RuntimeError) as e:
+                    logger.warning("Skipping recording %s (read failed): %s", path, e)
+                    continue
+
+                try:
+                    preprocessed = load_fnirs(path, deconvolution=deconvolution)
+                except (ValueError, RuntimeError) as e:
+                    logger.warning("Skipping recording %s (preprocess failed): %s", path, e)
+                    del raw_scan
+                    gc.collect()
+                    continue
+
+                qc_report = run_quality_control(
+                    raw_scan,
+                    preprocessed,
+                    sci_threshold=sci_threshold,
+                    snr_threshold=snr_threshold,
+                    cardiac_band=cardiac_band,
+                    cardiac_peak_ratio=cardiac_peak_ratio,
+                    require_cardiac=require_cardiac,
+                    hrf_band=hrf_band,
+                    peak_power_low=peak_power_low,
+                    peak_power_high=peak_power_high,
+                )
+                qc_reports.append(qc_report)
+                del raw_scan
+
+                # Save to cache
+                if qc_cache_path:
+                    from synchronai.data.fnirs.quality_control import save_qc_result
+                    save_qc_result(qc_cache_path, path, qc_report)
+
+                if not qc_report.scan_passed:
+                    logger.warning(
+                        "QC REJECTED recording %d/%d %s: %s",
+                        idx + 1, len(paths), path,
+                        "; ".join(qc_report.rejection_reasons),
+                    )
+                    n_qc_rejected += 1
+                    del preprocessed
+                    gc.collect()
+                    continue
+
+                logger.debug(
+                    "QC passed recording %d/%d: %d/%d channels kept, SNR=%.2f",
+                    idx + 1, len(paths),
+                    qc_report.n_channels_after, qc_report.n_channels_before,
+                    qc_report.scan_snr or 0.0,
+                )
+
+                raw = preprocessed
+
+        # --- Standard path: no QC ---
+        else:
+            try:
+                raw = load_fnirs(path, deconvolution=deconvolution)
+            except (ValueError, RuntimeError) as e:
+                logger.warning(f"Skipping recording {path}: {e}")
+                continue
 
         if target_sfreq_hz is not None:
             raw = raw.copy().resample(target_sfreq_hz)
@@ -184,16 +326,33 @@ def load_training_windows(
         del raw, x, meta
         gc.collect()
 
+    if enable_qc:
+        logger.info(
+            "QC summary: %d/%d recordings passed (%d rejected)",
+            len(paths) - n_qc_rejected, len(paths), n_qc_rejected,
+        )
+
     # (n_windows, time, pairs, hb) -> (n_windows, time, features)
+    if not windows:
+        logger.warning("No valid windows in this batch — all recordings were rejected or empty")
+        return FnirsTrainingData(
+            windows=np.zeros((0, 0, 0), dtype=np.float32),
+            sfreq_hz=target_sfreq_hz or 7.8125,
+            duration_seconds=duration_seconds,
+            pair_names=[],
+            hb_types=["hbo", "hbr"],
+            feature_mean=np.zeros(0, dtype=np.float32),
+            feature_std=np.ones(0, dtype=np.float32),
+        )
+
     # Validate all windows have the same shape before stacking
-    if windows:
-        first_shape = windows[0].shape
-        for i, win in enumerate(windows):
-            if win.shape != first_shape:
-                raise ValueError(
-                    f"Window shape mismatch: window {i} has shape {win.shape}, "
-                    f"expected {first_shape}. This may indicate data processing issues."
-                )
+    first_shape = windows[0].shape
+    for i, win in enumerate(windows):
+        if win.shape != first_shape:
+            raise ValueError(
+                f"Window shape mismatch: window {i} has shape {win.shape}, "
+                f"expected {first_shape}. This may indicate data processing issues."
+            )
 
     windows_np = np.stack(windows, axis=0)
 
@@ -204,7 +363,21 @@ def load_training_windows(
             f"Expected 4D array (n_windows, time, pairs, hb)."
         )
 
-    windows_np = windows_np.reshape(windows_np.shape[0], windows_np.shape[1], -1).astype(np.float32)
+    if per_pair:
+        # Explode (n_windows, time, pairs, hb) → (n_windows * pairs, time, hb)
+        # Each pair becomes an independent sample with feature_dim=len(hb_types)
+        n_win, t_len, n_pairs, n_hb = windows_np.shape
+        # Transpose to (n_windows, pairs, time, hb) then reshape
+        windows_np = windows_np.transpose(0, 2, 1, 3)  # (n_win, pairs, time, hb)
+        windows_np = windows_np.reshape(n_win * n_pairs, t_len, n_hb).astype(np.float32)
+        logger.info(
+            f"Per-pair mode: {n_win} windows × {n_pairs} pairs = "
+            f"{windows_np.shape[0]} samples, feature_dim={n_hb}"
+        )
+        # In per-pair mode, pair_names is meaningless (all pairs are pooled)
+        target_pair_names = ["any"]
+    else:
+        windows_np = windows_np.reshape(windows_np.shape[0], windows_np.shape[1], -1).astype(np.float32)
 
     if normalize:
         if external_mean is not None and external_std is not None:

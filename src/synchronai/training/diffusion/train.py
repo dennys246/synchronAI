@@ -22,9 +22,17 @@ from synchronai.models.fnirs.diffusion import (
     make_linear_beta_schedule,
     pad_length_to_multiple,
 )
+from synchronai.utils.generative_metrics import compute_fid, compute_mmd
 from synchronai.utils.logging import get_logger
 from synchronai.utils.trace import trace
 from synchronai.utils.visualization import plot_hemoglobin_signal
+from synchronai.utils.wandb_utils import (
+    init_wandb,
+    log_metrics,
+    log_summary,
+    log_artifact,
+    finish_wandb,
+)
 
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for headless environments
@@ -56,6 +64,12 @@ class TrainingHistory:
         self.val_batch_indices: List[int] = []  # global batch idx when val was run
         self.best_val_loss: float = float("inf")
         self.best_val_epoch: int = 0
+        # Generative quality metrics (FID / MMD)
+        self.val_fids: List[float] = []
+        self.val_mmds: List[float] = []
+        self.generative_epoch_indices: List[int] = []
+        self.best_fid: float = float("inf")
+        self.best_fid_epoch: int = 0
 
     def add_batch_loss(self, loss: float, recordings_in_batch: int = 0) -> None:
         """Record loss for a single batch."""
@@ -85,6 +99,17 @@ class TrainingHistory:
             self.best_val_loss = float(val_loss)
             self.best_val_epoch = epoch
 
+    def add_generative_metrics(self, fid: float, mmd: float, epoch: int) -> bool:
+        """Record FID and MMD generative quality metrics. Returns True if new best FID."""
+        self.val_fids.append(float(fid))
+        self.val_mmds.append(float(mmd))
+        self.generative_epoch_indices.append(epoch)
+        if float(fid) < self.best_fid:
+            self.best_fid = float(fid)
+            self.best_fid_epoch = epoch
+            return True
+        return False
+
     def save(self, path: str) -> None:
         """Save training history to a JSON file."""
         data = {
@@ -105,6 +130,11 @@ class TrainingHistory:
             "val_batch_indices": self.val_batch_indices,
             "best_val_loss": self.best_val_loss if self.best_val_loss != float("inf") else None,
             "best_val_epoch": self.best_val_epoch,
+            "val_fids": self.val_fids,
+            "val_mmds": self.val_mmds,
+            "generative_epoch_indices": self.generative_epoch_indices,
+            "best_fid": self.best_fid if self.best_fid != float("inf") else None,
+            "best_fid_epoch": self.best_fid_epoch,
         }
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
@@ -138,6 +168,13 @@ class TrainingHistory:
             best_val_loss = data.get("best_val_loss")
             history.best_val_loss = best_val_loss if best_val_loss is not None else float("inf")
             history.best_val_epoch = data.get("best_val_epoch", 0)
+            # Generative quality metrics (backwards compatible)
+            history.val_fids = data.get("val_fids", [])
+            history.val_mmds = data.get("val_mmds", [])
+            history.generative_epoch_indices = data.get("generative_epoch_indices", [])
+            best_fid = data.get("best_fid")
+            history.best_fid = best_fid if best_fid is not None else float("inf")
+            history.best_fid_epoch = data.get("best_fid_epoch", 0)
             # Backwards compatibility: compute from epoch_losses if not saved
             if history.best_loss == float("inf") and history.epoch_losses:
                 history.best_loss = min(history.epoch_losses)
@@ -162,20 +199,30 @@ class TrainingHistory:
                 f"Last val accuracy: {self.val_accuracies[-1]:.1f}%",
                 f"Best val loss: {self.best_val_loss:.6f} (epoch {self.best_val_epoch})",
             ]
+        if self.val_fids:
+            lines += [
+                f"Last FID: {self.val_fids[-1]:.4f}",
+                f"Best FID: {self.best_fid:.4f} (epoch {self.best_fid_epoch})",
+                f"Last MMD: {self.val_mmds[-1]:.6f}",
+            ]
         return " | ".join(lines)
 
     def plot(self, save_path: str, title: str = "Training Loss") -> None:
         """
         Plot training history and save to PNG.
 
-        Two-panel figure:
-        - Top: Train loss (batch, smoothed) + val loss per epoch on same axes
-        - Bottom: Val accuracy (R², %) per epoch with 70% target reference line
+        Up to three panels:
+        - Top: Train loss (batch, smoothed) + val loss per epoch
+        - Middle: Val accuracy (R², %) per epoch with 70% target reference line
+        - Bottom (if available): Generative quality metrics (FID, MMD)
         """
         if not self.batch_losses:
             return
 
-        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
+        n_panels = 2 + (1 if self.val_fids else 0)
+        fig, axes = plt.subplots(n_panels, 1, figsize=(12, 4 * n_panels), sharex=False)
+        if n_panels == 1:
+            axes = [axes]
 
         # --- Top panel: train loss + val loss ---
         ax1 = axes[0]
@@ -203,7 +250,7 @@ class TrainingHistory:
         ax1.grid(True, alpha=0.3)
         ax1.set_yscale('log')
 
-        # --- Bottom panel: val accuracy (%) vs epoch ---
+        # --- Middle panel: val accuracy (%) vs epoch ---
         ax2 = axes[1]
         if self.val_accuracies and self.val_epoch_indices:
             ax2.plot(self.val_epoch_indices, self.val_accuracies, 'o-',
@@ -227,6 +274,28 @@ class TrainingHistory:
                 ax2.legend(loc='upper right')
                 ax2.grid(True, alpha=0.3)
                 ax2.set_yscale('log')
+
+        # --- Bottom panel: generative quality metrics (FID / MMD) ---
+        if self.val_fids and n_panels > 2:
+            ax3 = axes[2]
+            epochs_gen = self.generative_epoch_indices
+            ax3.plot(epochs_gen, self.val_fids, 's-', color='crimson',
+                     linewidth=2.0, markersize=6, label='FID')
+            ax3.set_xlabel('Epoch')
+            ax3.set_ylabel('FID', color='crimson')
+            ax3.tick_params(axis='y', labelcolor='crimson')
+            ax3.set_title(f'{title} — Generative Quality')
+            ax3.grid(True, alpha=0.3)
+
+            ax3_twin = ax3.twinx()
+            ax3_twin.plot(epochs_gen, self.val_mmds, 'D-', color='mediumpurple',
+                          linewidth=2.0, markersize=5, label='MMD')
+            ax3_twin.set_ylabel('MMD', color='mediumpurple')
+            ax3_twin.tick_params(axis='y', labelcolor='mediumpurple')
+
+            lines1, labels1 = ax3.get_legend_handles_labels()
+            lines2, labels2 = ax3_twin.get_legend_handles_labels()
+            ax3.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
 
         plt.tight_layout()
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
@@ -309,8 +378,12 @@ class RunningStats:
 
     @property
     def std(self) -> np.ndarray:
-        """Return the current standard deviation estimate."""
-        return np.sqrt(np.maximum(self.variance, 1e-6)).astype(np.float32)
+        """Return the current standard deviation estimate.
+
+        Floor is 1e-12 (variance) / 1e-6 (std) to handle per-pair fNIRS
+        data where HbO/HbR concentrations have variance in the 1e-9 range.
+        """
+        return np.sqrt(np.maximum(self.variance, 1e-12)).astype(np.float32)
 
     def get_mean(self) -> np.ndarray:
         """Return the current mean estimate."""
@@ -474,6 +547,20 @@ class LazyFnirsDiscovery:
         return len(self.cached_paths)
 
 
+def _extract_subject_id(path: str) -> str:
+    """
+    Extract a subject identifier from a recording path.
+
+    For NIRx directories (contain probeInfo.mat), the directory name is the
+    subject ID.  For .snirf / .fif files, the filename stem (minus common
+    suffixes like ``_Deconvolved``) is used.
+    """
+    p = Path(path)
+    if p.is_dir():
+        return p.name
+    return p.stem.replace("_Deconvolved", "").replace("_deconvolved", "")
+
+
 def _pad_time(windows: np.ndarray, target_len: int) -> np.ndarray:
     if windows.shape[1] == target_len:
         return windows
@@ -562,6 +649,16 @@ def train_fnirs_diffusion(
     stats_mode: str = "frozen",
     save_every_batches: int = 0,
     lr_schedule: str = "constant",
+    eval_gen_every: int = 10,
+    per_pair: bool = False,
+    # Quality control parameters
+    enable_qc: bool = False,
+    sci_threshold: float = 0.5,
+    snr_threshold: float = 5.0,
+    cardiac_peak_ratio: float = 2.0,
+    require_cardiac: bool = True,
+    peak_power_low: Optional[float] = None,
+    peak_power_high: Optional[float] = None,
 ) -> FnirsDiffusionConfig:
     """
     Train a diffusion model on fNIRS windows and save weights + config.
@@ -573,6 +670,17 @@ def train_fnirs_diffusion(
         signal_type: Type of signal to train on - 'hemodynamic' (HbO/HbR) or 'neural' (deconvolved)
         stats_mode: "frozen" (precompute stats) or "streaming" (update during training)
         save_every_batches: Save checkpoints every N recording batches (0 = per-epoch only)
+        per_pair: If True, split each recording into individual source-detector pairs,
+            producing feature_dim=2 (HbO, HbR) instead of feature_dim=20 (10 pairs × 2).
+            Each window yields 10× more training samples. The model learns universal
+            hemodynamic dynamics that generalize to any montage configuration.
+        enable_qc: Enable multi-stage quality control pipeline.
+        sci_threshold: Minimum scalp coupling index (0-1).
+        snr_threshold: Minimum PSD-based SNR for scan rejection.
+        cardiac_peak_ratio: Min ratio of cardiac peak to median PSD.
+        require_cardiac: Reject channels without detectable cardiac signal.
+        peak_power_low: Min acceptable peak PSD.
+        peak_power_high: Max acceptable peak PSD.
     """
     logger = get_logger(__name__)
     trace("train_fnirs_diffusion: start")
@@ -583,6 +691,21 @@ def train_fnirs_diffusion(
         raise ValueError(f"stats_mode must be 'frozen' or 'streaming', got: {stats_mode}")
     if save_every_batches < 0:
         raise ValueError("save_every_batches must be >= 0")
+
+    # QC cache: persist results so each recording is only checked once
+    qc_cache_path = str(save_root / "qc_cache.csv") if enable_qc else None
+
+    # Quality control kwargs passed to every load_training_windows call
+    qc_kwargs = dict(
+        enable_qc=enable_qc,
+        sci_threshold=sci_threshold,
+        snr_threshold=snr_threshold,
+        cardiac_peak_ratio=cardiac_peak_ratio,
+        require_cardiac=require_cardiac,
+        peak_power_low=peak_power_low,
+        peak_power_high=peak_power_high,
+        qc_cache_path=qc_cache_path,
+    )
 
     # Initialize lazy discovery
     discovery = LazyFnirsDiscovery(
@@ -598,14 +721,27 @@ def train_fnirs_diffusion(
         raise RuntimeError(f"No fNIRS recordings found in: {data_dir}")
 
     if val_fraction > 0.0:
-        n_val = max(1, int(len(all_discovered) * val_fraction))
+        # Group recordings by subject to prevent data leakage.
+        # Subject ID is extracted from the recording path — typically the
+        # parent directory for NIRx folders, or the filename stem for .snirf/.fif.
+        subject_to_paths: dict[str, List[str]] = {}
+        for p in all_discovered:
+            sid = _extract_subject_id(p)
+            subject_to_paths.setdefault(sid, []).append(p)
+
+        subjects = sorted(subject_to_paths.keys())
+        n_val_subjects = max(1, int(len(subjects) * val_fraction))
         rng_split = np.random.default_rng(seed)
-        perm = rng_split.permutation(len(all_discovered)).tolist()
-        val_paths = [all_discovered[i] for i in perm[:n_val]]
-        train_paths = [all_discovered[i] for i in perm[n_val:]]
+        perm = rng_split.permutation(len(subjects)).tolist()
+        val_subjects = {subjects[i] for i in perm[:n_val_subjects]}
+
+        val_paths = [p for s in val_subjects for p in subject_to_paths[s]]
+        train_paths = [p for s in subjects if s not in val_subjects for p in subject_to_paths[s]]
         logger.info(
-            "Val split (fraction=%.2f): %d train recordings, %d val recordings",
-            val_fraction, len(train_paths), len(val_paths),
+            "Subject-grouped val split (fraction=%.2f): %d subjects (%d train, %d val), "
+            "%d train recordings, %d val recordings",
+            val_fraction, len(subjects), len(subjects) - n_val_subjects,
+            n_val_subjects, len(train_paths), len(val_paths),
         )
     else:
         train_paths = list(all_discovered)
@@ -636,8 +772,41 @@ def train_fnirs_diffusion(
         deconvolution=deconvolution,
         max_recordings=None,  # Load all paths in the slice (which is just the first batch)
         normalize=False,  # Don't normalize yet - we'll use running stats
+        per_pair=per_pair,
+        **qc_kwargs,
     )
     trace("train_fnirs_diffusion: loaded initial training windows (raw)")
+
+    if training.windows.size == 0:
+        logger.warning(
+            "Initial batch yielded no valid windows (all QC-rejected). "
+            "Trying next batches of recordings..."
+        )
+        batch_start = initial_batch_size
+        while training.windows.size == 0 and batch_start < len(train_paths):
+            batch_end = min(batch_start + initial_batch_size, len(train_paths))
+            logger.info(f"Trying recordings {batch_start}–{batch_end} of {len(train_paths)}...")
+            training = load_training_windows(
+                train_paths[batch_start:batch_end],
+                duration_seconds=duration_seconds,
+                target_sfreq_hz=target_sfreq_hz,
+                segments_per_recording=segments_per_recording,
+                seed=seed,
+                deconvolution=deconvolution,
+                max_recordings=None,
+                normalize=False,
+                per_pair=per_pair,
+                **qc_kwargs,
+            )
+            batch_start = batch_end
+            if training.windows.size > 0:
+                logger.info(f"Found {training.windows.shape[0]} valid windows from batch {batch_start-initial_batch_size}–{batch_start}")
+        if training.windows.size == 0:
+            raise RuntimeError(
+                f"No valid windows found in any of {len(train_paths)} recordings. "
+                f"Check QC thresholds (sci={qc_kwargs.get('sci_threshold')}, "
+                f"snr={qc_kwargs.get('snr_threshold')})."
+            )
 
     target_len = int(training.windows.shape[1])
     feature_dim = int(training.windows.shape[2])
@@ -680,17 +849,23 @@ def train_fnirs_diffusion(
             remaining_paths = train_paths[initial_batch_size:]
             for start in range(0, len(remaining_paths), recordings_per_batch):
                 batch_paths = remaining_paths[start:start + recordings_per_batch]
-                batch_training = load_training_windows(
-                    batch_paths,
-                    duration_seconds=duration_seconds,
-                    target_sfreq_hz=target_sfreq_hz,
-                    segments_per_recording=segments_per_recording,
-                    seed=seed + start,
-                    deconvolution=deconvolution,
-                    max_recordings=None,
-                    normalize=False,
-                )
-                running_stats.update_batch(batch_training.windows)
+                try:
+                    batch_training = load_training_windows(
+                        batch_paths,
+                        duration_seconds=duration_seconds,
+                        target_sfreq_hz=target_sfreq_hz,
+                        segments_per_recording=segments_per_recording,
+                        seed=seed + start,
+                        deconvolution=deconvolution,
+                        max_recordings=None,
+                        normalize=False,
+                        per_pair=per_pair,
+                        **qc_kwargs,
+                    )
+                    running_stats.update_batch(batch_training.windows)
+                except Exception as stats_err:
+                    logger.warning("Stats pass: skipping batch at offset %d: %s", start, stats_err)
+                    continue
                 if start == 0 or (start // recordings_per_batch) % 10 == 0:
                     logger.info(
                         "Stats pass: processed %d/%d recordings",
@@ -745,6 +920,32 @@ def train_fnirs_diffusion(
     _save_json(config_path, config.to_dict())
     logger.info("Wrote config: %s", config_path)
 
+    # Initialize wandb
+    init_wandb(
+        config={
+            "duration_seconds": duration_seconds,
+            "diffusion_timesteps": diffusion_timesteps,
+            "beta_schedule": beta_schedule,
+            "unet_base_width": unet_base_width,
+            "unet_depth": unet_depth,
+            "unet_dropout": unet_dropout,
+            "batch_size": batch_size,
+            "epochs": epochs,
+            "learning_rate": learning_rate,
+            "lr_schedule": lr_schedule,
+            "signal_type": signal_type,
+            "feature_dim": feature_dim,
+            "target_len": target_len,
+            "model_len": model_len,
+            "val_fraction": val_fraction,
+            "seed": seed,
+        },
+        name=f"fnirs-diffusion-w{unet_base_width}-d{unet_depth}",
+        tags=["fnirs-diffusion", signal_type, beta_schedule],
+        group="fnirs-training",
+        save_dir=str(save_root),
+    )
+
     trace("train_fnirs_diffusion: building diffusion schedule + U-Net")
     if beta_schedule == "cosine":
         schedule = make_cosine_beta_schedule(diffusion_timesteps)
@@ -772,16 +973,17 @@ def train_fnirs_diffusion(
             50,
             (total_recordings // recordings_per_batch) * segments_per_recording * 2,
         )
+        first_decay_steps = estimated_steps_per_epoch * 5  # 5-epoch first cycle
         lr_sched = tf.keras.optimizers.schedules.CosineDecayRestarts(
             initial_learning_rate=learning_rate,
-            first_decay_steps=estimated_steps_per_epoch,
+            first_decay_steps=first_decay_steps,
             t_mul=2.0,       # Double the period after each restart
-            m_mul=0.9,       # Reduce peak LR by 10% after each restart
-            alpha=1e-6,      # Minimum LR floor
+            m_mul=0.75,      # Reduce peak LR by 25% after each restart (dampens spikes)
+            alpha=0.05,      # Floor at 5% of peak (avoids near-zero → spike transitions)
         )
         logger.info(
-            "Using cosine decay with warm restarts: first_decay_steps=%d, t_mul=2.0, m_mul=0.9",
-            estimated_steps_per_epoch,
+            "Using cosine decay with warm restarts: first_decay_steps=%d (~5 epochs), t_mul=2.0, m_mul=0.75, alpha=0.05",
+            first_decay_steps,
         )
     elif lr_schedule == "constant":
         lr_sched = learning_rate
@@ -904,6 +1106,8 @@ def train_fnirs_diffusion(
                     deconvolution=deconvolution,
                     max_recordings=None,  # Load all in this batch
                     normalize=False,  # Don't normalize - we'll use running stats
+                    per_pair=per_pair,
+                    **qc_kwargs,
                 )
 
                 # Update running statistics with this batch (streaming mode only)
@@ -1056,9 +1260,9 @@ def train_fnirs_diffusion(
         if val_paths:
             val_loss_metric = tf.keras.metrics.Mean()
             val_acc_metric = tf.keras.metrics.Mean()
-            try:
-                for vstart in range(0, len(val_paths), recordings_per_batch):
-                    vbatch_paths = val_paths[vstart:vstart + recordings_per_batch]
+            for vstart in range(0, len(val_paths), recordings_per_batch):
+                vbatch_paths = val_paths[vstart:vstart + recordings_per_batch]
+                try:
                     val_batch = load_training_windows(
                         vbatch_paths,
                         duration_seconds=duration_seconds,
@@ -1068,23 +1272,29 @@ def train_fnirs_diffusion(
                         deconvolution=deconvolution,
                         max_recordings=None,
                         normalize=False,
+                        per_pair=per_pair,
+                        **qc_kwargs,
                     )
-                    val_windows_norm = standardize_with_stats(
-                        val_batch.windows,
-                        running_stats.get_mean(),
-                        running_stats.std,
-                    )
-                    val_windows_padded = _pad_time(val_windows_norm, model_len)
-                    val_dataset = (
-                        tf.data.Dataset.from_tensor_slices(val_windows_padded)
-                        .batch(batch_size, drop_remainder=False)
-                        .prefetch(tf.data.AUTOTUNE)
-                    )
-                    for val_data in val_dataset:
-                        v_loss, v_acc = val_step(val_data)
-                        val_loss_metric.update_state(v_loss)
-                        val_acc_metric.update_state(v_acc)
+                except Exception as val_load_err:
+                    logger.warning("Val: skipping batch at offset %d: %s", vstart, val_load_err)
+                    continue
+                val_windows_norm = standardize_with_stats(
+                    val_batch.windows,
+                    running_stats.get_mean(),
+                    running_stats.std,
+                )
+                val_windows_padded = _pad_time(val_windows_norm, model_len)
+                val_dataset = (
+                    tf.data.Dataset.from_tensor_slices(val_windows_padded)
+                    .batch(batch_size, drop_remainder=False)
+                    .prefetch(tf.data.AUTOTUNE)
+                )
+                for val_data in val_dataset:
+                    v_loss, v_acc = val_step(val_data)
+                    val_loss_metric.update_state(v_loss)
+                    val_acc_metric.update_state(v_acc)
 
+            if val_loss_metric.count.numpy() > 0:
                 val_loss_epoch = float(val_loss_metric.result())
                 val_acc_epoch = float(val_acc_metric.result())
                 history.add_val_metrics(val_loss_epoch, val_acc_epoch, epoch, history._global_batch)
@@ -1092,14 +1302,98 @@ def train_fnirs_diffusion(
                     "Epoch %d/%s — val_loss=%.6f, val_accuracy=%.1f%%",
                     epoch, epochs_display, val_loss_epoch, val_acc_epoch,
                 )
-            except Exception as val_err:
-                logger.warning("Val evaluation failed at epoch %d: %s", epoch, val_err)
+            else:
+                logger.warning("Val evaluation at epoch %d: all batches failed, no metrics recorded", epoch)
+
+        # Generative quality metrics (FID / MMD) — run every eval_gen_every epochs
+        if val_paths and eval_gen_every > 0 and epoch % eval_gen_every == 0:
+            try:
+                n_gen = 32
+                logger.info("Computing generative metrics (FID/MMD) at epoch %d with %d samples...", epoch, n_gen)
+
+                # Generate samples in standardized space (don't de-standardize)
+                rng_gen = tf.random.Generator.from_seed(seed + epoch * 1000)
+                x_gen = rng_gen.normal((n_gen, config.model_len, config.feature_dim), dtype=tf.float32)
+                for t in reversed(range(schedule.timesteps)):
+                    t_batch = tf.fill([n_gen], tf.cast(t, tf.int32))
+                    eps = model([x_gen, t_batch], training=False)
+                    beta_t = schedule.betas[t]
+                    alpha_t = schedule.alphas[t]
+                    alpha_bar_t = schedule.alpha_bars[t]
+                    x_gen = (1.0 / tf.sqrt(alpha_t)) * (x_gen - (beta_t / tf.sqrt(1.0 - alpha_bar_t)) * eps)
+                    if t > 0:
+                        alpha_bar_prev = schedule.alpha_bars[t - 1]
+                        posterior_var = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)
+                        x_gen = x_gen + tf.sqrt(tf.maximum(posterior_var, 1e-8)) * rng_gen.normal(tf.shape(x_gen), dtype=tf.float32)
+
+                gen_np = x_gen[:, :config.target_len, :].numpy()
+
+                # Collect normalized real val windows for comparison
+                real_windows_list = []
+                for vstart in range(0, len(val_paths), recordings_per_batch):
+                    vbatch_paths = val_paths[vstart:vstart + recordings_per_batch]
+                    try:
+                        vbatch = load_training_windows(
+                            vbatch_paths,
+                            duration_seconds=duration_seconds,
+                            target_sfreq_hz=target_sfreq_hz,
+                            segments_per_recording=segments_per_recording,
+                            seed=seed + epoch,
+                            deconvolution=deconvolution,
+                            max_recordings=None,
+                            normalize=False,
+                            **qc_kwargs,
+                        )
+                    except Exception:
+                        continue
+                    vw_norm = standardize_with_stats(
+                        vbatch.windows, running_stats.get_mean(), running_stats.std,
+                    )
+                    real_windows_list.append(vw_norm[:, :config.target_len, :])
+                    if sum(w.shape[0] for w in real_windows_list) >= n_gen * 2:
+                        break
+                if not real_windows_list:
+                    raise RuntimeError("No valid val windows for generative metrics")
+                real_np = np.concatenate(real_windows_list, axis=0)
+
+                fid_val = compute_fid(real_np, gen_np)
+                mmd_val = compute_mmd(real_np, gen_np)
+                is_best_fid = history.add_generative_metrics(fid_val, mmd_val, epoch)
+                if is_best_fid:
+                    best_fid_path = str(save_root / "fnirs_unet_best_fid.weights.h5")
+                    model.save_weights(best_fid_path)
+                    logger.info(
+                        "Epoch %d/%s — FID=%.4f (NEW BEST), MMD=%.6f — saved best-FID weights: %s",
+                        epoch, epochs_display, fid_val, mmd_val, best_fid_path,
+                    )
+                else:
+                    logger.info(
+                        "Epoch %d/%s — FID=%.4f (best: %.4f @ epoch %d), MMD=%.6f",
+                        epoch, epochs_display, fid_val, history.best_fid,
+                        history.best_fid_epoch, mmd_val,
+                    )
+            except Exception as gen_err:
+                logger.warning("Generative metrics failed at epoch %d: %s", epoch, gen_err)
 
         # Record epoch loss in training history and update current epoch for resume support
         history.add_epoch_loss(epoch_loss, epoch)
         history.current_epoch = epoch
         history.save(history_path)
         history.plot(loss_plot_path, title="fNIRS Diffusion Training")
+
+        # Log to wandb
+        wandb_epoch_metrics = {
+            "train/loss": epoch_loss,
+            "epoch": epoch,
+        }
+        if history.val_losses:
+            wandb_epoch_metrics["val/loss"] = history.val_losses[-1]
+        if history.val_accuracies:
+            wandb_epoch_metrics["val/accuracy"] = history.val_accuracies[-1]
+        if history.val_fids and history.generative_epoch_indices and history.generative_epoch_indices[-1] == epoch:
+            wandb_epoch_metrics["val/fid"] = history.val_fids[-1]
+            wandb_epoch_metrics["val/mmd"] = history.val_mmds[-1]
+        log_metrics(wandb_epoch_metrics)
 
         # Generate and save sample every N epochs
         if epoch % save_sample_every == 0 or (epochs > 0 and epoch == epochs):
@@ -1132,5 +1426,16 @@ def train_fnirs_diffusion(
                 logger.info("Saved generated sample data: %s", npz_path)
             except Exception as e:
                 logger.error(f"Failed to generate sample at epoch {epoch}: {e}", exc_info=True)
+
+    # Log final summary and artifact to wandb
+    log_summary({
+        "best_loss": history.best_loss,
+        "best_epoch": history.best_epoch,
+        "best_val_loss": history.best_val_loss if history.best_val_loss != float("inf") else None,
+        "best_fid": history.best_fid if history.best_fid != float("inf") else None,
+        "best_fid_epoch": history.best_fid_epoch,
+    })
+    log_artifact(weights_path, artifact_type="model")
+    finish_wandb()
 
     return config

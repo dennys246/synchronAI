@@ -1,9 +1,11 @@
 #!/bin/sh
+SCRIPT_VERSION="pre_generative_fnirs_v3_bsub-v1"
 # =============================================================================
-# Submit fNIRS Diffusion v2 Training
+# Submit fNIRS Diffusion v3 Training
 #
-# Wider U-Net (base_width=64) + cosine LR decay with warm restarts.
-# Saves to runs/fnirs_diffusion_v2/ — does NOT touch the current v1 run.
+# Subject-grouped validation split + FID/MMD generative quality metrics.
+# Same architecture as v2 (base_width=64, cosine restarts).
+# Saves to runs/fnirs_diffusion_v3/ — does NOT touch v1 or v2 runs.
 # =============================================================================
 
 export CONDA_ENVS_DIRS="/storage1/fs1/perlmansusan/Active/moochie/resources/conda/envs/"
@@ -18,6 +20,12 @@ export LSF_DOCKER_VOLUMES="/storage1/fs1/perlmansusan/Active:/storage1/fs1/perlm
 
 export LSF_DOCKER_PRESERVE_ENVIRONMENT=true
 
+# Weights & Biases — set your API key from https://wandb.ai/authorize
+# Or use WANDB_MODE=offline to log locally and sync later with: wandb sync ./wandb/offline-run-*
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
+
 export DATE=$(date +'%m-%d')
 
-bsub -J synchronai-fnirs-gen-v2-$DATE -oo $SYNCHRONAI_DIR/scripts/bsub/logs/synchronai_fnirs_gen_v2_$DATE.log -g /$USER/preprocessing < /storage1/fs1/perlmansusan/Active/moochie/github/synchronAI/scripts/bsub/generative_fnirs_v2_bsub.sh
+echo "=== [$SCRIPT_VERSION] ==="
+
+bsub -J synchronai-fnirs-gen-v3-$DATE -oo $SYNCHRONAI_DIR/scripts/bsub/logs/synchronai_fnirs_gen_v3_$DATE.log -g /$USER/preprocessing < /storage1/fs1/perlmansusan/Active/moochie/github/synchronAI/scripts/bsub/generative_fnirs_v3_bsub.sh

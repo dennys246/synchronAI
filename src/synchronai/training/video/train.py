@@ -38,6 +38,13 @@ from synchronai.models.cv.video_classifier import (
     build_video_classifier,
 )
 from synchronai.utils.reproducibility import set_seed, log_reproducibility_info
+from synchronai.utils.wandb_utils import (
+    init_wandb,
+    log_metrics,
+    log_summary,
+    log_artifact,
+    finish_wandb,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1101,6 +1108,15 @@ def train_video_classifier(
         config={"model": asdict(model_config), "training": asdict(training_config)},
     )
 
+    # Initialize wandb
+    init_wandb(
+        config={"model": asdict(model_config), "training": asdict(training_config)},
+        name=f"video-{model_config.backbone}-{model_config.temporal_aggregation}",
+        tags=["video-classifier", model_config.backbone],
+        group="video-training",
+        save_dir=save_dir,
+    )
+
     monitor = training_config.monitor
 
     def _is_improvement(val_loss: float, val_metrics: dict[str, float]) -> bool:
@@ -1202,6 +1218,21 @@ def train_video_classifier(
             history.val_accs.append(val_metrics["accuracy"])
             history.val_aucs.append(val_metrics["auc"])
             history.learning_rates.append(lr)
+
+            # Log to wandb
+            log_metrics({
+                "train/loss": train_loss,
+                "train/accuracy": train_acc,
+                "val/loss": val_loss,
+                "val/accuracy": val_metrics["accuracy"],
+                "val/auc": val_metrics["auc"],
+                "val/precision": val_metrics["precision"],
+                "val/recall": val_metrics["recall"],
+                "val/f1": val_metrics["f1"],
+                "lr": lr,
+                "stage": 1,
+                "epoch": epoch,
+            })
 
             # Check for best model (monitor-driven)
             is_best = _is_improvement(val_loss, val_metrics)
@@ -1376,6 +1407,21 @@ def train_video_classifier(
             history.val_aucs.append(val_metrics["auc"])
             history.learning_rates.append(lr)
 
+            # Log to wandb
+            log_metrics({
+                "train/loss": train_loss,
+                "train/accuracy": train_acc,
+                "val/loss": val_loss,
+                "val/accuracy": val_metrics["accuracy"],
+                "val/auc": val_metrics["auc"],
+                "val/precision": val_metrics["precision"],
+                "val/recall": val_metrics["recall"],
+                "val/f1": val_metrics["f1"],
+                "lr": lr,
+                "stage": 2,
+                "epoch": global_epoch,
+            })
+
             # Check for best model (monitor-driven)
             is_best = _is_improvement(val_loss, val_metrics)
             if is_best:
@@ -1449,6 +1495,15 @@ def train_video_classifier(
         save_dir / "batch_progress.png",
         title="Video Classifier Batch Progress (Final)",
     )
+
+    # Log final summary and artifact to wandb
+    log_summary({
+        "best_val_auc": history.best_val_auc,
+        "best_val_loss": history.best_val_loss,
+        "best_epoch": history.best_epoch,
+    })
+    log_artifact(save_dir / "best.pt", artifact_type="model")
+    finish_wandb()
 
     logger.info(f"Training complete. Best AUC: {history.best_val_auc:.4f} at epoch {history.best_epoch + 1}")
     logger.info(f"Checkpoints saved to: {save_dir}")

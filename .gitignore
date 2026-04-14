@@ -213,9 +213,10 @@ experiments/
 .vscode/
 
 ml-env/
-runs/
+/runs/
 data/*.*
 **/*.pt
 
 scripts/bsub/logs/
 scripts/bsub/data/
+/data/

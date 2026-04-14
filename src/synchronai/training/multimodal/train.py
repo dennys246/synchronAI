@@ -35,6 +35,13 @@ from synchronai.data.multimodal.dataset_mm import (
 from synchronai.data.video.dataset import VideoDatasetConfig
 from synchronai.data.audio.dataset import AudioDatasetConfig
 from synchronai.utils.reproducibility import set_seed, log_reproducibility_info, worker_init_fn
+from synchronai.utils.wandb_utils import (
+    init_wandb,
+    log_metrics,
+    log_summary,
+    log_artifact,
+    finish_wandb,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -567,6 +574,20 @@ def train_multimodal_classifier(
         }
     )
 
+    # Initialize wandb
+    init_wandb(
+        config={
+            "video": video_config,
+            "audio": audio_config,
+            "fusion": fusion_config,
+            "training": asdict(training_config),
+        },
+        name=f"multimodal-{fusion_config.get('type', 'fusion')}",
+        tags=["multimodal", video_config.get("backbone", "yolo"), fusion_config.get("type", "fusion")],
+        group="multimodal-training",
+        save_dir=save_dir,
+    )
+
     # ========================
     # Stage 1: Freeze backbones, train fusion + heads
     # ========================
@@ -657,6 +678,22 @@ def train_multimodal_classifier(
             f"Acc: {val_metrics['accuracy']:.4f}, "
             f"AUC: {val_metrics['auc']:.4f}"
         )
+
+        # Log to wandb
+        log_metrics({
+            "train/loss": train_metrics['loss'],
+            "train/sync_loss": train_metrics['sync_loss'],
+            "train/event_loss": train_metrics['event_loss'],
+            "train/accuracy": train_metrics['accuracy'],
+            "val/loss": val_metrics['loss'],
+            "val/sync_loss": val_metrics['sync_loss'],
+            "val/event_loss": val_metrics['event_loss'],
+            "val/accuracy": val_metrics['accuracy'],
+            "val/auc": val_metrics['auc'],
+            "lr": optimizer.param_groups[0]['lr'],
+            "stage": 1,
+            "epoch": epoch,
+        })
 
         # Update best model
         if val_metrics['loss'] < history.best_val_loss:
@@ -771,6 +808,22 @@ def train_multimodal_classifier(
             f"AUC: {val_metrics['auc']:.4f}"
         )
 
+        # Log to wandb
+        log_metrics({
+            "train/loss": train_metrics['loss'],
+            "train/sync_loss": train_metrics['sync_loss'],
+            "train/event_loss": train_metrics['event_loss'],
+            "train/accuracy": train_metrics['accuracy'],
+            "val/loss": val_metrics['loss'],
+            "val/sync_loss": val_metrics['sync_loss'],
+            "val/event_loss": val_metrics['event_loss'],
+            "val/accuracy": val_metrics['accuracy'],
+            "val/auc": val_metrics['auc'],
+            "lr": optimizer.param_groups[0]['lr'],
+            "stage": 2,
+            "epoch": epoch,
+        })
+
         # Update best model
         if val_metrics['loss'] < history.best_val_loss:
             history.best_val_loss = val_metrics['loss']
@@ -842,6 +895,15 @@ def train_multimodal_classifier(
     }, save_dir / 'latest.pt')
 
     history.save(save_dir / 'history.json')
+
+    # Log final summary and artifact to wandb
+    log_summary({
+        "best_val_auc": history.best_val_auc,
+        "best_val_loss": history.best_val_loss,
+        "best_epoch": history.best_epoch,
+    })
+    log_artifact(save_dir / "best.pt", artifact_type="model")
+    finish_wandb()
 
     logger.info(f"\n{'='*60}")
     logger.info("Training complete!")

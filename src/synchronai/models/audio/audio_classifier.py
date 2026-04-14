@@ -165,12 +165,16 @@ class AudioClassifier(nn.Module):
     def forward(
         self,
         audio: Union[np.ndarray, torch.Tensor],
+        return_sequence: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Forward pass.
 
         Args:
             audio: Audio waveform, shape (batch, n_samples) or (n_samples,)
                    Expected: 16kHz, 1 second = 16000 samples
+            return_sequence: If True, also return pre-pooled frame-level
+                   encoder features as 'sequence_features' (B, T, encoder_dim).
+                   Used by temporal cross-attention fusion.
 
         Returns:
             Dictionary with:
@@ -179,11 +183,24 @@ class AudioClassifier(nn.Module):
             - vocalization_logit: (batch, 1) - vocalization logit (if enabled)
             - vocalization_prob: (batch, 1) - vocalization probability (if enabled)
             - energy: (batch, 1) - predicted energy level (if enabled)
+            - sequence_features: (batch, T, encoder_dim) [if return_sequence]
         """
-        # Extract Whisper encoder features (pool only over real content frames)
+        # Extract pooled encoder features for classification
         features = self.encoder.extract_features(
             audio, pool="mean", chunk_duration=self.config.chunk_duration
         )
+
+        # Optionally extract frame-level sequence for cross-attention fusion
+        if return_sequence:
+            sequence_features = self.encoder.extract_features(
+                audio, pool="none", chunk_duration=self.config.chunk_duration
+            )
+            # Trim to content frames only (avoid silence padding)
+            total_frames = sequence_features.shape[1]
+            content_frames = max(1, int(
+                total_frames * self.config.chunk_duration / 30.0
+            ))
+            sequence_features = sequence_features[:, :content_frames, :]
 
         # Project features
         hidden = self.feature_proj(features)
@@ -198,6 +215,9 @@ class AudioClassifier(nn.Module):
             "features": features,  # Raw encoder features for analysis
             "hidden_features": hidden,  # Projected features (hidden_dim)
         }
+
+        if return_sequence:
+            outputs["sequence_features"] = sequence_features
 
         # Vocalization detection
         if self.vocalization_head is not None:

@@ -26,9 +26,10 @@ class MultiModalSynchronyModel(nn.Module):
     Multi-modal model combining video and audio for synchrony prediction.
 
     Architecture:
-        Video: YOLO backbone → temporal aggregation → 256D features
-        Audio: Whisper encoder → pooling → 256D features
-        Fusion: Cross-modal attention/concat → synchrony prediction
+        Video: DINOv2/YOLO backbone → temporal aggregation → features
+        Audio: Whisper/WavLM encoder → projection → features
+        Fusion: Temporal cross-attention (on frame sequences) or
+                concat/gated (on pooled vectors) → synchrony prediction
 
     Args:
         video_config: Configuration dict for VideoClassifier
@@ -53,6 +54,7 @@ class MultiModalSynchronyModel(nn.Module):
 
         self.use_audio_auxiliary = use_audio_auxiliary
         self.num_classes = num_classes
+        self.fusion_type = fusion_config.get('type', 'concat')
 
         # Build config dataclasses from dicts, mapping YAML keys to dataclass fields
         video_cfg = self._build_video_config(video_config)
@@ -63,22 +65,31 @@ class MultiModalSynchronyModel(nn.Module):
         self.audio_model = AudioClassifier(audio_cfg)
 
         # Get feature dimensions from models
-        # Video: head input = temporal aggregation output dimension
-        video_dim = self.video_model.head[0].in_features
-        # Audio: projected feature dimension
-        audio_dim = self.audio_model.config.hidden_dim
+        # Video pooled: head input = temporal aggregation output dimension
+        video_pooled_dim = self.video_model.head[0].in_features
+        # Video frame-level: raw backbone feature dimension (before temporal agg)
+        video_frame_dim = self.video_model.feature_extractor.feature_dim
+        # Audio pooled: projected feature dimension
+        audio_pooled_dim = self.audio_model.config.hidden_dim
+        # Audio frame-level: raw encoder output dimension (before projection)
+        audio_frame_dim = self.audio_model.config.encoder_dim
 
         # Fusion module
-        # Default to 'concat' — cross_attention is a no-op with single-token
-        # features (softmax over 1 key = always 1.0). Use concat until
-        # temporal sequence features are implemented.
-        fusion_type = fusion_config.get('type', 'concat')
         fusion_hidden_dim = fusion_config.get('hidden_dim', 256)
         num_heads = fusion_config.get('num_heads', 4)
         dropout = fusion_config.get('dropout', 0.3)
 
+        # cross_attention operates on temporal sequences (B, T, D) using
+        # raw frame-level features; concat/gated use pooled vectors.
+        if self.fusion_type == 'cross_attention':
+            video_dim = video_frame_dim
+            audio_dim = audio_frame_dim
+        else:
+            video_dim = video_pooled_dim
+            audio_dim = audio_pooled_dim
+
         self.fusion_module = create_fusion_module(
-            fusion_type=fusion_type,
+            fusion_type=self.fusion_type,
             video_dim=video_dim,
             audio_dim=audio_dim,
             hidden_dim=fusion_hidden_dim,
@@ -106,7 +117,7 @@ class MultiModalSynchronyModel(nn.Module):
             mapped.setdefault('frame_width', size)
         else:
             # Default frame size based on backbone
-            backbone = mapped.get('backbone', 'dinov2-base')
+            backbone = mapped.get('backbone', 'dinov2-small')
             if backbone.startswith('dinov2'):
                 mapped.setdefault('frame_height', 224)
                 mapped.setdefault('frame_width', 224)
@@ -165,12 +176,24 @@ class MultiModalSynchronyModel(nn.Module):
         video_output = self.video_model(video_frames, return_features=True)
         video_features = video_output['temporal_features']  # (batch, video_dim)
 
-        # Get audio features (projected to hidden_dim, not raw encoder features)
-        audio_output = self.audio_model(audio_chunks)
+        # For cross_attention, also get frame-level sequences
+        need_sequences = self.fusion_type == 'cross_attention'
+
+        # Get audio features
+        audio_output = self.audio_model(
+            audio_chunks, return_sequence=need_sequences
+        )
         audio_features = audio_output['hidden_features']  # (batch, audio_dim)
 
         # Fuse modalities
-        fused_features = self.fusion_module(video_features, audio_features)
+        if need_sequences:
+            # Cross-attention uses temporal sequences (B, T, D)
+            video_sequence = video_output['frame_features']       # (B, T_v, feat_dim)
+            audio_sequence = audio_output['sequence_features']    # (B, T_a, enc_dim)
+            fused_features = self.fusion_module(video_sequence, audio_sequence)
+        else:
+            # Concat/gated use pooled vectors (B, D)
+            fused_features = self.fusion_module(video_features, audio_features)
 
         # Synchrony prediction
         sync_logits = self.sync_head(fused_features)

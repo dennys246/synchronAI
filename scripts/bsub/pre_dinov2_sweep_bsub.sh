@@ -1,4 +1,5 @@
 #!/bin/sh
+SCRIPT_VERSION="pre_dinov2_sweep_bsub-v1"
 # =============================================================================
 # Submit DINOv2 Small Backbone Sweep — Focused on dinov2-small (384-dim)
 #
@@ -24,6 +25,10 @@ export PYTHONPATH="/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI:$
 export LSF_DOCKER_VOLUMES="/storage1/fs1/perlmansusan/Active:/storage1/fs1/perlmansusan/Active /home/$USER:/home/$USER"
 export LSF_DOCKER_PRESERVE_ENVIRONMENT=true
 
+# Weights & Biases — set your API key from https://wandb.ai/authorize
+# Or use WANDB_MODE=offline to log locally and sync later with: wandb sync ./wandb/offline-run-*
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
+
 export DATE=$(date +'%m-%d')
 SWEEP_SCRIPT="$SYNCHRONAI_DIR/scripts/bsub/dinov2_sweep_bsub.sh"
 LOG_DIR="$SYNCHRONAI_DIR/scripts/bsub/logs"
@@ -31,6 +36,7 @@ mkdir -p "$LOG_DIR"
 
 SMALL_FEATURES="data/dinov2_features_small_meanpatch"
 
+echo "=== [$SCRIPT_VERSION] ==="
 echo "=========================================="
 echo "  DINOv2 Small Backbone Sweep"
 echo "  All runs use dinov2-small (384-dim)"

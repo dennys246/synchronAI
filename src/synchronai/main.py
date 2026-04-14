@@ -242,6 +242,28 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="Fraction of recordings held out for validation (0 to disable).")
     parser.add_argument("--lr-schedule", default="constant", choices=["constant", "cosine_restarts"],
                         help="LR schedule: constant or cosine decay with warm restarts.")
+    parser.add_argument("--eval-gen-every", type=int, default=10,
+                        help="Compute FID/MMD generative metrics every N epochs (0 to disable).")
+    parser.add_argument("--per-pair", action="store_true",
+                        help="Per-pair mode: split each recording into individual source-detector "
+                             "pairs (feature_dim=2). Each window yields 10x more samples. "
+                             "Produces a montage-agnostic model.")
+
+    # Quality control arguments
+    parser.add_argument("--enable-qc", action="store_true",
+                        help="Enable multi-stage fNIRS quality control pipeline.")
+    parser.add_argument("--sci-threshold", type=float, default=0.5,
+                        help="Minimum scalp coupling index (0-1). Literature recommends 0.75-0.95.")
+    parser.add_argument("--snr-threshold", type=float, default=5.0,
+                        help="Minimum PSD-based SNR. Scans below this are rejected.")
+    parser.add_argument("--cardiac-peak-ratio", type=float, default=2.0,
+                        help="Minimum ratio of cardiac-band peak to median PSD.")
+    parser.add_argument("--no-require-cardiac", action="store_true",
+                        help="Don't reject channels missing cardiac signal.")
+    parser.add_argument("--peak-power-low", type=float, default=None,
+                        help="Min acceptable peak PSD (below = noise-dominated).")
+    parser.add_argument("--peak-power-high", type=float, default=None,
+                        help="Max acceptable peak PSD (above = motion artifact).")
     parser.add_argument("--n-samples", type=int, default=1)
     parser.add_argument("--config-path", default=None)
     parser.add_argument("--out-path", default=None)
@@ -583,6 +605,15 @@ def _run_fnirs_training(args: argparse.Namespace) -> None:
         signal_type=args.signal_type,
         val_fraction=args.val_fraction,
         lr_schedule=args.lr_schedule,
+        eval_gen_every=args.eval_gen_every,
+        per_pair=getattr(args, "per_pair", False),
+        enable_qc=getattr(args, "enable_qc", False),
+        sci_threshold=getattr(args, "sci_threshold", 0.5),
+        snr_threshold=getattr(args, "snr_threshold", 5.0),
+        cardiac_peak_ratio=getattr(args, "cardiac_peak_ratio", 2.0),
+        require_cardiac=not getattr(args, "no_require_cardiac", False),
+        peak_power_low=getattr(args, "peak_power_low", None),
+        peak_power_high=getattr(args, "peak_power_high", None),
     )
 
 

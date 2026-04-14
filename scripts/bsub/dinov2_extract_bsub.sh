@@ -1,4 +1,5 @@
 #!/bin/bash
+SCRIPT_VERSION="dinov2_extract_bsub-v1"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -27,6 +28,7 @@ mkdir -p "$HF_HOME"
 # Step 1: Build ml-env from scratch
 # =============================================================================
 
+echo "=== [$SCRIPT_VERSION] ==="
 echo "=== Building ml-env virtual environment ==="
 
 # Remove stale env to avoid conflicts

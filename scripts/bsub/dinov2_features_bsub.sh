@@ -1,4 +1,5 @@
 #!/bin/bash
+SCRIPT_VERSION="dinov2_features_bsub-v1"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -20,6 +21,7 @@ mkdir -p "$HF_HOME"
 # Install Dependencies
 # =============================================================================
 
+echo "=== [$SCRIPT_VERSION] ==="
 echo "=== Installing dependencies ==="
 
 # Fix NumPy installation

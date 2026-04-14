@@ -1,4 +1,5 @@
 #!/bin/bash
+SCRIPT_VERSION="detect_persons_bsub-v1"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -18,6 +19,7 @@ source "${SYNCHRONAI_DIR:-$PROJECT_DIR}"/ml-env/bin/activate
 
 cd "$PROJECT_DIR"
 
+echo "=== [$SCRIPT_VERSION] ==="
 echo "Working directory: $(pwd)"
 
 # =============================================================================

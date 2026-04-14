@@ -28,7 +28,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import (
+    CosineAnnealingLR,
+    CosineAnnealingWarmRestarts,
+    LinearLR,
+    SequentialLR,
+)
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -37,6 +42,13 @@ from synchronai.data.video.feature_dataset import create_feature_dataloaders
 from synchronai.models.cv.video_classifier import (
     TemporalAttention,
     TemporalLSTM,
+)
+from synchronai.utils.wandb_utils import (
+    init_wandb,
+    log_metrics,
+    log_summary,
+    log_artifact,
+    finish_wandb,
 )
 
 logging.basicConfig(
@@ -194,6 +206,49 @@ def augment_features(
     return features
 
 
+def mixup_features(
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    alpha: float = 0.2,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """Apply mixup augmentation in feature space.
+
+    Blends pairs of feature sequences and their labels using a Beta-distributed
+    mixing coefficient. This creates synthetic training examples that regularize
+    the decision boundary.
+
+    Args:
+        features: (B, T, D) pre-extracted feature sequences
+        labels: (B,) binary labels
+        alpha: Beta distribution parameter (higher = more mixing)
+
+    Returns:
+        Tuple of (mixed_features, labels_a, labels_b, lam)
+    """
+    if alpha <= 0:
+        return features, labels, labels, 1.0
+
+    lam = np.random.beta(alpha, alpha)
+    lam = max(lam, 1 - lam)  # Ensure lam >= 0.5 so primary sample dominates
+
+    batch_size = features.size(0)
+    index = torch.randperm(batch_size, device=features.device)
+
+    mixed = lam * features + (1 - lam) * features[index]
+    return mixed, labels, labels[index], lam
+
+
+def mixup_criterion(
+    criterion: nn.Module,
+    logits: torch.Tensor,
+    labels_a: torch.Tensor,
+    labels_b: torch.Tensor,
+    lam: float,
+) -> torch.Tensor:
+    """Compute mixed loss for mixup training."""
+    return lam * criterion(logits, labels_a) + (1 - lam) * criterion(logits, labels_b)
+
+
 def train_from_features(
     feature_dir: str,
     save_dir: str,
@@ -207,6 +262,9 @@ def train_from_features(
     warmup_epochs: int = 3,
     patience: int = 15,
     label_smoothing: float = 0.05,
+    mixup_alpha: float = 0.0,
+    lr_schedule: str = "cosine",
+    lr_restart_period: int = 10,
     val_split: float = 0.2,
     group_by: str = "subject_id",
     num_workers: int = 4,
@@ -228,6 +286,9 @@ def train_from_features(
         warmup_epochs: Number of warmup epochs
         patience: Early stopping patience
         label_smoothing: Label smoothing factor
+        mixup_alpha: Feature mixup alpha (0 = disabled, 0.2 = recommended)
+        lr_schedule: LR schedule type ("cosine" or "cosine_restarts")
+        lr_restart_period: Period for cosine restarts in epochs (T_0)
         val_split: Validation split fraction
         group_by: Column to group by for train/val split
         num_workers: DataLoader workers
@@ -278,17 +339,36 @@ def train_from_features(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
 
-    # Scheduler: warmup + cosine
-    if warmup_epochs > 0:
-        warmup_sched = LinearLR(
-            optimizer, start_factor=0.3, total_iters=warmup_epochs
-        )
-        main_sched = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs)
-        scheduler = SequentialLR(
-            optimizer, [warmup_sched, main_sched], milestones=[warmup_epochs]
+    # Scheduler: warmup + cosine (with optional warm restarts)
+    if lr_schedule == "cosine_restarts":
+        if warmup_epochs > 0:
+            warmup_sched = LinearLR(
+                optimizer, start_factor=0.3, total_iters=warmup_epochs
+            )
+            main_sched = CosineAnnealingWarmRestarts(
+                optimizer, T_0=lr_restart_period, T_mult=2, eta_min=1e-7
+            )
+            scheduler = SequentialLR(
+                optimizer, [warmup_sched, main_sched], milestones=[warmup_epochs]
+            )
+        else:
+            scheduler = CosineAnnealingWarmRestarts(
+                optimizer, T_0=lr_restart_period, T_mult=2, eta_min=1e-7
+            )
+        logger.info(
+            f"Using cosine warm restarts: T_0={lr_restart_period}, T_mult=2"
         )
     else:
-        scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+        if warmup_epochs > 0:
+            warmup_sched = LinearLR(
+                optimizer, start_factor=0.3, total_iters=warmup_epochs
+            )
+            main_sched = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs)
+            scheduler = SequentialLR(
+                optimizer, [warmup_sched, main_sched], milestones=[warmup_epochs]
+            )
+        else:
+            scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
 
     # Save config
     config = {
@@ -306,12 +386,24 @@ def train_from_features(
         "warmup_epochs": warmup_epochs,
         "patience": patience,
         "label_smoothing": label_smoothing,
+        "mixup_alpha": mixup_alpha,
+        "lr_schedule": lr_schedule,
+        "lr_restart_period": lr_restart_period,
         "val_split": val_split,
         "group_by": group_by,
         "seed": seed,
     }
     with open(save_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
+
+    # Initialize wandb
+    init_wandb(
+        config=config,
+        name=f"features-{backbone}-{temporal_aggregation}",
+        tags=["feature-training", backbone, temporal_aggregation],
+        group="feature-training",
+        save_dir=save_dir,
+    )
 
     # Training history
     history = {
@@ -348,12 +440,24 @@ def train_from_features(
             # Feature-level augmentation (noise + frame dropout)
             features = augment_features(features)
 
+            # Apply label smoothing to labels before mixup
             if label_smoothing > 0:
-                labels = labels * (1.0 - 2 * label_smoothing) + label_smoothing
+                smooth_labels = labels * (1.0 - 2 * label_smoothing) + label_smoothing
+            else:
+                smooth_labels = labels
 
-            logits = model(features)
-            logits = logits.squeeze(-1) if logits.dim() > 1 else logits
-            loss = criterion(logits, labels)
+            # Feature mixup
+            if mixup_alpha > 0:
+                features, labels_a, labels_b, lam = mixup_features(
+                    features, smooth_labels, alpha=mixup_alpha
+                )
+                logits = model(features)
+                logits = logits.squeeze(-1) if logits.dim() > 1 else logits
+                loss = mixup_criterion(criterion, logits, labels_a, labels_b, lam)
+            else:
+                logits = model(features)
+                logits = logits.squeeze(-1) if logits.dim() > 1 else logits
+                loss = criterion(logits, smooth_labels)
 
             optimizer.zero_grad()
             loss.backward()
@@ -402,6 +506,20 @@ def train_from_features(
             f"AUC: {val_metrics['auc']:.4f}, F1: {val_metrics['f1']:.4f} | "
             f"LR: {lr:.2e}"
         )
+
+        # Log to wandb
+        log_metrics({
+            "train/loss": train_loss,
+            "train/accuracy": train_metrics["accuracy"],
+            "val/loss": val_loss,
+            "val/accuracy": val_metrics["accuracy"],
+            "val/auc": val_metrics["auc"],
+            "val/f1": val_metrics["f1"],
+            "val/precision": val_metrics["precision"],
+            "val/recall": val_metrics["recall"],
+            "lr": lr,
+            "epoch": epoch,
+        })
 
         # Update history
         history["train_losses"].append(train_loss)
@@ -482,6 +600,15 @@ def train_from_features(
         _plot_training_history(history, save_dir / "training_plot.png")
     except Exception as e:
         logger.warning(f"Failed to generate training plot: {e}")
+
+    # Log final summary and artifact to wandb
+    log_summary({
+        "best_val_auc": history["best_val_auc"],
+        "best_val_loss": history["best_val_loss"],
+        "best_epoch": history["best_epoch"],
+    })
+    log_artifact(save_dir / "best.pt", artifact_type="model")
+    finish_wandb()
 
     logger.info("Training complete!")
     logger.info(
@@ -581,6 +708,13 @@ def main():
     parser.add_argument("--warmup-epochs", type=int, default=3)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
+    parser.add_argument("--mixup-alpha", type=float, default=0.0,
+                        help="Feature mixup alpha (0=disabled, 0.2=recommended)")
+    parser.add_argument("--lr-schedule", default="cosine",
+                        choices=["cosine", "cosine_restarts"],
+                        help="LR schedule: cosine or cosine_restarts")
+    parser.add_argument("--lr-restart-period", type=int, default=10,
+                        help="Period for cosine restarts (T_0 in epochs)")
     parser.add_argument("--val-split", type=float, default=0.2)
     parser.add_argument("--group-by", default="subject_id",
                         choices=["subject_id", "video_path"])
@@ -603,6 +737,9 @@ def main():
         warmup_epochs=args.warmup_epochs,
         patience=args.patience,
         label_smoothing=args.label_smoothing,
+        mixup_alpha=args.mixup_alpha,
+        lr_schedule=args.lr_schedule,
+        lr_restart_period=args.lr_restart_period,
         val_split=args.val_split,
         group_by=args.group_by,
         num_workers=args.num_workers,

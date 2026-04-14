@@ -15,7 +15,7 @@ requires-python = ">=3.9,<3.13"  # TensorFlow 2.16+ supports up to Python 3.12
 dependencies = [
   "numpy>=1.24",  # TensorFlow 2.18+ supports NumPy 2.x
   "tensorflow>=2.18",  # TensorFlow 2.18+ has NumPy 2.x support
-  "protobuf>=3.20,<6.0",  # Prevent protobuf ABI mismatches
+  "protobuf>=3.20",  # TF 2.21+ needs protobuf 6.x
   "h5py>=3.8,<4.0",  # Required for TensorFlow model I/O
   "mne>=1.11.0",
   "mne_nirs>=0.7.3",
@@ -49,5 +49,8 @@ person_detection = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[project.scripts]
-synchronai = "synchronai.main:main"
+# CLI entry point disabled — caused pip install race conditions when
+# multiple BSub Docker containers install into shared ml-env concurrently.
+# Use `python -m synchronai.main` instead.
+# [project.scripts]
+# synchronai = "synchronai.main:main"
