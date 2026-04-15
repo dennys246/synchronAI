@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="pre_fnirs_extract_features_bsub-v3"
+SCRIPT_VERSION="pre_fnirs_extract_features_bsub-v5"
 # =============================================================================
 # fNIRS Per-Pair Feature Extraction — All Model Sizes
 #
@@ -60,8 +60,10 @@ submit_extraction() {
          << EXTRACT_EOF
 echo "=== [$SCRIPT_VERSION] extract $MODEL_NAME ==="
 cd $SYNCHRONAI_DIR
-. "$SYNCHRONAI_DIR/ml-env/bin/activate"
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:\$PYTHONPATH"
+# ml-env/bin/activate does not reliably work inside LSF heredocs on this
+# cluster — invoke ml-env python by absolute path. See docs/ris_bsub_reference.md.
+ML_PY="$SYNCHRONAI_DIR/ml-env/bin/python"
 
 # Convert TF -> PyTorch if needed
 if [ ! -f "$ENCODER_PT" ]; then
@@ -70,7 +72,7 @@ if [ ! -f "$ENCODER_PT" ]; then
         exit 1
     fi
     echo "=== Converting TF weights to PyTorch ==="
-    python scripts/convert_fnirs_tf_to_pt.py \
+    "\$ML_PY" scripts/convert_fnirs_tf_to_pt.py \
         --config-json "$CONFIG_JSON" \
         --weights-path "$WEIGHTS_H5" \
         --output "$ENCODER_PT" \
@@ -86,7 +88,7 @@ fi
 # rm -rf "$FEATURE_DIR"
 
 echo "=== Extracting per-pair features ==="
-python scripts/extract_fnirs_features.py \
+"\$ML_PY" scripts/extract_fnirs_features.py \
     --encoder-weights "$ENCODER_PT" \
     --data-dirs "$FNIRS_DIRS" \
     --output-dir "$FEATURE_DIR" \
@@ -95,6 +97,8 @@ python scripts/extract_fnirs_features.py \
     --qc-cache "$QC_CACHE" \
     --include-tiers "gold,standard,salvageable" \
     --encoder-batch-size 32 \
+    --pack-output \
+    --delete-unpacked \
     $EXTRA_FLAGS
 
 echo "=== Extraction complete for $MODEL_NAME ==="

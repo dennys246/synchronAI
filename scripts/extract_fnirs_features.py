@@ -316,6 +316,8 @@ def extract_features(
     include_tiers: Optional[list[str]] = None,
     qc_cache_path: Optional[str] = None,
     encoder_batch_size: int = 32,
+    pack_output: bool = False,
+    delete_unpacked: bool = False,
 ) -> None:
     """Extract fNIRS encoder features for all discovered recordings.
 
@@ -551,7 +553,9 @@ def extract_features(
                     fnirs_path, segment_idx=seg_idx,
                     suffix=f"_{pair_name}",
                 )
-                feat_to_save = all_features[idx]
+                # .clone() detaches from the concatenated storage — otherwise
+                # torch.save pickles the full (N_total, T, C) storage for every slice.
+                feat_to_save = all_features[idx].clone()
                 # Retry up to 3 times on transient NFS write failures
                 for attempt in range(3):
                     try:
@@ -696,6 +700,11 @@ def extract_features(
                 f"participant_type! Check detect_participant_type() for these paths."
             )
 
+    if pack_output and index_rows:
+        from synchronai.data.fnirs.feature_dataset import pack_features
+        logger.info("Packing features to mmap format...")
+        pack_features(output_dir, delete_unpacked=delete_unpacked)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -772,6 +781,12 @@ def main():
     parser.add_argument("--encoder-batch-size", type=int, default=32,
                         help="Batch size for encoder forward passes (default: 32). "
                              "Higher = faster but more memory.")
+    parser.add_argument("--pack-output", action="store_true",
+                        help="After extraction, pack all .pt files into a single "
+                             "mmap binary (features_packed.bin) for fast training.")
+    parser.add_argument("--delete-unpacked", action="store_true",
+                        help="With --pack-output, delete individual .pt files after "
+                             "packing to save disk space.")
 
     args = parser.parse_args()
 
@@ -797,6 +812,8 @@ def main():
         include_tiers=include_tiers,
         qc_cache_path=args.qc_cache,
         encoder_batch_size=args.encoder_batch_size,
+        pack_output=args.pack_output,
+        delete_unpacked=args.delete_unpacked,
     )
 
 
