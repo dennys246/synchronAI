@@ -1,5 +1,6 @@
 #!/bin/sh
-SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v9"
+SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v11"
+PLOT_EVERY=3  # write history.png every N epochs during training
 # =============================================================================
 # fNIRS Per-Pair Transfer Learning: Classification Sweep
 #
@@ -225,7 +226,8 @@ echo "Found feature_index.csv at $FEATURE_DIR"
     --num-workers 0 \
     --seed 42 \
     --include-tiers "gold,standard" \
-    --holdout-tiers "gold,salvageable"
+    --holdout-tiers "gold,salvageable" \
+    --plot-every $PLOT_EVERY
 EOF
     }
 

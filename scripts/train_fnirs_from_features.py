@@ -42,6 +42,90 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _plot_history(history: dict, save_path: Path) -> None:
+    """Save a 2x2 PNG with loss, accuracy, AUC (incl. holdout tiers), and LR."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # headless — no X display required
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.warning("matplotlib not available — skipping history plot")
+        return
+
+    if not history.get("train_losses"):
+        return
+
+    n_epochs = len(history["train_losses"])
+    epochs = list(range(1, n_epochs + 1))
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+    # Loss
+    ax = axes[0, 0]
+    ax.plot(epochs, history["train_losses"], label="train", lw=1.5)
+    ax.plot(epochs, history["val_losses"], label="val", lw=1.5)
+    for tier in ("gold", "salvageable"):
+        key = f"holdout_{tier}_losses"
+        if key in history and history[key]:
+            ax.plot(range(1, len(history[key]) + 1), history[key],
+                    label=f"holdout[{tier}]", lw=1.0, linestyle="--")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("Loss")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    # Accuracy
+    ax = axes[0, 1]
+    ax.plot(epochs, history["train_accs"], label="train", lw=1.5)
+    ax.plot(epochs, history["val_accs"], label="val", lw=1.5)
+    for tier in ("gold", "salvageable"):
+        key = f"holdout_{tier}_accs"
+        if key in history and history[key]:
+            ax.plot(range(1, len(history[key]) + 1), history[key],
+                    label=f"holdout[{tier}]", lw=1.0, linestyle="--")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Accuracy")
+    ax.set_title("Accuracy")
+    ax.set_ylim(0.0, 1.0)
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    # AUC (val + holdout tiers)
+    ax = axes[1, 0]
+    ax.plot(epochs, history["val_aucs"], label="val", lw=1.5)
+    for tier in ("gold", "salvageable"):
+        key = f"holdout_{tier}_aucs"
+        if key in history and history[key]:
+            ax.plot(range(1, len(history[key]) + 1), history[key],
+                    label=f"holdout[{tier}]", lw=1.5)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("AUC")
+    ax.set_title("Validation AUC")
+    ax.set_ylim(0.4, 1.0)
+    ax.axhline(0.5, color="gray", linestyle=":", lw=0.8, label="chance")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    # Learning rate
+    ax = axes[1, 1]
+    ax.plot(epochs, history["learning_rates"], color="purple", lw=1.5)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Learning rate")
+    ax.set_title("LR schedule")
+    ax.set_yscale("log")
+    ax.grid(alpha=0.3, which="both")
+
+    fig.suptitle(f"Training history — {save_path.parent.name} (epoch {n_epochs})")
+    fig.tight_layout()
+    try:
+        fig.savefig(save_path, dpi=120, bbox_inches="tight")
+    except Exception as e:
+        logger.warning("Failed to write history plot %s: %s", save_path, e)
+    finally:
+        plt.close(fig)
+
+
 class FnirsFeatureClassifier(nn.Module):
     """Classifier for pre-extracted fNIRS encoder features.
 
@@ -193,6 +277,7 @@ def train_fnirs_from_features(
     seed: int = 42,
     include_tiers: list[str] | None = None,
     holdout_tiers: list[str] | None = None,
+    plot_every: int = 5,
 ) -> None:
     """Train a classifier on pre-extracted fNIRS features.
 
@@ -477,6 +562,11 @@ def train_fnirs_from_features(
         with open(save_dir / "history.json", "w") as f:
             json.dump(history, f, indent=2)
 
+        # Periodic history plot — writes a fresh history.png every
+        # `plot_every` epochs so you can monitor training without parsing logs.
+        if plot_every and (epoch % plot_every == 0):
+            _plot_history(history, save_dir / "history.png")
+
         # Early stopping
         if epochs_without_improvement >= patience:
             logger.info(
@@ -485,6 +575,8 @@ def train_fnirs_from_features(
             )
             break
 
+    # Final history plot (guaranteed regardless of plot_every interval)
+    _plot_history(history, save_dir / "history.png")
     logger.info(f"Training complete!")
     logger.info(f"  Best AUC: {best_auc:.4f} at epoch {best_epoch}")
     logger.info(f"  Model saved to: {save_dir / 'best.pt'}")
@@ -521,6 +613,10 @@ def main():
                         help="Comma-separated quality tiers to evaluate each epoch "
                              "as separate test sets (e.g. 'gold,salvageable'). "
                              "Eval-only — never trained on or used for early stopping.")
+    parser.add_argument("--plot-every", type=int, default=5,
+                        help="Write history.png every N epochs (default: 5). "
+                             "A final plot is always written at the end of training. "
+                             "Set to 0 to disable periodic plots.")
 
     args = parser.parse_args()
 
@@ -546,6 +642,7 @@ def main():
         seed=args.seed,
         include_tiers=include_tiers,
         holdout_tiers=holdout_tiers,
+        plot_every=args.plot_every,
     )
 
 
