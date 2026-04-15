@@ -31,6 +31,7 @@ import csv
 import hashlib
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -160,15 +161,18 @@ def discover_fnirs_paths(data_dirs: str, signal_type: str = "hemodynamic") -> li
             logger.warning(f"Skipping missing directory: {dir_path}")
             continue
 
-        for root, dirs, files in sorted(Path(dir_path).walk()):
+        # os.walk instead of Path.walk() — Path.walk() was only added in
+        # Python 3.12, and ml-env on the cluster runs 3.11.
+        for root, _dirs, files in sorted(os.walk(dir_path)):
+            root_path = Path(root)
             # Check for NIRx directory (has .hdr file)
             if any(f.endswith(".hdr") for f in files):
-                paths.append(str(root))
-                nirx_dirs.add(str(root))
+                paths.append(str(root_path))
+                nirx_dirs.add(str(root_path))
                 continue
 
             # Skip .snirf/.fif files inside NIRx directories
-            if str(root) in nirx_dirs:
+            if str(root_path) in nirx_dirs:
                 continue
 
             for fname in sorted(files):
@@ -178,7 +182,7 @@ def discover_fnirs_paths(data_dirs: str, signal_type: str = "hemodynamic") -> li
                         continue
                     if signal_type == "neural" and not is_deconvolved:
                         continue
-                    paths.append(str(root / fname))
+                    paths.append(str(root_path / fname))
 
     logger.info(f"Discovered {len(paths)} fNIRS recordings from {data_dirs}")
     return paths
