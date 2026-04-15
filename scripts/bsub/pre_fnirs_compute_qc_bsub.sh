@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="pre_fnirs_compute_qc_bsub-v1"
+SCRIPT_VERSION="pre_fnirs_compute_qc_bsub-v2"
 # =============================================================================
 # fNIRS QC Tier Pre-Computation
 #
@@ -42,10 +42,12 @@ bsub -J "synchronai-qc-tiers-$DATE" \
      << QC_EOF
 echo "=== [$SCRIPT_VERSION] ==="
 cd $SYNCHRONAI_DIR
-. "$SYNCHRONAI_DIR/ml-env/bin/activate"
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:\$PYTHONPATH"
+# ml-env/bin/activate does not reliably work inside LSF heredocs on this
+# cluster — invoke ml-env python by absolute path. See docs/ris_bsub_reference.md.
+ML_PY="$SYNCHRONAI_DIR/ml-env/bin/python"
 
-python scripts/compute_fnirs_qc.py \
+"\$ML_PY" scripts/compute_fnirs_qc.py \
     --data-dirs "$FNIRS_DIRS" \
     --output "$QC_OUTPUT" \
     --sci-threshold 0.40 \

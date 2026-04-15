@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="pre_fnirs_extract_random_bsub-v1"
+SCRIPT_VERSION="pre_fnirs_extract_random_bsub-v4"
 # =============================================================================
 # fNIRS Random Encoder Feature Extraction (for ablation)
 #
@@ -43,14 +43,16 @@ bsub -J "synchronai-extract-random-${MODEL_NAME}-$DATE" \
      -oo "$LOG_DIR/fnirs_extract_random_${MODEL_NAME}_$DATE.log" \
      -g /$USER/fnirs_extract \
      << EXTRACT_EOF
-echo "=== [$SCRIPT_VERSION] random extract $MODEL_NAME ==="
+echo "=== [pre_fnirs_extract_random_bsub-v4] random extract $MODEL_NAME ==="
 cd $SYNCHRONAI_DIR
-. "$SYNCHRONAI_DIR/ml-env/bin/activate"
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:\$PYTHONPATH"
+# ml-env/bin/activate does not reliably work inside LSF heredocs on this
+# cluster — invoke ml-env python by absolute path. See docs/ris_bsub_reference.md.
+ML_PY="$SYNCHRONAI_DIR/ml-env/bin/python"
 
 rm -rf "$FEATURE_DIR"
 
-python scripts/extract_fnirs_features.py \
+"\$ML_PY" scripts/extract_fnirs_features.py \
     --encoder-weights "$ENCODER_PT" \
     --data-dirs "$FNIRS_DIRS" \
     --output-dir "$FEATURE_DIR" \
@@ -59,7 +61,9 @@ python scripts/extract_fnirs_features.py \
     --random-init \
     --qc-cache "$SYNCHRONAI_DIR/data/qc_tiers.csv" \
     --include-tiers "gold,standard,salvageable" \
-    --encoder-batch-size 32
+    --encoder-batch-size 32 \
+    --pack-output \
+    --delete-unpacked
 
 echo "=== Random extraction complete ==="
 if [ -f "$FEATURE_DIR/feature_index.csv" ]; then

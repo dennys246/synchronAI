@@ -1,5 +1,5 @@
 #!/bin/sh
-SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v5"
+SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v9"
 # =============================================================================
 # fNIRS Per-Pair Transfer Learning: Classification Sweep
 #
@@ -89,11 +89,13 @@ submit_pipeline() {
          -g /$USER/fnirs_perpair_transfer \
          << SETUP_EOF > /tmp/bsub_transfer_setup_${MODEL_NAME}_$$.out 2>&1
 echo "=== [$SCRIPT_VERSION] ==="
-conda init
-source /home/$USER/.bashrc
-source $SYNCHRONAI_DIR/ml-env/bin/activate
 cd $SYNCHRONAI_DIR
-export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
+export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:\$PYTHONPATH"
+# Invoke ml-env's python by absolute path. Sourcing ml-env/bin/activate
+# inside LSF heredocs does not reliably prepend ml-env/bin to PATH on
+# this cluster — \`python\` silently resolves to the container's base
+# /opt/conda/bin/python which does not have torch. See docs/troubleshooting.md.
+ML_PY="$SYNCHRONAI_DIR/ml-env/bin/python"
 set -e
 
 CONFIG_JSON="$CONFIG_JSON"
@@ -111,7 +113,7 @@ fi
 # Convert TF -> PyTorch
 if [ ! -f "\$ENCODER_PT" ]; then
     echo "=== Converting TF weights to PyTorch ==="
-    python scripts/convert_fnirs_tf_to_pt.py \
+    "\$ML_PY" scripts/convert_fnirs_tf_to_pt.py \
         --config-json "\$CONFIG_JSON" \
         --weights-path "\$WEIGHTS_H5" \
         --output "\$ENCODER_PT" \
@@ -124,23 +126,24 @@ else
     echo "=== PyTorch encoder already exists ==="
 fi
 
-# Extract per-pair features
-if [ ! -f "\${FEATURE_DIR}/feature_index.csv" ]; then
+# Extract per-pair features. Skip only when BOTH the index CSV and the
+# packed mmap binary exist — otherwise we'd silently train on the slow
+# unpacked path if someone resurrected an old index without packing.
+if [ ! -f "\${FEATURE_DIR}/feature_index.csv" ] || [ ! -f "\${FEATURE_DIR}/features_packed.bin" ]; then
     echo "=== Extracting per-pair features ==="
 
     FNIRS_DIRS="$FNIRS_DIRS"
 
-    python scripts/extract_fnirs_features.py \
+    "\$ML_PY" scripts/extract_fnirs_features.py \
         --encoder-weights "\$ENCODER_PT" \
         --data-dirs "\$FNIRS_DIRS" \
         --output-dir "\$FEATURE_DIR" \
         --stride-seconds 60.0 \
-        --enable-qc \
-        --sci-threshold 0.40 \
-        --snr-threshold 2.0 \
-        --cardiac-peak-ratio 2.0 \
-        --no-require-cardiac \
-        --include-tiers "gold,standard,salvageable"
+        --qc-cache "$SYNCHRONAI_DIR/data/qc_tiers.csv" \
+        --include-tiers "gold,standard,salvageable" \
+        --encoder-batch-size 32 \
+        --pack-output \
+        --delete-unpacked
 else
     echo "=== Features already extracted ==="
 fi
@@ -170,24 +173,26 @@ SETUP_EOF
 
         echo "    $RUN_NAME (h=$HIDDEN_DIM, pool=$POOL)"
 
+        # 16GB RAM: packed features are loaded via np.memmap. The full array
+        # can exceed RAM (large ~62GB) — the OS pages in on demand. 16GB is
+        # enough working set for any model size; large will see some page
+        # churn but is still dramatically faster than per-file loads.
         bsub -J "synchronai-perpair-${MODEL_NAME}-${RUN_NAME}-$DATE" \
              -G compute-perlmansusan \
              -q general \
              -m general \
-             -M 4000000 \
+             -M 16000000 \
              -a 'docker(continuumio/anaconda3)' \
              -n 4 \
-             -R 'select[mem>4GB] rusage[mem=4GB]' \
+             -R 'select[mem>16GB] rusage[mem=16GB]' \
              -w "done($SETUP_JOBID)" \
              -oo "$LOG_DIR/fnirs_perpair_${MODEL_NAME}_${RUN_NAME}_$DATE.log" \
              -g /$USER/fnirs_perpair_transfer \
              << EOF
 echo "=== [$SCRIPT_VERSION] train ${MODEL_NAME}_${RUN_NAME} ==="
-conda init
-source /home/$USER/.bashrc
-source $SYNCHRONAI_DIR/ml-env/bin/activate
 cd $SYNCHRONAI_DIR
-export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
+export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:\$PYTHONPATH"
+ML_PY="$SYNCHRONAI_DIR/ml-env/bin/python"
 
 # Force NFS metadata cache refresh and verify features exist
 ls "$FEATURE_DIR/feature_index.csv" > /dev/null 2>&1
@@ -203,7 +208,7 @@ if [ ! -f "$FEATURE_DIR/feature_index.csv" ]; then
 fi
 echo "Found feature_index.csv at $FEATURE_DIR"
 
-python scripts/train_fnirs_from_features.py \
+"\$ML_PY" scripts/train_fnirs_from_features.py \
     --feature-dir "$FEATURE_DIR" \
     --save-dir "$SWEEP_DIR/${MODEL_NAME}_${RUN_NAME}" \
     --label-column participant_type \

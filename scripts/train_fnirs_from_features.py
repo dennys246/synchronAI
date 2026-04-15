@@ -206,9 +206,11 @@ def train_fnirs_from_features(
     from synchronai.data.fnirs.feature_dataset import (
         create_fnirs_feature_dataloaders,
         filter_by_quality_tier,
+        is_feature_dir_packed,
         load_fnirs_feature_index,
         split_fnirs_feature_entries,
         FnirsFeatureDataset,
+        FnirsPackedFeatureDataset,
         _fnirs_feature_collate_fn,
     )
 
@@ -253,12 +255,17 @@ def train_fnirs_from_features(
         # contain subjects from the val set (prevents leakage)
         _, val_entries = split_fnirs_feature_entries(all_entries, val_split, seed)
 
+        holdout_dataset_cls = (
+            FnirsPackedFeatureDataset
+            if is_feature_dir_packed(feature_dir_path)
+            else FnirsFeatureDataset
+        )
         for tier in holdout_tiers:
             tier_entries = filter_by_quality_tier(val_entries, [tier])
             if not tier_entries:
                 logger.warning(f"Holdout tier '{tier}': no val entries, skipping")
                 continue
-            tier_dataset = FnirsFeatureDataset(
+            tier_dataset = holdout_dataset_cls(
                 feature_dir_path, tier_entries, label_column, label_map
             )
             tier_loader = torch.utils.data.DataLoader(

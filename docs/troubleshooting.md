@@ -29,6 +29,29 @@ Based on real problems encountered during synchronAI development.
 - **Cause**: LSF `done()` fires when a job finishes, even if it failed (exit code 1). Training runs after a failed setup.
 - **Fix**: Check setup logs for errors before relying on `done()` dependency. Setup scripts should `exit 1` on failure.
 
+### `source: not found` in heredoc jobs
+
+- **Symptom**: BSub heredoc job prints `source: not found` twice, then runs with the wrong Python environment (virtualenv never activated)
+- **Cause**: LSF executes heredoc bodies as `/bin/sh` (dash), not bash. `source` is a bash-only built-in.
+- **Fix**: Use `.` instead of `source`:
+  ```bash
+  . /home/$USER/.bashrc
+  . $SYNCHRONAI_DIR/ml-env/bin/activate
+  ```
+- **Note**: Scripts with `#!/bin/bash` shebangs are fine — `source` works there. This only bites inside heredocs.
+
+### `du` hangs on directory after mass deletion
+
+- **Symptom**: Running `du` on a directory that previously held 100K+ files is very slow or appears stuck, even though the files are gone
+- **Cause**: Cluster filesystem is IBM Spectrum Scale / GPFS (`rdcw-fs2`). Directory hash tables grow when files are created but do NOT shrink on deletion. `du` traverses all the empty hash slots.
+- **Fix**: Use `mmdf` / `mmlsquota` for usage reporting instead of `du`. Kill the stuck `du` — the data really is gone, just the metadata lags.
+
+### `np.memmap(mode="w+")` fails on login node with OSError 12
+
+- **Symptom**: `OSError: [Errno 12] Cannot allocate memory` when creating a large memmap file on the login node
+- **Cause**: Login node enforces an address-space ulimit. `np.memmap(mode="w+")` reserves the entire file's VA space upfront.
+- **Fix**: For the one-time pack operation, write sequentially via `open(path, "wb")` + `file.write(arr.tobytes())`. No mmap reservation needed. mmap is only used during training reads (mode="r", no VA pressure inside Docker).
+
 ### NFS caching / file not found
 
 - **Symptom**: File was just written by one job but another job can't find it
@@ -76,6 +99,25 @@ Based on real problems encountered during synchronAI development.
 - **Symptom**: `Holdout tier 'salvageable': no val entries, skipping`
 - **Cause**: Feature extraction didn't include salvageable tier, or no salvageable recordings in val split
 - **Fix**: Extraction must use `--include-tiers "gold,standard,salvageable"` with relaxed QC thresholds
+
+### Extracted feature files are 100-330× larger than expected
+
+- **Symptom**: Per-pair feature directories end up in the terabytes (e.g. micro ~766 GB) when they should be single-digit GB
+- **Cause**: `torch.save` on a tensor slice/view saves the entire underlying storage, not just the view's logical extent. `all_features = torch.cat(...); torch.save(all_features[idx], path)` writes the whole concatenated tensor to every file.
+- **Fix**: Always `.clone()` before saving a slice: `torch.save(all_features[idx].clone(), path)`. Fixed in `scripts/extract_fnirs_features.py:554`.
+
+### Feature extraction runs inline QC despite cached tiers existing
+
+- **Symptom**: Extraction takes ~90s per recording instead of ~1-5s. tqdm shows `96.55s/it`.
+- **Cause**: Extraction called with `--enable-qc` flag, which re-runs SCI/SNR/cardiac checks for every recording from scratch.
+- **Fix**: Use `--qc-cache $SYNCHRONAI_DIR/data/qc_tiers.csv` instead. The cache is computed once by `pre_fnirs_compute_qc_bsub.sh` and reused for all subsequent extractions. Reduces per-model extraction from ~50 hours to ~20 minutes.
+
+### fNIRS training is CPU/IO-bound, no epoch output for hours
+
+- **Symptom**: Training job runs silently for hours with no epoch metrics. Each epoch takes many hours.
+- **Cause**: The legacy `FnirsFeatureDataset` loads one `.pt` file per sample via `torch.load()`. On GPFS over NFS this is one open()+read() per sample, serialized. With 500K+ samples per epoch and `--num-workers 0`, I/O dominates.
+- **Fix**: Use the packed feature format — one `features_packed.bin` per feature dir, loaded via `np.memmap` with lazy per-worker open. Pack an existing unpacked dir with `python scripts/pack_features.py <feature_dir> --delete-unpacked`. New extractions should pass `--pack-output --delete-unpacked` to the extractor.
+- **See also**: [docs/fnirs_feature_storage.md](fnirs_feature_storage.md) for the full format spec.
 
 ---
 

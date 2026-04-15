@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="pre_fnirs_ablation_random_bsub-v6"
+SCRIPT_VERSION="pre_fnirs_ablation_random_bsub-v7"
 # =============================================================================
 # fNIRS Ablation: Random Per-Pair Encoder — Training Only
 #
@@ -34,10 +34,12 @@ bsub -J "synchronai-fnirs-random-${MODEL_NAME}-$DATE" \
      -oo "$LOG_DIR/fnirs_ablation_random_${MODEL_NAME}_$DATE.log" \
      -g /$USER/fnirs_ablation \
      << 'ABLATION_EOF'
-echo "=== [pre_fnirs_ablation_random_bsub-v6] ==="
+echo "=== [pre_fnirs_ablation_random_bsub-v7] ==="
 cd $SYNCHRONAI_DIR
-. "$SYNCHRONAI_DIR/ml-env/bin/activate"
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
+# ml-env/bin/activate does not reliably work inside LSF heredocs on this
+# cluster — invoke ml-env python by absolute path. See docs/ris_bsub_reference.md.
+ML_PY="$SYNCHRONAI_DIR/ml-env/bin/python"
 
 RANDOM_FEATURES="$SYNCHRONAI_DIR/data/fnirs_perpair_${ABLATION_MODEL_NAME}_random_features"
 ABLATION_DIR="$SYNCHRONAI_DIR/runs/fnirs_ablation_random"
@@ -49,7 +51,7 @@ if [ ! -f "$RANDOM_FEATURES/feature_index.csv" ]; then
 fi
 
 echo "=== Training ${ABLATION_MODEL_NAME}_lstm64 on random features ==="
-python scripts/train_fnirs_from_features.py \
+"$ML_PY" scripts/train_fnirs_from_features.py \
     --feature-dir "$RANDOM_FEATURES" \
     --save-dir "$ABLATION_DIR/${ABLATION_MODEL_NAME}_lstm64" \
     --label-column participant_type \
