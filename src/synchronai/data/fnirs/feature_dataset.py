@@ -278,27 +278,58 @@ def pack_features(
     # which exceeds login-node ulimits for large (~tens of GB) outputs.
     # Sequential writes have no such requirement and are equally fast for
     # the one-time pack operation — mmap is only needed during training reads.
+    #
+    # Corrupt .pt files are replaced with zero-filled rows to maintain row
+    # alignment (row_idx == byte offset / row_bytes). Their paths are logged
+    # to corrupt_files.txt for manual inspection / cleanup.
+    zero_row = np.zeros(per_entry_shape, dtype=dtype).tobytes()
+    corrupt_files: list[str] = []
+
     t_start = time.time()
     with open(packed_path, "wb") as f:
         for row_idx, row in enumerate(df.itertuples(index=False)):
             fname = row.feature_file
-            feat = torch.load(
-                files_dir / fname, map_location="cpu", weights_only=True
-            )
-            if tuple(feat.shape) != per_entry_shape:
-                raise ValueError(
-                    f"Shape mismatch at row {row_idx} ({fname}): "
-                    f"{tuple(feat.shape)} != {per_entry_shape}. All features "
-                    f"must share the same shape to pack."
+            try:
+                feat = torch.load(
+                    files_dir / fname, map_location="cpu", weights_only=True
                 )
-            arr = np.ascontiguousarray(
-                feat.numpy().astype(dtype, copy=False)
-            )
-            f.write(arr.tobytes())
+                if tuple(feat.shape) != per_entry_shape:
+                    raise ValueError(
+                        f"shape {tuple(feat.shape)} != expected {per_entry_shape}"
+                    )
+                arr = np.ascontiguousarray(
+                    feat.numpy().astype(dtype, copy=False)
+                )
+                f.write(arr.tobytes())
+            except Exception as e:
+                # Write zero-fill to maintain row alignment, log for cleanup
+                f.write(zero_row)
+                corrupt_files.append(fname)
+                if len(corrupt_files) <= 20:
+                    logger.warning(
+                        "  corrupt/unreadable at row %d (%s): %s — zero-filled",
+                        row_idx, fname, e,
+                    )
+                elif len(corrupt_files) == 21:
+                    logger.warning("  (suppressing further corrupt-file warnings)")
 
             if (row_idx + 1) % chunk_log == 0:
                 rate = (row_idx + 1) / (time.time() - t_start)
                 logger.info("  packed %d/%d (%.0f/s)", row_idx + 1, n, rate)
+
+    # Write corrupt-files log if any were skipped
+    if corrupt_files:
+        corrupt_log_path = feature_dir / "corrupt_files.txt"
+        with open(corrupt_log_path, "w") as cf:
+            cf.write(f"# {len(corrupt_files)} corrupt/unreadable .pt files\n")
+            cf.write(f"# Zero-filled in features_packed.bin at their row positions\n")
+            cf.write(f"# Delete these and re-run extraction to fix:\n")
+            for fname in corrupt_files:
+                cf.write(f"{fname}\n")
+        logger.warning(
+            "%d corrupt files zero-filled during pack — see %s",
+            len(corrupt_files), corrupt_log_path,
+        )
 
     # Append row_idx to the CSV (overwrite in place)
     df["row_idx"] = range(n)
@@ -309,15 +340,19 @@ def pack_features(
         "dtype": dtype,
         "n_entries": n,
         "per_entry_shape": list(per_entry_shape),
+        "n_corrupt": len(corrupt_files),
     }
     with open(feature_dir / "features_meta.json", "w") as f:
         json.dump(meta, f, indent=2)
 
     size_mb = packed_path.stat().st_size / (1024 * 1024)
     elapsed = time.time() - t_start
+    n_good = n - len(corrupt_files)
     logger.info(
-        "Packed %d entries, %.1f MB, %.1fs (%.0f entries/s)",
-        n, size_mb, elapsed, n / max(elapsed, 1e-6),
+        "Packed %d entries (%d good, %d corrupt/zero-filled), "
+        "%.1f MB, %.1fs (%.0f entries/s)",
+        n, n_good, len(corrupt_files),
+        size_mb, elapsed, n / max(elapsed, 1e-6),
     )
 
     if delete_unpacked:
@@ -334,6 +369,7 @@ def pack_features(
 
     return {
         "n_entries": n,
+        "n_corrupt": len(corrupt_files),
         "shape": list(total_shape),
         "size_mb": size_mb,
         "elapsed_sec": elapsed,

@@ -704,10 +704,39 @@ def extract_features(
                 f"participant_type! Check detect_participant_type() for these paths."
             )
 
-    if pack_output and index_rows:
+    # Fail loudly if nothing was extracted — otherwise downstream jobs
+    # end up training on stale features from previous runs.
+    if n_success == 0:
+        logger.error(
+            "Extraction produced zero successful recordings (%d failures). "
+            "Aborting with exit code 1 so downstream setup jobs do not "
+            "silently claim success on stale feature data.",
+            n_fail,
+        )
+        raise SystemExit(1)
+
+    if pack_output:
+        if not index_rows:
+            # Defensive: n_success>0 but index_rows empty shouldn't happen;
+            # treat it as the same class of silent failure.
+            logger.error(
+                "pack_output requested but index_rows is empty. "
+                "Something is wrong with the extraction loop — aborting."
+            )
+            raise SystemExit(1)
         from synchronai.data.fnirs.feature_dataset import pack_features
         logger.info("Packing features to mmap format...")
         pack_features(output_dir, delete_unpacked=delete_unpacked)
+
+        # Sanity check: packed files must now exist on disk
+        packed_path = output_dir / "features_packed.bin"
+        meta_path = output_dir / "features_meta.json"
+        if not packed_path.exists() or not meta_path.exists():
+            logger.error(
+                "pack_features did not produce %s + %s. Aborting.",
+                packed_path.name, meta_path.name,
+            )
+            raise SystemExit(1)
 
 
 def main():

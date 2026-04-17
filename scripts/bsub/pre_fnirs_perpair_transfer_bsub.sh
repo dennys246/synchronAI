@@ -1,5 +1,5 @@
 #!/bin/sh
-SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v11"
+SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v12"
 PLOT_EVERY=3  # write history.png every N epochs during training
 # =============================================================================
 # fNIRS Per-Pair Transfer Learning: Classification Sweep
@@ -145,9 +145,31 @@ if [ ! -f "\${FEATURE_DIR}/feature_index.csv" ] || [ ! -f "\${FEATURE_DIR}/featu
         --encoder-batch-size 32 \
         --pack-output \
         --delete-unpacked
+    extract_rc=\$?
+    if [ \$extract_rc -ne 0 ]; then
+        echo "ERROR: extraction exited with code \$extract_rc"
+        exit \$extract_rc
+    fi
 else
     echo "=== Features already extracted ==="
 fi
+
+# Post-setup verification: both the index CSV and the packed binary must
+# exist before we declare success. Prevents downstream training jobs from
+# running on stale unpacked data when extraction silently no-ops.
+if [ ! -f "\${FEATURE_DIR}/feature_index.csv" ]; then
+    echo "ERROR: feature_index.csv missing after setup — extraction failed silently"
+    exit 1
+fi
+if [ ! -f "\${FEATURE_DIR}/features_packed.bin" ]; then
+    echo "ERROR: features_packed.bin missing after setup — pack step did not run"
+    exit 1
+fi
+if [ ! -f "\${FEATURE_DIR}/features_meta.json" ]; then
+    echo "ERROR: features_meta.json missing after setup — pack step incomplete"
+    exit 1
+fi
+echo "Verified: feature_index.csv + features_packed.bin + features_meta.json all present"
 
 echo "=== Setup complete for $MODEL_NAME ==="
 SETUP_EOF
