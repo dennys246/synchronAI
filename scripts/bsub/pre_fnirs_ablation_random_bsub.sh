@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="pre_fnirs_ablation_random_bsub-v7"
+SCRIPT_VERSION="pre_fnirs_ablation_random_bsub-v8"
 # =============================================================================
 # fNIRS Ablation: Random Per-Pair Encoder — Training Only
 #
@@ -23,18 +23,30 @@ mkdir -p "$LOG_DIR"
 echo "=== [$SCRIPT_VERSION] ==="
 echo "  Ablation: $MODEL_NAME (random encoder)"
 
+# RAM scales with packed feature file size (bottleneck_dim × n_entries × 4B):
+#   micro  ~9GB packed → 8GB;  small  ~18GB → 16GB;
+#   medium ~37GB      → 24GB; large  ~74GB → 32GB
+case "$MODEL_NAME" in
+    micro)  MEM_GB=8  ;;
+    small)  MEM_GB=16 ;;
+    medium) MEM_GB=24 ;;
+    large)  MEM_GB=32 ;;
+    *)      MEM_GB=16 ;;
+esac
+echo "  RAM: ${MEM_GB}GB"
+
 bsub -J "synchronai-fnirs-random-${MODEL_NAME}-$DATE" \
      -G compute-perlmansusan \
      -q general \
      -m general \
-     -M 8000000 \
+     -M $((MEM_GB * 1000000)) \
      -a 'docker(continuumio/anaconda3)' \
      -n 4 \
-     -R 'select[mem>8GB] rusage[mem=8GB]' \
+     -R "select[mem>${MEM_GB}GB] rusage[mem=${MEM_GB}GB]" \
      -oo "$LOG_DIR/fnirs_ablation_random_${MODEL_NAME}_$DATE.log" \
      -g /$USER/fnirs_ablation \
      << 'ABLATION_EOF'
-echo "=== [pre_fnirs_ablation_random_bsub-v7] ==="
+echo "=== [pre_fnirs_ablation_random_bsub-v8] ==="
 cd $SYNCHRONAI_DIR
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
 # ml-env/bin/activate does not reliably work inside LSF heredocs on this

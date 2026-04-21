@@ -1,5 +1,5 @@
 #!/bin/sh
-SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v12"
+SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v13"
 PLOT_EVERY=3  # write history.png every N epochs during training
 # =============================================================================
 # fNIRS Per-Pair Transfer Learning: Classification Sweep
@@ -196,18 +196,30 @@ SETUP_EOF
 
         echo "    $RUN_NAME (h=$HIDDEN_DIM, pool=$POOL)"
 
-        # 16GB RAM: packed features are loaded via np.memmap. The full array
-        # can exceed RAM (large ~62GB) — the OS pages in on demand. 16GB is
-        # enough working set for any model size; large will see some page
-        # churn but is still dramatically faster than per-file loads.
+        # RAM scales with packed feature file size, which scales with model's
+        # bottleneck_dim. mmap still pages in on demand, but we need enough
+        # working set to avoid thrashing swap during random-access training.
+        #   micro  ~9GB packed → 8GB
+        #   small  ~18GB       → 16GB
+        #   medium ~37GB       → 24GB
+        #   large  ~74GB       → 32GB
+        local MEM_GB
+        case "$MODEL_NAME" in
+            micro)  MEM_GB=8  ;;
+            small)  MEM_GB=16 ;;
+            medium) MEM_GB=24 ;;
+            large)  MEM_GB=32 ;;
+            *)      MEM_GB=16 ;;
+        esac
+
         bsub -J "synchronai-perpair-${MODEL_NAME}-${RUN_NAME}-$DATE" \
              -G compute-perlmansusan \
              -q general \
              -m general \
-             -M 16000000 \
+             -M $((MEM_GB * 1000000)) \
              -a 'docker(continuumio/anaconda3)' \
              -n 4 \
-             -R 'select[mem>16GB] rusage[mem=16GB]' \
+             -R "select[mem>${MEM_GB}GB] rusage[mem=${MEM_GB}GB]" \
              -w "done($SETUP_JOBID)" \
              -oo "$LOG_DIR/fnirs_perpair_${MODEL_NAME}_${RUN_NAME}_$DATE.log" \
              -g /$USER/fnirs_perpair_transfer \
