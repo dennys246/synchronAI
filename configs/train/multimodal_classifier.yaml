@@ -17,8 +17,8 @@ video:
 
 # Audio model configuration
 audio:
-  model_name: "large-v3"  # Whisper: tiny, base, small, medium, large, large-v2, large-v3
-  # model_name: "wavlm-large"  # WavLM (recommended): wavlm-large, wavlm-base-plus
+  model_name: "wavlm-large"  # WavLM (recommended): wavlm-large, wavlm-base-plus
+  # model_name: "large-v3"  # Whisper: tiny, base, small, medium, large, large-v2, large-v3
   pooling_mode: "mean"  # mean, max, first, last
   hidden_dim: 256
   dropout: 0.3
@@ -31,7 +31,7 @@ audio:
 
 # Fusion configuration
 fusion:
-  type: "concat"  # concat, cross_attention (no-op with single tokens), gated
+  type: "concat"  # concat, cross_attention (uses temporal sequences), gated
   hidden_dim: 256
   num_heads: 4  # For cross_attention (when temporal sequences are available)
   dropout: 0.3

@@ -22,13 +22,22 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 from tqdm import tqdm
+
+# Ensure src/ is importable when run directly.
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from synchronai.data.metadata import (  # noqa: E402
+    MODALITY_FNIRS,
+    classify_recording as _classify_recording_shared,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -87,106 +96,15 @@ def discover_fnirs_paths(data_dirs: str) -> list[str]:
 
 
 def classify_recording(path: str) -> dict:
-    """Assign study / timepoint / task / family_id / subject_id / participant_type.
+    """Thin wrapper around the shared classifier returning a dict.
 
-    Canonical `subject_id` is stable across visits (e.g., CARE child `50001`
-    across V0 and V1 is one subject; R01 `11001_C` across T1/T3/T5 is one).
+    The dict-form preserves the legacy API used by this script's downstream
+    code. `path` is retained as an alias for `source_path` for back-compat.
     """
-    parts = Path(path).parts
-    result = {
-        "path": path,
-        "study": "unknown",
-        "timepoint": "unknown",
-        "task": "unknown",
-        "family_id": "",
-        "subject_id": "",
-        "participant_type": "unknown",
-    }
-
-    # ---- CARE ------------------------------------------------------------
-    # .../CARE/NIRS_data/{family}/V{N}/{subject}_V{N}_fNIRS/
-    if "CARE" in parts:
-        result["study"] = "CARE"
-        result["task"] = "DB-DOS"
-
-        for p in parts:
-            if re.fullmatch(r"V\d+", p):
-                result["timepoint"] = p
-                break
-
-        for p in parts:
-            m = re.match(r"^(\d+)_V\d+_fNIRS", p)
-            if m:
-                sub = m.group(1)
-                result["subject_id"] = sub
-                # Family = first 4 digits; 5-digit child IDs share the family
-                # prefix with their 4-digit parent (e.g., 50001 in family 5000).
-                result["family_id"] = sub[:4] if len(sub) >= 4 else sub
-                if len(sub) == 5:
-                    result["participant_type"] = "child"
-                elif len(sub) == 4:
-                    result["participant_type"] = "adult"
-                return result
-        return result
-
-    # ---- P-CAT R56 -------------------------------------------------------
-    # .../R56/NIRS_data/{family}/{family}_DB-DOS/{subject}_fNIRS_DB-DOS/
-    # .../R56/NIRS_data/{family}/{family}_Flanker
-    if "R56" in parts:
-        result["study"] = "R56"
-        result["timepoint"] = "visit1"  # R56 is single-timepoint; DB-DOS and Flanker are two tasks within the same visit
-
-        # Task detection
-        path_upper = path.upper()
-        if "FLANKER" in path_upper:
-            result["task"] = "Flanker"
-        else:
-            result["task"] = "DB-DOS"
-
-        # Per-participant DB-DOS dir: "1102-C_fNIRS_DB-DOS"
-        for p in parts:
-            m = re.match(r"^(\d+)-([CP])_fNIRS", p)
-            if m:
-                family, ct = m.group(1), m.group(2)
-                result["family_id"] = family
-                result["subject_id"] = f"{family}-{ct}"
-                result["participant_type"] = "child" if ct == "C" else "adult"
-                return result
-
-        # Family-level Flanker dir: "1109_Flanker" (no child/parent subdir)
-        for p in parts:
-            m = re.match(r"^(\d+)_Flanker", p)
-            if m:
-                family = m.group(1)
-                result["family_id"] = family
-                result["subject_id"] = f"{family}-dyad"
-                result["participant_type"] = "dyad"
-                return result
-        return result
-
-    # ---- P-CAT R01 (PSU or WUSTL) ----------------------------------------
-    # .../{site}_data/{T}/nirs_data/dbdos/{family}/{subject}/
-    is_psu = "PSU_data" in parts
-    is_wustl = "WUSTL_data" in parts
-    if is_psu or is_wustl:
-        result["study"] = "R01_PSU" if is_psu else "R01_WUSTL"
-        result["task"] = "DB-DOS"
-
-        for p in parts:
-            if p in ("T1", "T3", "T5"):
-                result["timepoint"] = p
-                break
-
-        for p in parts:
-            m = re.fullmatch(r"(\d+)_([CP])", p)
-            if m:
-                family, ct = m.group(1), m.group(2)
-                result["family_id"] = family
-                result["subject_id"] = f"{family}_{ct}"
-                result["participant_type"] = "child" if ct == "C" else "adult"
-                return result
-
-    return result
+    meta = _classify_recording_shared(path, modality=MODALITY_FNIRS)
+    d = meta.to_dict()
+    d["path"] = d.get("source_path", path)
+    return d
 
 
 def get_duration_minutes(path: str) -> Optional[float]:

@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="multimodal_synchrony_bsub-v1"
+SCRIPT_VERSION="multimodal_synchrony_bsub-v5"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -8,43 +8,33 @@ SCRIPT_VERSION="multimodal_synchrony_bsub-v1"
 #BSUB -n 40
 #BSUB -R 'select[mem>99GB && tmp>99GB] rusage[mem=99GB, tmp=99GB]'
 
-source /home/$USER/.bashrc
-source $SYNCHRONAI_DIR/ml-env/bin/activate
+# ml-env is maintained by the extraction scripts (wavlm_extract_bsub.sh,
+# dinov2_extract_bsub.sh). This training script uses the absolute python path
+# directly — `source activate` is unreliable inside LSF Docker heredocs and
+# silently falls back to conda's python (causing ModuleNotFoundError: torch).
+ML_PY="$SYNCHRONAI_DIR/ml-env/bin/python"
+
+# HuggingFace cache on shared NFS, not /home/$USER (which has a quota).
+export HF_HOME="/storage1/fs1/perlmansusan/Active/moochie/resources/huggingface"
+
+# Make synchronai package importable without `pip install -e .` (which races
+# across concurrent Docker containers on the shared ml-env). Set this here in
+# the body, not just the launcher — Docker env propagation has been unreliable.
+export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
 
 cd $SYNCHRONAI_DIR
 
-# =============================================================================
-# Install Dependencies for Multi-Modal Training
-# =============================================================================
-
 echo "=== [$SCRIPT_VERSION] ==="
-echo "=== Installing multi-modal dependencies ==="
 
-# Fix NumPy installation - reinstall to get proper binary dependencies
-# NumPy 2.x bundles OpenBLAS, but the wheel wasn't installed correctly
-echo "Installing NumPy..."
-pip install --force-reinstall --no-cache-dir "numpy>=2.0,<2.5"
+# =============================================================================
+# Preflight: verify ml-env has required packages
+# =============================================================================
 
-# Clear any corrupted whisper wheel cache
-echo "Clearing Whisper cache..."
-rm -rf /home/$USER/.cache/pip/wheels/*/openai_whisper* 2>/dev/null || true
-
-# Install audio dependencies (--no-cache-dir ensures fresh download)
-echo "Installing audio dependencies..."
-pip install --no-cache-dir openai-whisper soundfile imageio-ffmpeg
-pip install --no-cache-dir transformers  # WavLM encoder support
-
-# Install synchronAI package
-echo "Installing synchronAI package..."
-pip install -e .
-
-# Fix OpenCV for headless Docker container (no libGL)
-# MUST run AFTER pip install -e . because ultralytics pulls in opencv-python (non-headless)
-# Uninstall BOTH variants first — they share the cv2 module directory, so partial
-# uninstall leaves cv2 broken. Then fresh-install only the headless version.
-echo "Replacing OpenCV with headless version..."
-pip uninstall -y opencv-python opencv-python-headless 2>/dev/null || true
-pip install --force-reinstall opencv-python-headless
+echo "=== Preflight: checking ml-env imports ==="
+"$ML_PY" -c "import torch, transformers, soundfile, cv2, synchronai; print(f'torch={torch.__version__} transformers={transformers.__version__} soundfile ok cv2 ok synchronai ok')" || {
+    echo "ERROR: ml-env missing required packages or synchronai not on PYTHONPATH."
+    exit 1
+}
 
 # =============================================================================
 # Directory Configuration
@@ -52,7 +42,7 @@ pip install --force-reinstall opencv-python-headless
 
 LABEL_DIRECTORY="/storage1/fs1/perlmansusan/Active/moochie/study_data/CARE/synchrony_coding/archive/OLD_synchronycoding_participants/"
 VIDEO_DIRECTORY="/storage1/fs1/perlmansusan/Active/moochie/study_data/CARE/video_data/"
-OUTPUT_DIR="runs/multimodal_classifier"
+OUTPUT_DIR="runs/multimodal_dinov2_wavlm"
 LABELS_CSV="data/labels.csv"
 CONFIG_FILE="configs/train/multimodal_classifier.yaml"
 
@@ -66,7 +56,7 @@ if [ ! -f "${LABELS_CSV}" ]; then
     echo "Video directory: ${VIDEO_DIRECTORY}"
     echo "Output CSV: ${LABELS_CSV}"
 
-    python -m synchronai.main --preprocess \
+    "$ML_PY" -m synchronai.main --preprocess \
         --label-dir "${LABEL_DIRECTORY}" \
         --video-dir "${VIDEO_DIRECTORY}" \
         --output-csv "${LABELS_CSV}" \
@@ -89,7 +79,7 @@ echo "Config file: ${CONFIG_FILE}"
 echo "Output directory: ${OUTPUT_DIR}"
 echo ""
 
-python -m synchronai.training.multimodal.train \
+"$ML_PY" -m synchronai.training.multimodal.train \
     --config "${CONFIG_FILE}" \
     --labels-file "${LABELS_CSV}" \
     --save-dir "${OUTPUT_DIR}"

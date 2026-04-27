@@ -521,7 +521,7 @@ def train_multimodal_classifier(
             logger.info(f"  Audio checkpoint: {training_config.pretrained_audio}")
 
         if training_config.load_heads_only:
-            logger.info("\n  Backbones: Using pretrained YOLO + Whisper (from Ultralytics/OpenAI)")
+            logger.info(f"\n  Backbones: Using pretrained {video_config.get('backbone', '?')} + {audio_config.get('model_name', '?')}")
             logger.info("  Heads: Loading from your trained models")
         else:
             logger.info("\n  Loading complete models (backbones + heads)")
