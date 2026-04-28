@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="wavlm_large_extract_bsub-v1"
+SCRIPT_VERSION="wavlm_large_extract_bsub-v2"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -33,13 +33,24 @@ SCRIPT_VERSION="wavlm_large_extract_bsub-v1"
 # slot fragmentation across hosts is fine here (unlike LSTM training).
 # =============================================================================
 
+# v2: hardcode SYNCHRONAI_DIR. v1 inherited it from the submitting shell, but
+# `bsub < script.sh` only propagates env when LSF_DOCKER_PRESERVE_ENVIRONMENT
+# is set in the submit shell — easy to forget. Self-contained scripts are
+# fewer footguns. v1 silently failed: empty $SYNCHRONAI_DIR made the labels.csv
+# preflight check evaluate "/data/labels.csv" and exit with the wrong error.
+export SYNCHRONAI_DIR="/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI"
+
 cd "$SYNCHRONAI_DIR"
 
 # Redirect HuggingFace cache to storage (model weights ~1.3 GB)
 export HF_HOME="/storage1/fs1/perlmansusan/Active/moochie/resources/huggingface"
 mkdir -p "$HF_HOME"
 
+# Make synchronai package importable without pip install -e (NFS race risk).
+export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
+
 echo "=== [$SCRIPT_VERSION] ==="
+echo "SYNCHRONAI_DIR=$SYNCHRONAI_DIR"
 
 # ml-env/bin/activate doesn't reliably work inside LSF heredocs on this
 # cluster; use absolute python path. See docs/ris_bsub_reference.md.

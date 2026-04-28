@@ -1,5 +1,5 @@
 #!/bin/sh
-SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v13"
+SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v14"
 PLOT_EVERY=3  # write history.png every N epochs during training
 # =============================================================================
 # fNIRS Per-Pair Transfer Learning: Classification Sweep
@@ -219,7 +219,7 @@ SETUP_EOF
              -M $((MEM_GB * 1000000)) \
              -a 'docker(continuumio/anaconda3)' \
              -n 4 \
-             -R "select[mem>${MEM_GB}GB] rusage[mem=${MEM_GB}GB]" \
+             -R "select[mem>${MEM_GB}GB] rusage[mem=${MEM_GB}GB] span[hosts=1]" \
              -w "done($SETUP_JOBID)" \
              -oo "$LOG_DIR/fnirs_perpair_${MODEL_NAME}_${RUN_NAME}_$DATE.log" \
              -g /$USER/fnirs_perpair_transfer \
@@ -227,6 +227,14 @@ SETUP_EOF
 echo "=== [$SCRIPT_VERSION] train ${MODEL_NAME}_${RUN_NAME} ==="
 cd $SYNCHRONAI_DIR
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:\$PYTHONPATH"
+# v14: span[hosts=1] above keeps all 4 slots on one host. PyTorch's intra-op
+# pool defaults to host-physical-cores, not LSF -n; without these exports
+# the slots are reserved but unused. Two prior runs (small_lstm64 441996,
+# medium_lstm64 564586) hung silently mid-training when scattered across
+# hosts — see CLAUDE.md "fNIRS training jobs hang silently on fragmented
+# slots". Match LSF -n value here.
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
 ML_PY="$SYNCHRONAI_DIR/ml-env/bin/python"
 
 # Force NFS metadata cache refresh and verify features exist

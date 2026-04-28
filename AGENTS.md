@@ -22,6 +22,7 @@
 - **Absolute paths**: All feature dirs, save dirs, and weight paths must use `$SYNCHRONAI_DIR/` prefixes. Relative paths fail inside Docker containers.
 - **SCRIPT_VERSION**: Every BSub script defines and echoes a version string as the first output line.
 - **Replace hardcoded usernames** with `$USER` (e.g., `/home/$USER/.bashrc`).
+- **CPU training jobs require `span[hosts=1]` + `OMP_NUM_THREADS=N`** matching `-n N`. Without both, LSF fragments slots across hosts and PyTorch CPU jobs either run slowly or hang silently mid-training. Extraction jobs are exempt (embarrassingly parallel). See CLAUDE.md "CPU training jobs hang silently when LSF slots fragment across hosts" for details.
 
 ### Hugging Face Upload Principles
 - Repos: `dennys246/fNIRS_diffusion`, `dennys246/fNIRS_synchrony`, `dennys246/video_synchrony`, `dennys246/audio_synchrony`, `dennys246/transcript_synchrony`

@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="pre_fnirs_child_adult_sweep-v7"
+SCRIPT_VERSION="pre_fnirs_child_adult_sweep-v8"
 # =============================================================================
 # fNIRS Child/Adult Classification Sweep — Training Only
 #
@@ -40,7 +40,7 @@ submit_model_sweep() {
          -M 8000000 \
          -a 'docker(continuumio/anaconda3)' \
          -n 4 \
-         -R 'select[mem>8GB] rusage[mem=8GB]' \
+         -R 'select[mem>8GB] rusage[mem=8GB] span[hosts=1]' \
          -oo "$LOG_DIR/fnirs_sweep_${MODEL_NAME}_$DATE.log" \
          -g /$USER/fnirs_sweep \
          << SWEEP_EOF
@@ -48,6 +48,11 @@ echo "=== [$SCRIPT_VERSION] $MODEL_NAME ==="
 cd $SYNCHRONAI_DIR
 . "$SYNCHRONAI_DIR/ml-env/bin/activate"
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:\$PYTHONPATH"
+# v8: span[hosts=1] above + OMP/MKL exports below match LSF -n 4. Without
+# these, PyTorch's thread pool defaults to host-physical-cores; with -n
+# scattered across hosts, training hangs silently. See CLAUDE.md.
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
 
 if [ ! -f "$FEATURE_DIR/feature_index.csv" ]; then
     echo "ERROR: Features not found at $FEATURE_DIR/feature_index.csv"

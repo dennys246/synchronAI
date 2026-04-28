@@ -240,6 +240,46 @@ must traverse all the empty hash slots. This is not corruption. Use `mmdf` or
 different node. **Fix**: Use absolute paths and, when chaining jobs, add a brief
 verification step that checks the file exists before proceeding.
 
+### CPU training jobs hang silently when LSF slots fragment across hosts
+**Symptom**: A training job (LSTM, transformer, anything sequential) reports `RUN`
+in `bjobs` for hours or days while doing zero work. `bjobs -l <JOBID> | grep -A5
+"CPU USAGE"` shows `CPU PEAK: 0.00 / CPU AVERAGE EFFICIENCY: 0.00%`. Memory usage
+is stable, so it's not OOM. Process is alive but doing nothing.
+
+**Confirmed cases**: `small_lstm64` (job 441996, silent for 4 days), `medium_lstm64`
+(job 564586, silent for 13+ hours mid-epoch 17). Both ran without `span[hosts=1]`
+and without `OMP_NUM_THREADS`. Both got LSF execution hosts like
+`1*compute1-exec-411 + 3*compute1-exec-188` (slots scattered across 2+ hosts).
+
+**Hypothesis**: when LSF fragments `-n 4` across hosts, PyTorch's intra-op pool
+may attempt to use cores on a host where the python process isn't running. If
+that fragmented host's slot becomes unresponsive, PyTorch waits for it
+indefinitely. The main process hangs, but the docker container stays alive, so
+LSF sees no failure and never marks the job EXIT.
+
+**Fix** (mandatory for CPU training jobs):
+1. Add `span[hosts=1]` to the `-R` line: `-R "select[mem>NGB] rusage[mem=NGB] span[hosts=1]"`
+2. Export `OMP_NUM_THREADS=N` and `MKL_NUM_THREADS=N` matching `-n N` inside the
+   heredoc. `span[hosts=1]` alone gets the slots on one host; the OMP exports make
+   PyTorch's thread pool actually use them. **Both are needed** — span without OMP
+   reserves cores PyTorch doesn't use; OMP without span attempts threads on cores
+   that aren't local.
+3. Consider reducing `-n` from 8 to 4 if the workload is sequential — LSTM
+   training averages ~1.7 effective cores; reserving 8 is just hostile to other
+   users.
+
+**Don't apply** to extraction jobs (audio, fNIRS feature extraction). Those are
+embarrassingly parallel per-second, slot fragmentation is fine, and faster
+scheduling is preferable.
+
+**Diagnostic when a job goes silent**: run `bjobs -l <JOBID> | grep -A5 "CPU USAGE"`.
+If `CPU PEAK: 0.00`, kill it (`bkill <JOBID>`) — the checkpoint at the last
+completed epoch is your final result. Don't wait it out.
+
+**Scripts already fixed** (as of 2026-04-28): `multimodal_from_features_bsub-v7`,
+`pre_fnirs_ablation_random_bsub-v9`, `pre_fnirs_perpair_transfer_bsub-v14`,
+`pre_fnirs_child_adult_sweep-v8`. New CPU training BSub scripts MUST follow this pattern.
+
 ### Job dependency gotcha
 `bsub -w "done(JOBID)"` fires on job completion regardless of exit code — a failed
 setup job will still trigger downstream training. **Fix**: Use `"ended(JOBID)"` with
