@@ -180,3 +180,46 @@ If D1+D2+D3 are the right diagnoses, v2-baseline should:
 - Run in < 8 hours total (preload + train)
 
 If v2-baseline plateaus below 0.78, the bottleneck is the data/representation, not the optimization, and we'd need WavLM-large extraction or attention-based fusion to push higher.
+
+---
+
+## Actual results — first batch (2026-04-27 overnight)
+
+All four variants ran 30 epochs with `--early-stop-metric val_loss`, multi-criterion checkpoints, `span[hosts=1]` + `OMP=4` (no slot fragmentation). All completed cleanly.
+
+| Variant | Best AUC (ep) | Best Acc (ep) | Best Loss (ep) | Stopped |
+|---|---|---|---|---|
+| **v2_baseline_v6** | **0.7977** (1) | **0.7640** (4) | 0.4970 (5) | ep15 |
+| v2_higher_capacity (h=128) | 0.7872 (3) | 0.7597 (3) | **0.4948** (4) | ep14 |
+| v2_lower_capacity (h=32) | 0.7827 (3) | 0.7627 (5) | 0.5059 (6) | ep16 |
+| v2_more_reg (drop=0.5, wd=3e-2) | 0.7975 (1) | 0.7599 (5) | 0.4968 (5) | ep15 |
+
+### What we learned
+
+- **The 0.78 publication bar was not cleared.** Best val_acc 0.7640.
+- **Architecture and regularization are not the bottleneck.** All 4 variants converged within 0.43 percentage points of each other on val_acc. Bigger, smaller, more regularized — none moved the needle.
+- **The val_loss-based early-stopping change was the biggest single lever** — moved val_acc from 0.7273 (the original v2_baseline `best.pt` saved at AUC-peak ep1) to 0.7640 (`best_acc.pt` at ep4) with no model change. **+3.7 pp from picking the right epoch.**
+- **The "AUC peaks at warmup" pattern is robust across all variants** — calibration phenomenon, not architecture artifact. Confirms the early-stopping switch was correct.
+- **Multi-modal fusion gain preserved**: +6 AUC over single-modality baselines (DINOv2 alone 0.697, WavLM-base-plus alone 0.674, multimodal 0.7977).
+
+### Where the ceiling actually sits
+
+Architecture is exhausted as a lever. The remaining bottlenecks, in order of likelihood:
+1. **Audio expressivity** — WavLM-base-plus's 768-dim features may be the cap. WavLM-large (1024-dim, 24 layers, 94k pretraining hours) is the canonical next step.
+2. **Dataset scale** — 50K samples / 40 train subjects / 9 val subjects. With more data being collected, this self-resolves over time.
+3. **Val-set variance** — only 9 val subjects → ±1-2 pp standard error; the 0.764→0.78 gap is real but small.
+
+### Levers explicitly NOT pursued
+
+- **Label smoothing**: assumes label noise. Synchrony labels are *thresholded continuous*, not noisy — smoothing toward 0.5±ε blurs correctly-placed boundaries without modeling the gradient.
+- **Mixup**: interpolates `(v_i, a_i) + (v_j, a_j)`. Breaks inter-modal temporal alignment, which IS the synchrony signal. Mixed sample doesn't represent any real dyadic state.
+
+Both were dropped on scientific grounds, not just compute grounds.
+
+---
+
+## Next batch — Option C: WavLM-large extraction
+
+Submitted via `scripts/bsub/wavlm_large_extract_bsub.sh`. Output to `data/wavlm_large_features/` (49, 1024). Per-layer extraction deferred until blended-large justifies it. ETA ~12-18h walltime.
+
+After extraction completes, re-run the v2 sweep with `MM_AUDIO_FEATURE_DIR=data/wavlm_large_features` to test whether audio expressivity was the real cap.

@@ -1,12 +1,12 @@
 #!/bin/bash
-SCRIPT_VERSION="multimodal_from_features_bsub-v6"
+SCRIPT_VERSION="multimodal_from_features_bsub-v7"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
-#BSUB -M 32000000
+#BSUB -M 20000000
 #BSUB -a 'docker(continuumio/anaconda3)'
-#BSUB -n 8
-#BSUB -R 'select[mem>32GB] rusage[mem=32GB] span[hosts=1]'
+#BSUB -n 4
+#BSUB -R 'select[mem>20GB] rusage[mem=20GB] span[hosts=1]'
 
 # CPU-only multi-modal training on pre-extracted DINOv2 + WavLM features.
 # Mirrors the wavlm_audio_sweep_bsub.sh pattern: ml-env is maintained by
@@ -29,8 +29,11 @@ cd $SYNCHRONAI_DIR
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
 
 # Tell PyTorch to use the LSF slot count. span[hosts=1] alone is not enough.
-export OMP_NUM_THREADS=8
-export MKL_NUM_THREADS=8
+# v7: dropped 8 → 4 to match -n 4. v2_baseline run used only ~1.7 effective
+# cores time-averaged anyway (LSTM is sequential), so 4 is enough headroom for
+# spikes and frees slots for other users.
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
 
 ARCH="${MM_ARCH:-v2}"
 VIDEO_FEATURE_DIR="${MM_VIDEO_FEATURE_DIR:-data/dinov2_features_meanpatch}"

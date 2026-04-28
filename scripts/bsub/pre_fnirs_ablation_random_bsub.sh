@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="pre_fnirs_ablation_random_bsub-v8"
+SCRIPT_VERSION="pre_fnirs_ablation_random_bsub-v9"
 # =============================================================================
 # fNIRS Ablation: Random Per-Pair Encoder — Training Only
 #
@@ -42,13 +42,20 @@ bsub -J "synchronai-fnirs-random-${MODEL_NAME}-$DATE" \
      -M $((MEM_GB * 1000000)) \
      -a 'docker(continuumio/anaconda3)' \
      -n 4 \
-     -R "select[mem>${MEM_GB}GB] rusage[mem=${MEM_GB}GB]" \
+     -R "select[mem>${MEM_GB}GB] rusage[mem=${MEM_GB}GB] span[hosts=1]" \
      -oo "$LOG_DIR/fnirs_ablation_random_${MODEL_NAME}_$DATE.log" \
      -g /$USER/fnirs_ablation \
      << 'ABLATION_EOF'
-echo "=== [pre_fnirs_ablation_random_bsub-v8] ==="
+echo "=== [pre_fnirs_ablation_random_bsub-v9] ==="
 cd $SYNCHRONAI_DIR
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
+# v9: span[hosts=1] above keeps all 4 slots on one host, but PyTorch's
+# intra-op pool defaults to host-physical-cores rather than LSF -n. Without
+# these exports, slots are reserved but unused (the v8 large run was running
+# at ~1 effective core because the LSTM hit one of the host's cores instead
+# of the 4 we'd reserved). Match LSF -n value here.
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
 # ml-env/bin/activate does not reliably work inside LSF heredocs on this
 # cluster — invoke ml-env python by absolute path. See docs/ris_bsub_reference.md.
 ML_PY="$SYNCHRONAI_DIR/ml-env/bin/python"
