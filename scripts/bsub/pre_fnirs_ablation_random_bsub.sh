@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="pre_fnirs_ablation_random_bsub-v9"
+SCRIPT_VERSION="pre_fnirs_ablation_random_bsub-v10"
 # =============================================================================
 # fNIRS Ablation: Random Per-Pair Encoder — Training Only
 #
@@ -22,6 +22,15 @@ mkdir -p "$LOG_DIR"
 
 echo "=== [$SCRIPT_VERSION] ==="
 echo "  Ablation: $MODEL_NAME (random encoder)"
+
+# Skip if already trained — prevents accidental clobbering of completed
+# runs. Delete or rename runs/.../best.pt to force a re-run.
+ABL_SAVE_DIR="$SYNCHRONAI_DIR/runs/fnirs_ablation_random/${MODEL_NAME}_lstm64"
+if [ -f "$ABL_SAVE_DIR/best.pt" ] && [ -f "$ABL_SAVE_DIR/history.json" ]; then
+    echo "  SKIP: ablation already trained — $ABL_SAVE_DIR/best.pt exists."
+    echo "  Delete or rename it to force re-run."
+    exit 0
+fi
 
 # RAM scales with packed feature file size (bottleneck_dim × n_entries × 4B):
 #   micro  ~9GB packed → 8GB;  small  ~18GB → 16GB;

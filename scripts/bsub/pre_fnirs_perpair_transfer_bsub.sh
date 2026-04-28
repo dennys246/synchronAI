@@ -1,5 +1,5 @@
 #!/bin/sh
-SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v14"
+SCRIPT_VERSION="pre_fnirs_perpair_transfer_bsub-v15"
 PLOT_EVERY=3  # write history.png every N epochs during training
 # =============================================================================
 # fNIRS Per-Pair Transfer Learning: Classification Sweep
@@ -193,6 +193,17 @@ SETUP_EOF
         local DROPOUT="$3"
         local POOL="$4"
         local LR="$5"
+
+        local SAVE_DIR="$SWEEP_DIR/${MODEL_NAME}_${RUN_NAME}"
+
+        # Skip if already trained — prevents accidental resubmissions from
+        # clobbering completed runs (this happened to small_lstm64 on
+        # 2026-04-23 and required GPFS-snapshot recovery). To re-run, delete
+        # or rename $SAVE_DIR/best.pt before invoking this script.
+        if [ -f "$SAVE_DIR/best.pt" ] && [ -f "$SAVE_DIR/history.json" ]; then
+            echo "    $RUN_NAME: SKIP (already trained — $SAVE_DIR/best.pt exists)"
+            return 0
+        fi
 
         echo "    $RUN_NAME (h=$HIDDEN_DIM, pool=$POOL)"
 
