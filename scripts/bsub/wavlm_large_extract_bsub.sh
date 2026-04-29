@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="wavlm_large_extract_bsub-v3"
+SCRIPT_VERSION="wavlm_large_extract_bsub-v4"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -113,6 +113,12 @@ echo ""
     --encoder wavlm-large \
     --chunk-duration 1.0 \
     --device auto
+extract_rc=$?
+if [ $extract_rc -ne 0 ]; then
+    echo "ERROR: extraction exited with code $extract_rc — see traceback above."
+    echo "  WavLM-large extraction FAILED, no completion banner."
+    exit $extract_rc
+fi
 
 echo ""
 echo "=== WavLM-large extraction complete ==="

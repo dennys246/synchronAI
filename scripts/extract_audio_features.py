@@ -166,9 +166,16 @@ def extract_features(
     # extraction). For pre-extraction we want deterministic features without
     # dropout firing — both for speed and so the saved .pt files don't depend
     # on the dropout RNG state.
+    #
+    # The encoder lazy-loads the actual transformer (self.wavlm = None at
+    # __init__; populated by _load_model() on first forward pass). Trigger
+    # the load explicitly so we can flip to eval() before any extraction
+    # calls happen — without this, every forward pass would run in train
+    # mode (HF models default to train mode after from_pretrained()).
     if encoder_type == "wavlm":
+        encoder._load_model()
         encoder.wavlm.eval()
-        logger.info("WavLM encoder set to eval() mode for deterministic extraction")
+        logger.info("WavLM encoder loaded and set to eval() mode for deterministic extraction")
 
     # Per-video audio cache. load_audio() reads the full decoded WAV from NFS
     # on each call (16-50 MB). With ~40-60 entries per video, re-reading the
