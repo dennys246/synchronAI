@@ -268,9 +268,20 @@ LSF sees no failure and never marks the job EXIT.
    training averages ~1.7 effective cores; reserving 8 is just hostile to other
    users.
 
-**Don't apply** to extraction jobs (audio, fNIRS feature extraction). Those are
-embarrassingly parallel per-second, slot fragmentation is fine, and faster
-scheduling is preferable.
+**When this applies to extraction jobs**: extraction is parallel ACROSS files but
+each FILE still goes through a single python process. The right rule is
+per-item compute weight, not "training vs extraction":
+- **Light per-item** (small models, simple features, fast pre-processing): skip
+  the fix. Slot fragmentation is fine because per-item time is tiny anyway,
+  and faster scheduling is preferable.
+- **Heavy per-item** (large transformer encoders like WavLM-large or DINOv2-large
+  on CPU, anything where one forward pass is non-trivial): apply the fix. The
+  per-second forward pass needs intra-process threading; fragmented slots leave
+  most cores stranded on remote hosts.
+
+WavLM-large extraction was the canary: v2 of `wavlm_large_extract_bsub.sh`
+omitted both `span[hosts=1]` and `OMP_NUM_THREADS` and projected ~10 days for
+the run; v3 added both and dropped projected time to a few hours.
 
 **Diagnostic when a job goes silent**: run `bjobs -l <JOBID> | grep -A5 "CPU USAGE"`.
 If `CPU PEAK: 0.00`, kill it (`bkill <JOBID>`) — the checkpoint at the last

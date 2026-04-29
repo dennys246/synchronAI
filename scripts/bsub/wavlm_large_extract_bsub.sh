@@ -1,12 +1,12 @@
 #!/bin/bash
-SCRIPT_VERSION="wavlm_large_extract_bsub-v2"
+SCRIPT_VERSION="wavlm_large_extract_bsub-v3"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
 #BSUB -M 99000000
 #BSUB -a 'docker(continuumio/anaconda3)'
 #BSUB -n 40
-#BSUB -R 'select[mem>99GB && tmp>99GB] rusage[mem=99GB, tmp=99GB]'
+#BSUB -R 'select[mem>99GB && tmp>99GB] rusage[mem=99GB, tmp=99GB] span[hosts=1]'
 #BSUB -J synchronai-wavlm-large-extract
 #BSUB -oo /storage1/fs1/perlmansusan/Active/moochie/github/synchronAI/scripts/bsub/logs/wavlm_large_extract_%J.log
 
@@ -29,8 +29,12 @@ SCRIPT_VERSION="wavlm_large_extract_bsub-v2"
 # Skips env-bootstrap and labels-gen (both already exist). If ml-env or
 # data/labels.csv is missing, run scripts/bsub/wavlm_extract_bsub.sh first.
 #
-# No span[hosts=1]: audio extraction is embarrassingly parallel per-second,
-# slot fragmentation across hosts is fine here (unlike LSTM training).
+# v3: ADDED span[hosts=1] — earlier "audio extraction is exempt from
+# fragmentation" framing was wrong for heavy per-item compute. WavLM-large
+# is 24 transformer layers, so per-second forward pass is non-trivial CPU
+# work that needs intra-process threading; fragmented slots leave most
+# cores stranded on remote hosts. The "exempt" rule applies to LIGHT
+# extraction (small models, fast features), not transformer extraction.
 # =============================================================================
 
 # v2: hardcode SYNCHRONAI_DIR. v1 inherited it from the submitting shell, but
@@ -49,8 +53,18 @@ mkdir -p "$HF_HOME"
 # Make synchronai package importable without pip install -e (NFS race risk).
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
 
+# v3: WavLM-large is a 24-layer transformer; per-item compute is non-trivial.
+# Without these, PyTorch in docker defaults to 1-2 intra-op threads regardless
+# of -n 40, and per-file pace was 15.5s on v2 (10-day projection). With OMP=40
+# the same forward pass parallelizes across cores and pace should drop to
+# <1s per file. Same lesson as the training-job hangs: extraction is
+# parallel ACROSS files but each FILE still needs explicit thread count.
+export OMP_NUM_THREADS=40
+export MKL_NUM_THREADS=40
+
 echo "=== [$SCRIPT_VERSION] ==="
 echo "SYNCHRONAI_DIR=$SYNCHRONAI_DIR"
+echo "OMP_NUM_THREADS=$OMP_NUM_THREADS  MKL_NUM_THREADS=$MKL_NUM_THREADS"
 
 # ml-env/bin/activate doesn't reliably work inside LSF heredocs on this
 # cluster; use absolute python path. See docs/ris_bsub_reference.md.
