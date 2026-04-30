@@ -238,15 +238,22 @@ def extract_features(
                 n_fail += 1
                 continue
 
+        # Slice from cache. Match load_audio_chunk's lenient boundary
+        # handling: if the requested second is past the audio end, treat
+        # as silence; if the slice is short, pad with zeros to n_chunk_samples.
+        # The original load_audio_chunk did this; my v1 cache path was
+        # over-strict and rejected ~38% of entries (run 800589) at video
+        # edges where audio was 0.1-0.5s shorter than the labels claimed.
+        if cached_audio is None:
+            n_fail += 1
+            continue
         start_sample = int(second * sample_rate)
-        end_sample = start_sample + n_chunk_samples
-        if cached_audio is None or end_sample > len(cached_audio):
-            n_fail += 1
-            continue
-        audio = cached_audio[start_sample:end_sample]
-        if len(audio) == 0:
-            n_fail += 1
-            continue
+        if start_sample >= len(cached_audio):
+            audio = np.zeros(n_chunk_samples, dtype=np.float32)
+        else:
+            audio = cached_audio[start_sample:start_sample + n_chunk_samples]
+            if len(audio) < n_chunk_samples:
+                audio = np.pad(audio, (0, n_chunk_samples - len(audio)))
 
         # Convert to tensor
         audio_tensor = torch.from_numpy(audio).float().unsqueeze(0)  # (1, n_samples)
