@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="wavlm_large_extract_bsub-v4"
+SCRIPT_VERSION="wavlm_large_extract_bsub-v5"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -87,16 +87,25 @@ echo "=== Preflight: ml-env imports ==="
     exit 1
 }
 
-# --- Skip if already extracted ---
+# --- Skip if already extracted (only when index covers the full labels set) ---
+# v5: tighten the guard. v4 skipped on mere existence of feature_index.csv,
+# which let an incomplete previous run (36,517 / 59,250 entries) block a
+# resubmit that should have filled the gap. Now we compare entry counts
+# and only short-circuit when the existing extraction is complete.
 WAVLM_LARGE_DIR="data/wavlm_large_features"
 if [ -f "${WAVLM_LARGE_DIR}/feature_index.csv" ]; then
-    echo "=== WavLM-large features already extracted at ${WAVLM_LARGE_DIR} ==="
-    "$ML_PY" -c "
-import pandas as pd
-idx = pd.read_csv('${WAVLM_LARGE_DIR}/feature_index.csv')
-print(f'Existing: {len(idx)} entries, feature_dim={idx[\"feature_dim\"].iloc[0]}, n_frames={idx[\"n_frames\"].iloc[0]}')
-"
-    exit 0
+    EXISTING_N=$(tail -n +2 "${WAVLM_LARGE_DIR}/feature_index.csv" | wc -l | tr -d ' ')
+    LABELS_N=$(tail -n +2 data/labels.csv | wc -l | tr -d ' ')
+    if [ "$EXISTING_N" = "$LABELS_N" ]; then
+        echo "=== WavLM-large features already extracted (complete: $EXISTING_N entries) ==="
+        echo "  Skipping. Delete ${WAVLM_LARGE_DIR}/feature_index.csv to force re-run."
+        exit 0
+    else
+        echo "=== Resuming WavLM-large extraction ==="
+        echo "  Existing index: $EXISTING_N entries (incomplete vs labels.csv: $LABELS_N)"
+        echo "  The python script will skip already-extracted .pt files and fill the gap."
+        echo "  Old feature_index.csv will be overwritten on completion."
+    fi
 fi
 
 # --- Extract ---
