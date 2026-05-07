@@ -1,12 +1,12 @@
 #!/bin/bash
-SCRIPT_VERSION="multimodal_from_features_bsub-v7"
+SCRIPT_VERSION="multimodal_from_features_bsub-v8"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
-#BSUB -M 20000000
+#BSUB -M 24000000
 #BSUB -a 'docker(continuumio/anaconda3)'
 #BSUB -n 4
-#BSUB -R 'select[mem>20GB] rusage[mem=20GB] span[hosts=1]'
+#BSUB -R 'select[mem>24GB] rusage[mem=24GB] span[hosts=1]'
 
 # CPU-only multi-modal training on pre-extracted DINOv2 + WavLM features.
 # Mirrors the wavlm_audio_sweep_bsub.sh pattern: ml-env is maintained by
@@ -103,6 +103,12 @@ echo "=== Starting Multi-Modal Feature Training ==="
     --patience "$PATIENCE" \
     --num-workers "$NUM_WORKERS" \
     --early-stop-metric "$EARLY_STOP_METRIC"
+train_rc=$?
+if [ $train_rc -ne 0 ]; then
+    echo "ERROR: training exited with code $train_rc — see traceback above."
+    echo "  Multimodal training FAILED, no completion banner."
+    exit $train_rc
+fi
 
 echo ""
 echo "=== Done ==="
