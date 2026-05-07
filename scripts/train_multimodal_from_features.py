@@ -357,6 +357,124 @@ class MultiModalV3(nn.Module):
         return self.head(fused).squeeze(-1)
 
 
+class MultiModalV4(nn.Module):
+    """v4: token-level cross-modal transformer fusion.
+
+    V3 (cross-attention on aggregated reprs) helped at low capacity but
+    plateaued — each modality is still summarized into a single vector
+    before the modalities can talk. v4 keeps the per-frame/per-step features
+    and runs a transformer over the joint sequence: every video frame can
+    attend to every audio frame and vice versa.
+
+    For dyadic synchrony, this is structurally aligned with the task: the
+    "is the audio at t=3.5s coordinating with the video at t=3.5s" question
+    can be answered by attention between specific time-aligned tokens,
+    rather than between two pre-aggregated summaries.
+
+    Architecture:
+      Video proj:  Linear(768->P) + GELU + Dropout      (B, 12, P)
+      Audio proj:  Linear(768->P) + GELU + Dropout      (B, 49, P)
+      + learnable modality embeddings (broadcast)
+      + learnable positional embeddings (per modality)
+      Concat → (B, 61, P) joint sequence
+      TransformerEncoder (n_layers, n_heads, FFN, pre-LN)
+      Mean-pool over 61 tokens → (B, P)
+      Head: Linear(P, head_hidden) + GELU + Dropout + Linear(head_hidden, 1)
+
+    Defaults: n_layers=1, n_heads=4, FFN=4*P, attn_dropout=0.1.
+    """
+
+    def __init__(
+        self,
+        video_feature_dim: int,
+        audio_feature_dim: int,
+        proj_dim: int = 64,
+        head_hidden: int = 64,
+        proj_dropout: float = 0.3,
+        head_dropout: float = 0.3,
+        n_layers: int = 1,
+        n_heads: int = 4,
+        ffn_dim: int = None,
+        attn_dropout: float = 0.1,
+        n_video_frames: int = 12,
+        n_audio_frames: int = 49,
+    ):
+        super().__init__()
+        if proj_dim % n_heads != 0:
+            raise ValueError(
+                f"proj_dim ({proj_dim}) must be divisible by n_heads ({n_heads})"
+            )
+        if ffn_dim is None:
+            ffn_dim = 4 * proj_dim
+
+        self.video_proj = nn.Sequential(
+            nn.Linear(video_feature_dim, proj_dim),
+            nn.GELU(),
+            nn.Dropout(proj_dropout),
+        )
+        self.audio_proj = nn.Sequential(
+            nn.Linear(audio_feature_dim, proj_dim),
+            nn.GELU(),
+            nn.Dropout(proj_dropout),
+        )
+
+        # Modality embeddings: 1 learnable vector per modality, broadcast
+        # across all positions. Distinguishes "this is a video token" from
+        # "this is an audio token" so attention can route by modality.
+        self.video_modality_emb = nn.Parameter(torch.zeros(1, 1, proj_dim))
+        self.audio_modality_emb = nn.Parameter(torch.zeros(1, 1, proj_dim))
+        nn.init.normal_(self.video_modality_emb, std=0.02)
+        nn.init.normal_(self.audio_modality_emb, std=0.02)
+
+        # Positional embeddings: per-position-within-modality. Temporal
+        # order matters for synchrony detection.
+        self.video_pos_emb = nn.Parameter(torch.zeros(1, n_video_frames, proj_dim))
+        self.audio_pos_emb = nn.Parameter(torch.zeros(1, n_audio_frames, proj_dim))
+        nn.init.normal_(self.video_pos_emb, std=0.02)
+        nn.init.normal_(self.audio_pos_emb, std=0.02)
+
+        # Pre-LN transformer block (more stable than post-LN at small scale).
+        layer = nn.TransformerEncoderLayer(
+            d_model=proj_dim,
+            nhead=n_heads,
+            dim_feedforward=ffn_dim,
+            dropout=attn_dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=n_layers)
+        self.final_norm = nn.LayerNorm(proj_dim)
+
+        self.head = nn.Sequential(
+            nn.Linear(proj_dim, head_hidden),
+            nn.GELU(),
+            nn.Dropout(head_dropout),
+            nn.Linear(head_hidden, 1),
+        )
+
+        n_params = sum(p.numel() for p in self.parameters())
+        logger.info(
+            f"MultiModalV4: video_dim={video_feature_dim} -> {proj_dim}, "
+            f"audio_dim={audio_feature_dim} -> {proj_dim}, "
+            f"transformer(n_layers={n_layers}, n_heads={n_heads}, ffn={ffn_dim}, drop={attn_dropout}), "
+            f"head_hidden={head_hidden}, "
+            f"params={n_params:,}"
+        )
+
+    def forward(self, video_features: torch.Tensor, audio_features: torch.Tensor) -> torch.Tensor:
+        v = self.video_proj(video_features)        # (B, 12, P)
+        v = v + self.video_modality_emb + self.video_pos_emb
+        a = self.audio_proj(audio_features)        # (B, 49, P)
+        a = a + self.audio_modality_emb + self.audio_pos_emb
+
+        tokens = torch.cat([v, a], dim=1)          # (B, 61, P)
+        tokens = self.transformer(tokens)          # (B, 61, P)
+        tokens = self.final_norm(tokens)
+        pooled = tokens.mean(dim=1)                # (B, P)
+        return self.head(pooled).squeeze(-1)
+
+
 def merge_feature_indices(
     video_feature_dir: Path,
     audio_feature_dir: Path,
@@ -421,6 +539,52 @@ def subject_grouped_split(
     logger.info(
         f"Split: {len(train)} train ({len(subjects) - n_val} subjects), "
         f"{len(val)} val ({n_val} subjects)"
+    )
+    return train, val
+
+
+def subject_kfold_split(
+    entries: list[dict],
+    num_folds: int,
+    fold_idx: int,
+    seed: int,
+) -> tuple[list[dict], list[dict]]:
+    """Deterministic k-fold split grouped by subject_id.
+
+    For tightening confidence intervals on a single point estimate (like
+    v2_baseline_v6's 0.7640 val_acc), 5-fold CV across the same 49 subjects
+    gives 5 disjoint val sets and lets us report mean ± SE instead of a
+    single-fold number.
+
+    Subjects are sorted (deterministic order) then shuffled with the same
+    seed across folds. Subjects in fold k are the [k*fold_size:(k+1)*fold_size]
+    slice of the shuffled list. Same seed → same fold composition.
+    """
+    if num_folds < 2 or fold_idx < 0 or fold_idx >= num_folds:
+        raise ValueError(
+            f"Invalid fold args: num_folds={num_folds}, fold_idx={fold_idx}"
+        )
+    rng = np.random.default_rng(seed)
+    by_subject = defaultdict(list)
+    for e in entries:
+        by_subject[e["subject_id"]].append(e)
+
+    subjects = sorted(by_subject.keys())  # deterministic order before shuffle
+    rng.shuffle(subjects)
+
+    fold_size = len(subjects) // num_folds
+    val_start = fold_idx * fold_size
+    val_end = val_start + fold_size if fold_idx < num_folds - 1 else len(subjects)
+    val_subjects = set(subjects[val_start:val_end])
+
+    train, val = [], []
+    for s, group in by_subject.items():
+        (val if s in val_subjects else train).extend(group)
+    logger.info(
+        f"K-fold split (fold {fold_idx+1}/{num_folds}, seed={seed}): "
+        f"{len(train)} train ({len(subjects) - len(val_subjects)} subjects), "
+        f"{len(val)} val ({len(val_subjects)} subjects). "
+        f"Val subjects: {sorted(val_subjects)}"
     )
     return train, val
 
@@ -513,6 +677,8 @@ def train(
     num_workers: int = 4,
     seed: int = 42,
     early_stop_metric: str = "val_auc",
+    num_folds: int = 0,
+    fold_idx: int = -1,
 ) -> None:
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -533,7 +699,10 @@ def train(
     )
 
     entries = merged.to_dict("records")
-    train_entries, val_entries = subject_grouped_split(entries, val_split, seed)
+    if num_folds > 0 and fold_idx >= 0:
+        train_entries, val_entries = subject_kfold_split(entries, num_folds, fold_idx, seed)
+    else:
+        train_entries, val_entries = subject_grouped_split(entries, val_split, seed)
     pos_weight = compute_pos_weight(train_entries)
     logger.info(f"Train pos_weight: {pos_weight:.3f}")
 
@@ -590,8 +759,26 @@ def train(
             attn_heads=4,
             attn_dropout=0.2,
         ).to(device)
+    elif arch == "v4":
+        # v4: token-level cross-modal transformer fusion. Each video frame
+        # and audio frame becomes a token; transformer over the joint 61-token
+        # sequence with modality + positional embeddings. Heaviest fusion in
+        # the lineup but most aligned with what synchrony detection needs.
+        model = MultiModalV4(
+            video_feature_dim=video_dim,
+            audio_feature_dim=audio_dim,
+            proj_dim=video_hidden,
+            head_hidden=head_hidden,
+            proj_dropout=dropout,
+            head_dropout=dropout,
+            n_layers=1,
+            n_heads=4,
+            attn_dropout=0.1,
+            n_video_frames=video_frames,
+            n_audio_frames=audio_frames,
+        ).to(device)
     else:
-        raise ValueError(f"Unknown --arch {arch!r}; expected 'v1', 'v2', or 'v3'.")
+        raise ValueError(f"Unknown --arch {arch!r}; expected 'v1', 'v2', 'v3', or 'v4'.")
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
     optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -621,6 +808,7 @@ def train(
         "warmup_epochs": warmup_epochs, "patience": patience,
         "val_split": val_split, "seed": seed,
         "early_stop_metric": early_stop_metric,
+        "num_folds": num_folds, "fold_idx": fold_idx,
     }
     with open(save_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -778,12 +966,13 @@ def main():
     parser.add_argument("--audio-feature-dir", required=True)
     parser.add_argument("--save-dir", required=True)
     parser.add_argument(
-        "--arch", choices=["v1", "v2", "v3"], default="v1",
+        "--arch", choices=["v1", "v2", "v3", "v4"], default="v1",
         help="Model architecture. v1=per-modality LSTM(D->H) + concat (original). "
              "v2=projection bottleneck + 2-layer LSTM (audio) + mean-pool (video) "
              "+ explicit aggregator dropout + concat. "
-             "v3=v2 backbone with cross-attention fusion replacing concat (tests "
-             "whether concat fusion was leaving cross-modal signal on the table).",
+             "v3=v2 backbone with cross-attention fusion replacing concat. "
+             "v4=token-level cross-modal transformer over the joint 61-token "
+             "sequence (every video frame attends to every audio frame).",
     )
     parser.add_argument("--video-hidden", type=int, default=64)
     parser.add_argument("--audio-hidden", type=int, default=64)
@@ -805,6 +994,15 @@ def main():
         help="Metric to drive early stopping and best.pt. Default val_auc preserves "
              "v1 behavior. v2 baseline showed val_auc peaks at warmup epoch 1 while "
              "val_loss/val_acc peak at epoch 4-5; for v2, prefer val_loss.",
+    )
+    parser.add_argument(
+        "--num-folds", type=int, default=0,
+        help="If >0, use deterministic k-fold subject-grouped CV split. "
+             "Default 0 → original 80/20 random split (preserves v1 reproducibility).",
+    )
+    parser.add_argument(
+        "--fold-idx", type=int, default=-1,
+        help="Which fold to hold out as val (0..num_folds-1). Required when --num-folds > 0.",
     )
     args = parser.parse_args()
 

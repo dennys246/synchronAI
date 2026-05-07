@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="multimodal_from_features_bsub-v8"
+SCRIPT_VERSION="multimodal_from_features_bsub-v9"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -54,6 +54,9 @@ NUM_WORKERS="${MM_NUM_WORKERS:-0}"
 # best.pt to undertrained ckpt). Override with MM_EARLY_STOP_METRIC=val_auc to
 # reproduce v1 behavior exactly.
 EARLY_STOP_METRIC="${MM_EARLY_STOP_METRIC:-val_loss}"
+# v9: optional k-fold CV. Default num_folds=0 → original 80/20 split.
+NUM_FOLDS="${MM_NUM_FOLDS:-0}"
+FOLD_IDX="${MM_FOLD_IDX:--1}"
 
 echo "=== [$SCRIPT_VERSION] ==="
 echo "  Arch:           $ARCH"
@@ -66,6 +69,9 @@ echo "  LR / WD:        $LEARNING_RATE / $WEIGHT_DECAY"
 echo "  Dropout:        $DROPOUT"
 echo "  Hidden dims:    video=$VIDEO_HIDDEN audio=$AUDIO_HIDDEN head=$HEAD_HIDDEN"
 echo "  Early-stop on:  $EARLY_STOP_METRIC"
+if [ "$NUM_FOLDS" -gt 0 ]; then
+    echo "  K-fold CV:      fold $FOLD_IDX of $NUM_FOLDS"
+fi
 echo "  Threads:        OMP=$OMP_NUM_THREADS MKL=$MKL_NUM_THREADS"
 
 echo "=== Preflight: checking ml-env imports ==="
@@ -102,7 +108,9 @@ echo "=== Starting Multi-Modal Feature Training ==="
     --warmup-epochs "$WARMUP_EPOCHS" \
     --patience "$PATIENCE" \
     --num-workers "$NUM_WORKERS" \
-    --early-stop-metric "$EARLY_STOP_METRIC"
+    --early-stop-metric "$EARLY_STOP_METRIC" \
+    --num-folds "$NUM_FOLDS" \
+    --fold-idx "$FOLD_IDX"
 train_rc=$?
 if [ $train_rc -ne 0 ]; then
     echo "ERROR: training exited with code $train_rc — see traceback above."
