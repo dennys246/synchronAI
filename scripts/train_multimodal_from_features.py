@@ -679,6 +679,7 @@ def train(
     early_stop_metric: str = "val_auc",
     num_folds: int = 0,
     fold_idx: int = -1,
+    modality: str = "both",
 ) -> None:
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -809,6 +810,7 @@ def train(
         "val_split": val_split, "seed": seed,
         "early_stop_metric": early_stop_metric,
         "num_folds": num_folds, "fold_idx": fold_idx,
+        "modality": modality,
     }
     with open(save_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -844,6 +846,13 @@ def train(
             v = batch["video_features"].to(device)
             a = batch["audio_features"].to(device)
             y = batch["label"].to(device)
+            # Single-modality ablation: zero out the suppressed modality.
+            # Same architecture/hyperparameters/fold splits, just one input
+            # stream removed → apples-to-apples vs the multimodal CV.
+            if modality == "video":
+                a = torch.zeros_like(a)
+            elif modality == "audio":
+                v = torch.zeros_like(v)
             logits = model(v, a)
             loss = criterion(logits, y)
             optimizer.zero_grad()
@@ -864,6 +873,10 @@ def train(
                 v = batch["video_features"].to(device)
                 a = batch["audio_features"].to(device)
                 y = batch["label"].to(device)
+                if modality == "video":
+                    a = torch.zeros_like(a)
+                elif modality == "audio":
+                    v = torch.zeros_like(v)
                 logits = model(v, a)
                 val_loss += criterion(logits, y).item()
                 all_logits.append(logits.cpu())
@@ -1003,6 +1016,13 @@ def main():
     parser.add_argument(
         "--fold-idx", type=int, default=-1,
         help="Which fold to hold out as val (0..num_folds-1). Required when --num-folds > 0.",
+    )
+    parser.add_argument(
+        "--modality", choices=["both", "video", "audio"], default="both",
+        help="Single-modality ablation. 'both' (default) trains the full multimodal "
+             "model. 'video' zeros out audio inputs; 'audio' zeros out video. "
+             "Same architecture / fold splits / hyperparams as multimodal — provides "
+             "apples-to-apples ablation for the multimodal-vs-single-modality gain.",
     )
     args = parser.parse_args()
 

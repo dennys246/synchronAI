@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="multimodal_from_features_bsub-v9"
+SCRIPT_VERSION="multimodal_from_features_bsub-v10"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -57,6 +57,9 @@ EARLY_STOP_METRIC="${MM_EARLY_STOP_METRIC:-val_loss}"
 # v9: optional k-fold CV. Default num_folds=0 → original 80/20 split.
 NUM_FOLDS="${MM_NUM_FOLDS:-0}"
 FOLD_IDX="${MM_FOLD_IDX:--1}"
+# v10: single-modality ablation. 'both' (default) = full multimodal,
+# 'video' = audio zeroed out, 'audio' = video zeroed out.
+MODALITY="${MM_MODALITY:-both}"
 
 echo "=== [$SCRIPT_VERSION] ==="
 echo "  Arch:           $ARCH"
@@ -71,6 +74,9 @@ echo "  Hidden dims:    video=$VIDEO_HIDDEN audio=$AUDIO_HIDDEN head=$HEAD_HIDDE
 echo "  Early-stop on:  $EARLY_STOP_METRIC"
 if [ "$NUM_FOLDS" -gt 0 ]; then
     echo "  K-fold CV:      fold $FOLD_IDX of $NUM_FOLDS"
+fi
+if [ "$MODALITY" != "both" ]; then
+    echo "  Modality:       $MODALITY (other modality zeroed for ablation)"
 fi
 echo "  Threads:        OMP=$OMP_NUM_THREADS MKL=$MKL_NUM_THREADS"
 
@@ -110,7 +116,8 @@ echo "=== Starting Multi-Modal Feature Training ==="
     --num-workers "$NUM_WORKERS" \
     --early-stop-metric "$EARLY_STOP_METRIC" \
     --num-folds "$NUM_FOLDS" \
-    --fold-idx "$FOLD_IDX"
+    --fold-idx "$FOLD_IDX" \
+    --modality "$MODALITY"
 train_rc=$?
 if [ $train_rc -ne 0 ]; then
     echo "ERROR: training exited with code $train_rc — see traceback above."
