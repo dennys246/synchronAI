@@ -252,6 +252,111 @@ class MultiModalV2(nn.Module):
         return self.head(fused).squeeze(-1)
 
 
+class MultiModalV3(nn.Module):
+    """v3: V2 architecture with cross-attention fusion replacing concat.
+
+    Concat fusion treats the two modality reprs as independent vectors at the
+    head — the head has to detect synchrony from juxtaposed summaries with no
+    cross-modal interaction in the representations themselves. For dyadic
+    synchrony, where the label IS the relationship between modalities, that's
+    structurally weak.
+
+    v3 keeps everything from V2 up through the per-modality reprs, then
+    treats them as 2 tokens in a sequence and runs multi-head self-attention
+    over them. Each token gets to "query" the other; the resulting reprs are
+    cross-modally informed before they reach the head.
+
+    The cross-attention block is a single transformer block without FFN
+    (~16K params on top of V2's 172K). Residual connection but no LayerNorm
+    — kept minimal to isolate the fusion-architecture effect from generic
+    transformer-block tuning.
+
+    Head input is still 2P (concat of the two attended tokens) so V2 vs V3
+    have an apples-to-apples head comparison; only the fusion mechanism
+    differs.
+    """
+
+    def __init__(
+        self,
+        video_feature_dim: int,
+        audio_feature_dim: int,
+        proj_dim: int = 64,
+        head_hidden: int = 64,
+        proj_dropout: float = 0.3,
+        lstm_dropout: float = 0.2,
+        repr_dropout: float = 0.3,
+        head_dropout: float = 0.3,
+        attn_heads: int = 4,
+        attn_dropout: float = 0.2,
+    ):
+        super().__init__()
+        self.video_proj = nn.Sequential(
+            nn.Linear(video_feature_dim, proj_dim),
+            nn.GELU(),
+            nn.Dropout(proj_dropout),
+        )
+        self.audio_proj = nn.Sequential(
+            nn.Linear(audio_feature_dim, proj_dim),
+            nn.GELU(),
+            nn.Dropout(proj_dropout),
+        )
+        self.audio_lstm = nn.LSTM(
+            proj_dim, proj_dim, num_layers=2,
+            dropout=lstm_dropout, batch_first=True,
+        )
+        self.video_repr_drop = nn.Dropout(repr_dropout)
+        self.audio_repr_drop = nn.Dropout(repr_dropout)
+
+        # Cross-modal attention. embed_dim must be divisible by num_heads.
+        if proj_dim % attn_heads != 0:
+            raise ValueError(
+                f"proj_dim ({proj_dim}) must be divisible by attn_heads ({attn_heads})"
+            )
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=proj_dim,
+            num_heads=attn_heads,
+            dropout=attn_dropout,
+            batch_first=True,
+        )
+
+        self.head = nn.Sequential(
+            nn.Linear(2 * proj_dim, head_hidden),
+            nn.GELU(),
+            nn.Dropout(head_dropout),
+            nn.Linear(head_hidden, 1),
+        )
+
+        n_params = sum(p.numel() for p in self.parameters())
+        logger.info(
+            f"MultiModalV3: video_dim={video_feature_dim} -> {proj_dim} (mean-pool), "
+            f"audio_dim={audio_feature_dim} -> {proj_dim} (LSTM x2), "
+            f"cross-attn(heads={attn_heads}, drop={attn_dropout}), "
+            f"head_hidden={head_hidden}, "
+            f"dropouts: proj={proj_dropout}/lstm={lstm_dropout}/repr={repr_dropout}/head={head_dropout}, "
+            f"params={n_params:,}"
+        )
+
+    def forward(self, video_features: torch.Tensor, audio_features: torch.Tensor) -> torch.Tensor:
+        v = self.video_proj(video_features)         # (B, 12, P)
+        v_repr = v.mean(dim=1)                      # (B, P)
+        v_repr = self.video_repr_drop(v_repr)
+
+        a = self.audio_proj(audio_features)         # (B, 49, P)
+        _, (h_n, _) = self.audio_lstm(a)            # h_n: (2, B, P)
+        a_repr = h_n[-1, :, :]                      # (B, P)
+        a_repr = self.audio_repr_drop(a_repr)
+
+        # Stack as 2 tokens, attend, residual back, flatten for the head.
+        # Token 0 = video repr, token 1 = audio repr. Self-attention here
+        # IS cross-attention because there are only 2 tokens — every token
+        # attends to the other and to itself.
+        tokens = torch.stack([v_repr, a_repr], dim=1)        # (B, 2, P)
+        attended, _ = self.cross_attn(tokens, tokens, tokens)  # (B, 2, P)
+        tokens = tokens + attended                            # residual
+        fused = tokens.flatten(start_dim=1)                   # (B, 2P)
+        return self.head(fused).squeeze(-1)
+
+
 def merge_feature_indices(
     video_feature_dir: Path,
     audio_feature_dir: Path,
@@ -468,8 +573,25 @@ def train(
             repr_dropout=dropout,
             head_dropout=dropout,
         ).to(device)
+    elif arch == "v3":
+        # v3: same per-modality pipeline as v2; replaces concat fusion with
+        # cross-modal multihead self-attention over the 2 aggregated tokens.
+        # attn_heads=4 fixed; proj_dim=video_hidden must be divisible by 4
+        # (so video_hidden ∈ {32, 64, 128} all work for the v2 sweep matrix).
+        model = MultiModalV3(
+            video_feature_dim=video_dim,
+            audio_feature_dim=audio_dim,
+            proj_dim=video_hidden,
+            head_hidden=head_hidden,
+            proj_dropout=dropout,
+            lstm_dropout=0.2,
+            repr_dropout=dropout,
+            head_dropout=dropout,
+            attn_heads=4,
+            attn_dropout=0.2,
+        ).to(device)
     else:
-        raise ValueError(f"Unknown --arch {arch!r}; expected 'v1' or 'v2'.")
+        raise ValueError(f"Unknown --arch {arch!r}; expected 'v1', 'v2', or 'v3'.")
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
     optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -656,10 +778,12 @@ def main():
     parser.add_argument("--audio-feature-dir", required=True)
     parser.add_argument("--save-dir", required=True)
     parser.add_argument(
-        "--arch", choices=["v1", "v2"], default="v1",
+        "--arch", choices=["v1", "v2", "v3"], default="v1",
         help="Model architecture. v1=per-modality LSTM(D->H) + concat (original). "
              "v2=projection bottleneck + 2-layer LSTM (audio) + mean-pool (video) "
-             "+ explicit aggregator dropout + concat.",
+             "+ explicit aggregator dropout + concat. "
+             "v3=v2 backbone with cross-attention fusion replacing concat (tests "
+             "whether concat fusion was leaving cross-modal signal on the table).",
     )
     parser.add_argument("--video-hidden", type=int, default=64)
     parser.add_argument("--audio-hidden", type=int, default=64)
