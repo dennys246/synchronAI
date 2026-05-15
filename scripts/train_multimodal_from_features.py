@@ -680,6 +680,8 @@ def train(
     num_folds: int = 0,
     fold_idx: int = -1,
     modality: str = "both",
+    video_dropout_prob: float = 0.0,
+    audio_dropout_prob: float = 0.0,
 ) -> None:
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -811,6 +813,8 @@ def train(
         "early_stop_metric": early_stop_metric,
         "num_folds": num_folds, "fold_idx": fold_idx,
         "modality": modality,
+        "video_dropout_prob": video_dropout_prob,
+        "audio_dropout_prob": audio_dropout_prob,
     }
     with open(save_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -853,6 +857,23 @@ def train(
                 a = torch.zeros_like(a)
             elif modality == "audio":
                 v = torch.zeros_like(v)
+            elif modality == "both" and (video_dropout_prob > 0 or audio_dropout_prob > 0):
+                # D3: stochastic modality dropout during training only.
+                # Forces each modality's pathway to carry the prediction
+                # signal on its own a fraction of the time, preventing the
+                # audio pathway from collapsing into a video-redundant
+                # representation (E2 from the audio-contribution
+                # investigation). Per-batch Bernoulli; resample if both
+                # would be dropped (degenerate input).
+                while True:
+                    drop_v = torch.rand((), device=device).item() < video_dropout_prob
+                    drop_a = torch.rand((), device=device).item() < audio_dropout_prob
+                    if not (drop_v and drop_a):
+                        break
+                if drop_v:
+                    v = torch.zeros_like(v)
+                if drop_a:
+                    a = torch.zeros_like(a)
             logits = model(v, a)
             loss = criterion(logits, y)
             optimizer.zero_grad()
@@ -1023,6 +1044,17 @@ def main():
              "model. 'video' zeros out audio inputs; 'audio' zeros out video. "
              "Same architecture / fold splits / hyperparams as multimodal — provides "
              "apples-to-apples ablation for the multimodal-vs-single-modality gain.",
+    )
+    parser.add_argument(
+        "--video-dropout-prob", type=float, default=0.0,
+        help="D3: stochastic video-modality dropout during training. Each training "
+             "batch independently zeros video features with this probability. "
+             "Only active when --modality=both. Default 0.0 = no dropout (baseline).",
+    )
+    parser.add_argument(
+        "--audio-dropout-prob", type=float, default=0.0,
+        help="D3: stochastic audio-modality dropout during training. Mirror of "
+             "--video-dropout-prob. If both would be dropped on a batch, we resample.",
     )
     args = parser.parse_args()
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="multimodal_from_features_bsub-v10"
+SCRIPT_VERSION="multimodal_from_features_bsub-v11"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -60,6 +60,10 @@ FOLD_IDX="${MM_FOLD_IDX:--1}"
 # v10: single-modality ablation. 'both' (default) = full multimodal,
 # 'video' = audio zeroed out, 'audio' = video zeroed out.
 MODALITY="${MM_MODALITY:-both}"
+# v11: D3 stochastic modality dropout during training. Only active when
+# modality=both. Default 0.0 → no dropout (preserves prior CV results).
+VIDEO_DROPOUT_PROB="${MM_VIDEO_DROPOUT_PROB:-0.0}"
+AUDIO_DROPOUT_PROB="${MM_AUDIO_DROPOUT_PROB:-0.0}"
 
 echo "=== [$SCRIPT_VERSION] ==="
 echo "  Arch:           $ARCH"
@@ -77,6 +81,9 @@ if [ "$NUM_FOLDS" -gt 0 ]; then
 fi
 if [ "$MODALITY" != "both" ]; then
     echo "  Modality:       $MODALITY (other modality zeroed for ablation)"
+fi
+if [ "$VIDEO_DROPOUT_PROB" != "0.0" ] || [ "$AUDIO_DROPOUT_PROB" != "0.0" ]; then
+    echo "  Modality dropout (train): video=$VIDEO_DROPOUT_PROB audio=$AUDIO_DROPOUT_PROB"
 fi
 echo "  Threads:        OMP=$OMP_NUM_THREADS MKL=$MKL_NUM_THREADS"
 
@@ -117,7 +124,9 @@ echo "=== Starting Multi-Modal Feature Training ==="
     --early-stop-metric "$EARLY_STOP_METRIC" \
     --num-folds "$NUM_FOLDS" \
     --fold-idx "$FOLD_IDX" \
-    --modality "$MODALITY"
+    --modality "$MODALITY" \
+    --video-dropout-prob "$VIDEO_DROPOUT_PROB" \
+    --audio-dropout-prob "$AUDIO_DROPOUT_PROB"
 train_rc=$?
 if [ $train_rc -ne 0 ]; then
     echo "ERROR: training exited with code $train_rc — see traceback above."
