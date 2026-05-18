@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="prosodic_extract_bsub-v1"
+SCRIPT_VERSION="prosodic_extract_bsub-v2"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -44,7 +44,19 @@ export MKL_NUM_THREADS=4
 echo "=== [$SCRIPT_VERSION] ==="
 echo "SYNCHRONAI_DIR=$SYNCHRONAI_DIR"
 
-ML_PY="$SYNCHRONAI_DIR/ml-env/bin/python"
+# v2: use a separate prosodic-env, NOT ml-env. opensmile's dep tree
+# conflicts with torch's numpy ABI when installed into ml-env (verified —
+# opensmile install hosed torch on v1 attempt). Sibling venv isolates
+# opensmile from every other BSub job in the project.
+#
+# Create prosodic-env interactively, one-time:
+#   python -m venv $SYNCHRONAI_DIR/prosodic-env
+#   $SYNCHRONAI_DIR/prosodic-env/bin/pip install --no-cache-dir \
+#       --extra-index-url https://download.pytorch.org/whl/cpu \
+#       opensmile numpy pandas tqdm soundfile imageio-ffmpeg torch
+# (CPU-only torch ~200MB; needed because the extraction writes .pt files
+# for drop-in compatibility with the multimodal training pipeline.)
+PY="$SYNCHRONAI_DIR/prosodic-env/bin/python"
 
 # --- Preflight ---
 if [ ! -f "$SYNCHRONAI_DIR/data/labels.csv" ]; then
@@ -52,20 +64,31 @@ if [ ! -f "$SYNCHRONAI_DIR/data/labels.csv" ]; then
     exit 1
 fi
 
-if [ ! -x "$ML_PY" ]; then
-    echo "ERROR: ml-env python not found at $ML_PY"
+if [ ! -x "$PY" ]; then
+    echo "ERROR: prosodic-env python not found at $PY"
+    echo ""
+    echo "Create it via:"
+    echo "  python -m venv $SYNCHRONAI_DIR/prosodic-env"
+    echo "  $SYNCHRONAI_DIR/prosodic-env/bin/pip install --no-cache-dir \\"
+    echo "      --extra-index-url https://download.pytorch.org/whl/cpu \\"
+    echo "      opensmile numpy pandas tqdm soundfile imageio-ffmpeg torch"
+    echo ""
+    echo "Then resubmit this job."
     exit 1
 fi
 
-echo "=== Preflight: ml-env imports ==="
-"$ML_PY" -c "import torch, pandas, numpy; print(f'torch={torch.__version__} pandas/numpy OK')" || {
-    echo "ERROR: ml-env missing required packages."
+echo "=== Preflight: prosodic-env imports ==="
+"$PY" -c "import torch, pandas, numpy; print(f'torch={torch.__version__} pandas/numpy OK')" || {
+    echo "ERROR: prosodic-env missing core packages (torch/pandas/numpy)."
+    echo "  Reinstall via the command in the create-it instructions above."
     exit 1
 }
-"$ML_PY" -c "import opensmile; print(f'opensmile={opensmile.__version__} OK')" || {
-    echo "ERROR: opensmile not installed in ml-env."
-    echo "  Install via:  $ML_PY -m pip install opensmile"
-    echo "  Then resubmit this job."
+"$PY" -c "import opensmile; print(f'opensmile={opensmile.__version__} OK')" || {
+    echo "ERROR: opensmile not installed in prosodic-env."
+    exit 1
+}
+"$PY" -c "import soundfile; print('soundfile OK')" || {
+    echo "ERROR: soundfile not installed in prosodic-env."
     exit 1
 }
 
@@ -93,7 +116,7 @@ echo "  Feature set: eGeMAPSv02 LLDs (~100Hz, 25 dims/frame)"
 echo "  ETA: ~50min"
 echo ""
 
-"$ML_PY" scripts/extract_prosodic_features.py \
+"$PY" scripts/extract_prosodic_features.py \
     --labels-file data/labels.csv \
     --output-dir "$PROSODIC_DIR" \
     --chunk-duration 1.0
