@@ -20,6 +20,7 @@ from synchronai.data.fnirs.processing import (
     read_raw_fnirs,
 )
 from synchronai.data.fnirs.quality_control import QualityReport, run_quality_control
+from synchronai.data.fnirs.windowing import tile_window_starts
 from synchronai.utils.logging import get_logger
 
 
@@ -102,6 +103,8 @@ def load_training_windows(
     external_mean: Optional[np.ndarray] = None,
     external_std: Optional[np.ndarray] = None,
     per_pair: bool = False,
+    windowing: str = "tile",
+    phase_offset: int = 0,
     qc_cache_path: Optional[str] = None,
     # Quality control parameters
     enable_qc: bool = False,
@@ -129,6 +132,12 @@ def load_training_windows(
         external_mean: Optional pre-computed mean for normalization (requires normalize=True)
         external_std: Optional pre-computed std for normalization (requires normalize=True)
         per_pair: Whether to explode windows into per-pair samples
+        windowing: "tile" (non-overlapping full coverage, the default) or
+            "random" (legacy: ``segments_per_recording`` random windows). In
+            "tile" mode ``segments_per_recording`` is ignored.
+        phase_offset: Tiling-grid offset in samples (tile mode only). Pass a
+            per-epoch random value during training for phase augmentation; use 0
+            for deterministic coverage (validation, metrics, feature extraction).
         enable_qc: Enable the multi-stage quality control pipeline
         sci_threshold: Minimum SCI to keep a channel (0-1). Literature recommends 0.75-0.95
         snr_threshold: Minimum scan-level SNR. Scans below this are rejected
@@ -149,11 +158,14 @@ def load_training_windows(
     rng = np.random.default_rng(seed)
     paths = list(fnirs_paths[: max_recordings or len(fnirs_paths)])
     logger.info(
-        "Loading fNIRS recordings=%d (received %d paths, max_recordings=%s, segments_per_recording=%d, duration_seconds=%.1f, target_sfreq_hz=%s)",
+        "Loading fNIRS recordings=%d (received %d paths, max_recordings=%s, windowing=%s, "
+        "segments_per_recording=%d, phase_offset=%d, duration_seconds=%.1f, target_sfreq_hz=%s)",
         len(paths),
         len(fnirs_paths),
         str(max_recordings),
+        windowing,
         segments_per_recording,
+        phase_offset,
         duration_seconds,
         str(target_sfreq_hz),
     )
@@ -315,12 +327,21 @@ def load_training_windows(
             gc.collect()
             continue
 
-        max_start = time_len - target_len
-        # Keep at least 1 segment per recording.
-        num_segments = max(1, int(segments_per_recording))
-        starts = rng.integers(0, max_start + 1, size=num_segments)
+        if windowing == "tile":
+            # Non-overlapping tiling over the whole recording (full coverage),
+            # with an optional per-epoch phase offset for augmentation. Shares
+            # the start-index logic with feature extraction (window_recording)
+            # so the two windowing schemes cannot drift apart.
+            starts = tile_window_starts(
+                time_len, target_len, stride_samples=target_len, phase_offset=phase_offset,
+            )
+        else:
+            # Legacy: random fixed-count segments per recording.
+            max_start = time_len - target_len
+            num_segments = max(1, int(segments_per_recording))
+            starts = rng.integers(0, max_start + 1, size=num_segments)
         for start in starts:
-            windows.append(x[start : start + target_len])
+            windows.append(x[int(start) : int(start) + target_len])
 
         # Explicit cleanup after processing each recording to prevent memory fragmentation
         del raw, x, meta

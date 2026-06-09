@@ -248,6 +248,10 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="Per-pair mode: split each recording into individual source-detector "
                              "pairs (feature_dim=2). Each window yields 10x more samples. "
                              "Produces a montage-agnostic model.")
+    parser.add_argument("--windowing", default="tile", choices=["tile", "random"],
+                        help="How recordings are windowed for training: 'tile' "
+                             "(non-overlapping full coverage + per-epoch phase offset, default) "
+                             "or 'random' (legacy: --segments-per-recording random windows).")
 
     # Quality control arguments
     parser.add_argument("--enable-qc", action="store_true",
@@ -607,6 +611,7 @@ def _run_fnirs_training(args: argparse.Namespace) -> None:
         lr_schedule=args.lr_schedule,
         eval_gen_every=args.eval_gen_every,
         per_pair=getattr(args, "per_pair", False),
+        windowing=getattr(args, "windowing", "tile"),
         enable_qc=getattr(args, "enable_qc", False),
         sci_threshold=getattr(args, "sci_threshold", 0.5),
         snr_threshold=getattr(args, "snr_threshold", 5.0),
