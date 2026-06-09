@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="generative_fnirs_perpair_probe_bsub-v1"
+#BSUB -J fnirs_perpair_probe
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -7,6 +7,12 @@ SCRIPT_VERSION="generative_fnirs_perpair_probe_bsub-v1"
 #BSUB -a 'docker(continuumio/anaconda3)'
 #BSUB -n 40
 #BSUB -R 'select[mem>99GB && tmp>99GB] rusage[mem=99GB, tmp=99GB]'
+# NOTE: #BSUB directives MUST stay directly under the shebang, before any
+# command (incl. the SCRIPT_VERSION= assignment below). LSF stops parsing
+# directives at the first non-comment line; putting a command above them makes
+# LSF ignore every #BSUB line and use the whole script text as the job name.
+
+SCRIPT_VERSION="generative_fnirs_perpair_probe_bsub-v2"
 
 # =============================================================================
 # fNIRS Per-Pair Generative — VALIDATION / CONVERGENCE PROBE (tile windowing)
