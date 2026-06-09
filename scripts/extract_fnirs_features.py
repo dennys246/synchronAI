@@ -268,34 +268,53 @@ def window_recording(
     model_len: int,
     stride_seconds: float = 60.0,
     sfreq_hz: float = 7.8125,
+    real_len: Optional[int] = None,
 ) -> list[np.ndarray]:
     """Slice a recording into fixed-length windows.
 
     Args:
         x: (total_time, features) normalized recording
-        model_len: Expected input length for encoder (e.g., 472)
+        model_len: Encoder input length, e.g. 472 (a multiple of 2**depth).
         stride_seconds: Stride between windows in seconds.
-            60.0 = non-overlapping (for 60s model_len).
+            60.0 = non-overlapping (for a 60s window).
             30.0 = 50% overlap.
         sfreq_hz: Sampling frequency
+        real_len: Real-signal window length (e.g. round(60*7.8125)=469). When
+            real_len < model_len, each window holds real_len real samples
+            zero-padded up to model_len — mirroring generative pretraining, where
+            load_training_windows builds real_len windows that train.py pads to
+            model_len before the U-Net. Defaults to model_len (slice model_len
+            real samples, the legacy behaviour).
 
     Returns:
         List of (model_len, features) arrays
     """
-    stride_samples = int(stride_seconds * sfreq_hz)
+    from synchronai.data.fnirs.windowing import tile_window_starts
+
+    if real_len is None:
+        real_len = model_len
+    # round() so stride matches generative's target_len = round(duration*sfreq).
+    stride_samples = int(round(stride_seconds * sfreq_hz))
     if stride_samples < 1:
-        stride_samples = model_len
+        stride_samples = real_len
 
+    # Deterministic tiling (phase_offset=0) by real_len, then zero-pad each window
+    # to model_len. Identical window construction to generative pretraining, and
+    # shares the start-index logic via the same helper so the two cannot drift.
+    starts = tile_window_starts(x.shape[0], real_len, stride_samples, phase_offset=0)
     windows = []
-    start = 0
-    while start + model_len <= x.shape[0]:
-        windows.append(x[start : start + model_len])
-        start += stride_samples
+    for start in starts:
+        w = x[start : start + real_len]
+        if model_len > real_len:
+            pad = np.zeros((model_len - real_len, x.shape[1]), dtype=np.float32)
+            w = np.concatenate([w, pad], axis=0)
+        windows.append(w)
 
-    # If recording is shorter than model_len, pad and use as single window
+    # If recording is shorter than real_len, pad and use as single window
     if not windows and x.shape[0] > 0:
         padded = np.zeros((model_len, x.shape[1]), dtype=np.float32)
-        padded[: x.shape[0]] = x
+        n = min(x.shape[0], real_len)
+        padded[:n] = x[:n]
         windows.append(padded)
 
     return windows
@@ -361,6 +380,9 @@ def extract_features(
 
     feature_dim = encoder_config["multiscale_dim"] if multiscale else encoder_config["bottleneck_dim"]
     model_len = encoder_config["input_length"]
+    # Real-signal window length (e.g. 469); the encoder input (model_len, e.g. 472)
+    # is this zero-padded — matching how generative pretraining built its windows.
+    real_len = int(diffusion_config.get("target_len", model_len))
 
     logger.info(
         f"Encoder loaded: bottleneck_dim={encoder_config['bottleneck_dim']}, "
@@ -524,7 +546,7 @@ def extract_features(
             all_windows = []
             all_metadata = []  # (pair_name, seg_idx) per window
             for pair_name, pair_array in pairs_data:
-                pair_windows = window_recording(pair_array, model_len, stride_seconds, target_sfreq)
+                pair_windows = window_recording(pair_array, model_len, stride_seconds, target_sfreq, real_len=real_len)
                 for seg_idx, window in enumerate(pair_windows):
                     all_windows.append(window)
                     all_metadata.append((pair_name, seg_idx))
@@ -615,7 +637,7 @@ def extract_features(
                 continue
 
             # Slice into windows
-            windows = window_recording(x, model_len, stride_seconds, target_sfreq)
+            windows = window_recording(x, model_len, stride_seconds, target_sfreq, real_len=real_len)
 
             for seg_idx, window in enumerate(windows):
                 fname = feature_filename(fnirs_path, segment_idx=seg_idx)

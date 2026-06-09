@@ -222,3 +222,7 @@ scripts/bsub/data/
 /data/
 
 .claude/
+
+# Sibling Python virtualenvs (e.g. prosodic-env/, ml-env/) and analysis outputs
+*-env/
+/results/

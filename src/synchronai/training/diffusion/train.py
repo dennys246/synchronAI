@@ -651,6 +651,7 @@ def train_fnirs_diffusion(
     lr_schedule: str = "constant",
     eval_gen_every: int = 10,
     per_pair: bool = False,
+    windowing: str = "tile",
     # Quality control parameters
     enable_qc: bool = False,
     sci_threshold: float = 0.5,
@@ -1071,6 +1072,15 @@ def train_fnirs_diffusion(
         epoch_count += 1
         loss_metric = tf.keras.metrics.Mean()
 
+        # Per-epoch tiling phase offset (augmentation): the same grid offset is
+        # used for every recording this epoch and redrawn each epoch, so window
+        # boundaries shift over training while coverage stays complete. Zero in
+        # legacy "random" mode (offset is unused there).
+        epoch_phase_offset = (
+            int(np.random.default_rng(seed + epoch).integers(0, config.target_len))
+            if windowing == "tile" else 0
+        )
+
         # Use the fixed train split for every epoch
         all_paths = train_paths
 
@@ -1107,6 +1117,8 @@ def train_fnirs_diffusion(
                     max_recordings=None,  # Load all in this batch
                     normalize=False,  # Don't normalize - we'll use running stats
                     per_pair=per_pair,
+                    windowing=windowing,
+                    phase_offset=epoch_phase_offset,
                     **qc_kwargs,
                 )
 
@@ -1342,6 +1354,7 @@ def train_fnirs_diffusion(
                             deconvolution=deconvolution,
                             max_recordings=None,
                             normalize=False,
+                            per_pair=per_pair,
                             **qc_kwargs,
                         )
                     except Exception:
