@@ -252,6 +252,10 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="How recordings are windowed for training: 'tile' "
                              "(non-overlapping full coverage + per-epoch phase offset, default) "
                              "or 'random' (legacy: --segments-per-recording random windows).")
+    parser.add_argument("--window-cache", default=None,
+                        help="Path to a pre-built packed window cache dir (from "
+                             "cache_fnirs_windows.py). If set, train from the memmapped "
+                             "windows instead of preprocessing recordings each epoch.")
 
     # Quality control arguments
     parser.add_argument("--enable-qc", action="store_true",
@@ -612,6 +616,7 @@ def _run_fnirs_training(args: argparse.Namespace) -> None:
         eval_gen_every=args.eval_gen_every,
         per_pair=getattr(args, "per_pair", False),
         windowing=getattr(args, "windowing", "tile"),
+        window_cache=getattr(args, "window_cache", None),
         enable_qc=getattr(args, "enable_qc", False),
         sci_threshold=getattr(args, "sci_threshold", 0.5),
         snr_threshold=getattr(args, "snr_threshold", 5.0),

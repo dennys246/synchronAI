@@ -621,6 +621,219 @@ def _generate_sample(
     return x_np
 
 
+def _load_window_cache(cache_dir: str, val_fraction: float, seed: int):
+    """Memmap a packed window cache and produce a subject-grouped train/val split.
+
+    Returns (mmap, train_idx, val_idx, meta, first_path, n_subjects).
+    """
+    import csv as _csv
+
+    cache = Path(cache_dir)
+    with open(cache / "windows_meta.json") as f:
+        meta = json.load(f)
+    shape = tuple(meta["shape"])
+    mmap = np.memmap(cache / "windows_packed.bin", dtype=meta["dtype"], mode="r", shape=shape)
+
+    subjects: List[str] = []
+    first_path = None
+    with open(cache / "window_index.csv", newline="") as f:
+        for row in _csv.DictReader(f):
+            subjects.append(row["subject_id"])
+            if first_path is None:
+                first_path = row["fnirs_path"]
+    subjects_arr = np.asarray(subjects)
+    uniq = sorted(set(subjects))
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(len(uniq))
+    n_val = int(round(len(uniq) * val_fraction))
+    val_set = {uniq[i] for i in perm[:n_val].tolist()}
+    is_val = np.array([s in val_set for s in subjects], dtype=bool)
+    train_idx = np.nonzero(~is_val)[0]
+    val_idx = np.nonzero(is_val)[0]
+    return mmap, train_idx, val_idx, meta, first_path, len(uniq)
+
+
+def _train_fnirs_diffusion_from_cache(
+    *,
+    window_cache: str,
+    save_dir: str,
+    unet_base_width: int,
+    unet_depth: int,
+    unet_time_embed_dim: int,
+    unet_dropout: float,
+    diffusion_timesteps: int,
+    beta_schedule: str,
+    beta_start: float,
+    beta_end: float,
+    batch_size: int,
+    epochs: int,
+    learning_rate: float,
+    seed: int,
+    lr_schedule: str,
+    val_fraction: float,
+    config_filename: str,
+) -> FnirsDiffusionConfig:
+    """Train the diffusion U-Net from a pre-built packed window cache.
+
+    Each epoch is just train + val over in-memory windows (no per-epoch HRfunc
+    preprocessing), so epochs run in minutes instead of ~90 min. FID/MMD is not
+    computed here (dropped). Mirrors the live-path model/schedule/history exactly
+    so the saved weights/config/Figure-1 history are interchangeable.
+    """
+    logger = get_logger(__name__)
+    save_root = Path(save_dir)
+    save_root.mkdir(parents=True, exist_ok=True)
+
+    mmap, train_idx, val_idx, meta, first_path, n_subj = _load_window_cache(
+        window_cache, val_fraction, seed
+    )
+    target_len = int(meta["per_entry_shape"][0])
+    feature_dim = int(meta["per_entry_shape"][1])
+    duration_seconds = float(meta.get("duration_seconds", 60.0))
+    sfreq_hz = float(meta.get("sfreq_hz", 7.8125))
+    model_len = pad_length_to_multiple(target_len, 2 ** unet_depth)
+    logger.info(
+        "Window cache %s: %d windows (%d train / %d val) from %d subjects; "
+        "target_len=%d feature_dim=%d -> model_len=%d",
+        window_cache, len(train_idx) + len(val_idx), len(train_idx), len(val_idx),
+        n_subj, target_len, feature_dim, model_len,
+    )
+    if len(train_idx) == 0:
+        raise RuntimeError(f"Window cache {window_cache} produced no training windows.")
+
+    # Load raw windows into RAM, compute running stats over train, normalize + pad.
+    train_raw = np.asarray(mmap[train_idx], dtype=np.float32)
+    val_raw = np.asarray(mmap[val_idx], dtype=np.float32) if len(val_idx) else None
+    running_stats = RunningStats(feature_dim)
+    running_stats.update_batch(train_raw)
+    mean, std = running_stats.get_mean(), running_stats.std
+    train_x = _pad_time(standardize_with_stats(train_raw, mean, std), model_len)
+    val_x = (
+        _pad_time(standardize_with_stats(val_raw, mean, std), model_len)
+        if val_raw is not None else None
+    )
+    del train_raw, val_raw
+
+    # pair_names / hb_types for the saved config (downstream extraction reads them).
+    pair_names, hb_types = [], ["hbo", "hbr"]
+    try:
+        from synchronai.data.fnirs.processing import extract_hemoglobin_pairs, load_fnirs
+        _x, _meta = extract_hemoglobin_pairs(load_fnirs(first_path, deconvolution=False))
+        pair_names, hb_types = list(_meta.pair_names), list(_meta.hb_types)
+    except Exception as e:
+        logger.warning("Could not read pair metadata from %s (%s); config pair_names left empty", first_path, e)
+
+    schedule = (
+        make_cosine_beta_schedule(diffusion_timesteps) if beta_schedule == "cosine"
+        else make_linear_beta_schedule(diffusion_timesteps, beta_start=beta_start, beta_end=beta_end)
+    )
+    model = build_unet_1d(
+        input_length=model_len, feature_dim=feature_dim, base_width=unet_base_width,
+        depth=unet_depth, time_embed_dim=unet_time_embed_dim, dropout=unet_dropout,
+    )
+    steps_per_epoch = max(1, len(train_x) // batch_size)
+    if lr_schedule == "cosine_restarts":
+        lr_sched = tf.keras.optimizers.schedules.CosineDecayRestarts(
+            initial_learning_rate=learning_rate, first_decay_steps=steps_per_epoch * 5,
+            t_mul=2.0, m_mul=0.75, alpha=0.05,
+        )
+    else:
+        lr_sched = learning_rate
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_sched)
+    _ = model([tf.zeros((1, model_len, feature_dim)), tf.zeros((1,), dtype=tf.int32)])
+
+    weights_path = str(save_root / "fnirs_unet.weights.h5")
+    config_path = str(save_root / config_filename)
+    running_stats_path = str(save_root / "running_stats.npz")
+    history_path = str(save_root / "training_history.json")
+    loss_plot_path = str(save_root / "training_loss.png")
+    history = TrainingHistory.load(history_path)
+    start_epoch = history.current_epoch
+    if start_epoch > 0 and os.path.exists(weights_path):
+        model.load_weights(weights_path)
+        logger.info("Resuming from epoch %d", start_epoch)
+    running_stats.save(running_stats_path)
+
+    @tf.function
+    def train_step(x0: tf.Tensor) -> tf.Tensor:
+        b = tf.shape(x0)[0]
+        t = tf.random.uniform((b,), 0, schedule.timesteps, dtype=tf.int32)
+        noise = tf.random.normal(tf.shape(x0))
+        x_t = tf.gather(schedule.sqrt_alpha_bars, t)[:, None, None] * x0 \
+            + tf.gather(schedule.sqrt_one_minus_alpha_bars, t)[:, None, None] * noise
+        with tf.GradientTape() as tape:
+            loss = tf.reduce_mean(tf.square(noise - model([x_t, t], training=True)))
+        optimizer.apply_gradients(zip(tape.gradient(loss, model.trainable_variables), model.trainable_variables))
+        return loss
+
+    @tf.function
+    def val_step(x0: tf.Tensor):
+        b = tf.shape(x0)[0]
+        t = tf.random.uniform((b,), 0, schedule.timesteps, dtype=tf.int32)
+        noise = tf.random.normal(tf.shape(x0))
+        x_t = tf.gather(schedule.sqrt_alpha_bars, t)[:, None, None] * x0 \
+            + tf.gather(schedule.sqrt_one_minus_alpha_bars, t)[:, None, None] * noise
+        loss = tf.reduce_mean(tf.square(noise - model([x_t, t], training=False)))
+        ss_tot = tf.reduce_mean(tf.square(noise - tf.reduce_mean(noise)))
+        return loss, tf.clip_by_value((1.0 - loss / (ss_tot + 1e-8)) * 100.0, 0.0, 100.0)
+
+    def _make_config() -> FnirsDiffusionConfig:
+        return FnirsDiffusionConfig(
+            duration_seconds=duration_seconds, sfreq_hz=sfreq_hz,
+            target_len=target_len, model_len=model_len, pair_names=pair_names, hb_types=hb_types,
+            feature_dim=feature_dim, feature_mean=mean.tolist(), feature_std=std.tolist(),
+            unet_base_width=unet_base_width, unet_depth=unet_depth,
+            unet_time_embed_dim=unet_time_embed_dim, unet_dropout=unet_dropout,
+            diffusion_timesteps=diffusion_timesteps, beta_schedule=beta_schedule,
+            beta_start=beta_start, beta_end=beta_end, weights_path="fnirs_unet.weights.h5",
+        )
+
+    if epochs - start_epoch <= 0:
+        logger.info("Training already complete (epoch %d/%d)", start_epoch, epochs)
+        return _make_config()
+
+    n = len(train_x)
+    batch_rng = np.random.default_rng(seed)
+    epoch = start_epoch
+    while epoch < epochs:
+        epoch += 1
+        perm = batch_rng.permutation(n)
+        loss_metric = tf.keras.metrics.Mean()
+        for i in range(0, n, batch_size):
+            xb = tf.convert_to_tensor(train_x[perm[i:i + batch_size]])
+            batch_loss = float(train_step(xb))
+            loss_metric.update_state(batch_loss)
+            history.add_batch_loss(batch_loss)
+        epoch_loss = float(loss_metric.result())
+        history.add_epoch_loss(epoch_loss, epoch)
+        history.current_epoch = epoch
+        model.save_weights(weights_path)
+        _save_json(config_path, _make_config().to_dict())
+
+        if val_x is not None:
+            vlm, vam = tf.keras.metrics.Mean(), tf.keras.metrics.Mean()
+            for i in range(0, len(val_x), batch_size):
+                vl, va = val_step(tf.convert_to_tensor(val_x[i:i + batch_size]))
+                vlm.update_state(vl)
+                vam.update_state(va)
+            history.add_val_metrics(float(vlm.result()), float(vam.result()), epoch, history._global_batch)
+            logger.info("Epoch %d/%d - loss=%.6f - val_loss=%.6f val_acc=%.1f%%",
+                        epoch, epochs, epoch_loss, float(vlm.result()), float(vam.result()))
+        else:
+            logger.info("Epoch %d/%d - loss=%.6f", epoch, epochs, epoch_loss)
+
+        history.save(history_path)
+        try:
+            history.plot(loss_plot_path, title="fNIRS Diffusion Training (cached)")
+        except Exception as e:
+            logger.warning("Could not write loss plot: %s", e)
+
+    running_stats.save(running_stats_path)
+    logger.info("Cache training done. Best val_loss=%.6f @ epoch %d",
+                history.best_val_loss, history.best_val_epoch)
+    return _make_config()
+
+
 def train_fnirs_diffusion(
     *,
     data_dir: str,
@@ -652,6 +865,7 @@ def train_fnirs_diffusion(
     eval_gen_every: int = 10,
     per_pair: bool = False,
     windowing: str = "tile",
+    window_cache: Optional[str] = None,
     # Quality control parameters
     enable_qc: bool = False,
     sci_threshold: float = 0.5,
@@ -687,6 +901,21 @@ def train_fnirs_diffusion(
     trace("train_fnirs_diffusion: start")
     save_root = Path(save_dir)
     save_root.mkdir(parents=True, exist_ok=True)
+
+    # Fast path: train from a pre-built packed window cache (no per-epoch
+    # HRfunc preprocessing). Bypasses discovery/streaming entirely.
+    if window_cache:
+        return _train_fnirs_diffusion_from_cache(
+            window_cache=window_cache, save_dir=save_dir,
+            unet_base_width=unet_base_width, unet_depth=unet_depth,
+            unet_time_embed_dim=unet_time_embed_dim, unet_dropout=unet_dropout,
+            diffusion_timesteps=diffusion_timesteps, beta_schedule=beta_schedule,
+            beta_start=beta_start, beta_end=beta_end, batch_size=batch_size,
+            epochs=epochs, learning_rate=learning_rate, seed=seed,
+            lr_schedule=lr_schedule, val_fraction=val_fraction,
+            config_filename=config_filename,
+        )
+
     stats_mode = stats_mode.lower()
     if stats_mode not in {"frozen", "streaming"}:
         raise ValueError(f"stats_mode must be 'frozen' or 'streaming', got: {stats_mode}")
