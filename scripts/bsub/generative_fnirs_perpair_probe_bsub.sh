@@ -3,16 +3,16 @@
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
-#BSUB -M 99000000
+#BSUB -M 40000000
 #BSUB -a 'docker(continuumio/anaconda3)'
-#BSUB -n 40
-#BSUB -R 'select[mem>99GB && tmp>99GB] rusage[mem=99GB, tmp=99GB] span[hosts=1]'
+#BSUB -n 16
+#BSUB -R 'select[mem>40GB && tmp>20GB] rusage[mem=40GB, tmp=20GB] span[hosts=1]'
 # NOTE: #BSUB directives MUST stay directly under the shebang, before any
 # command (incl. the SCRIPT_VERSION= assignment below). LSF stops parsing
 # directives at the first non-comment line; putting a command above them makes
 # LSF ignore every #BSUB line and use the whole script text as the job name.
 
-SCRIPT_VERSION="generative_fnirs_perpair_probe_bsub-v4"
+SCRIPT_VERSION="generative_fnirs_perpair_probe_bsub-v5"
 
 # =============================================================================
 # fNIRS Per-Pair Generative — VALIDATION / CONVERGENCE PROBE (tile windowing)
@@ -80,10 +80,10 @@ export PYTHONNOUSERSITE=1
 echo "Using python: $(command -v python) -> $($SYNCHRONAI_DIR/ml-env/bin/python --version 2>&1)"
 
 # span[hosts=1] keeps all -n slots on one host; these exports make the math
-# libraries actually use them. Without both, LSF scatters the slots and the CPU
-# trainer only uses the master host's cores (slow / silent-hang risk).
-export OMP_NUM_THREADS=40
-export MKL_NUM_THREADS=40
+# libraries actually use them (match -n). Without both, LSF scatters the slots
+# and the CPU trainer only uses the master host's cores (slow / silent-hang risk).
+export OMP_NUM_THREADS=16
+export MKL_NUM_THREADS=16
 
 bash $SYNCHRONAI_DIR/scripts/generative_pretrain.sh \
     --save-dir "$SYNCHRONAI_DIR/$SAVE_DIR" \
