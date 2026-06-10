@@ -12,7 +12,7 @@
 # directives at the first non-comment line; putting a command above them makes
 # LSF ignore every #BSUB line and use the whole script text as the job name.
 
-SCRIPT_VERSION="generative_fnirs_perpair_probe_bsub-v3"
+SCRIPT_VERSION="generative_fnirs_perpair_probe_bsub-v4"
 
 # =============================================================================
 # fNIRS Per-Pair Generative — VALIDATION / CONVERGENCE PROBE (tile windowing)
@@ -70,6 +70,14 @@ conda init
 source /home/$USER/.bashrc
 source $SYNCHRONAI_DIR/ml-env/bin/activate
 cd $SYNCHRONAI_DIR
+
+# LSF often runs this job under /bin/sh, so `source ml-env/bin/activate` may not
+# take effect and the job falls back to base conda python (3.12) + a broken
+# ~/.local hrfunc. Force the ml-env interpreter onto PATH (so bare `python`
+# inside generative_pretrain.sh resolves to ml-env's 3.11) and block user-site.
+export PATH="$SYNCHRONAI_DIR/ml-env/bin:$PATH"
+export PYTHONNOUSERSITE=1
+echo "Using python: $(command -v python) -> $($SYNCHRONAI_DIR/ml-env/bin/python --version 2>&1)"
 
 # span[hosts=1] keeps all -n slots on one host; these exports make the math
 # libraries actually use them. Without both, LSF scatters the slots and the CPU
