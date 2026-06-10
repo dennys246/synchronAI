@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="multimodal_from_features_bsub-v11"
+SCRIPT_VERSION="multimodal_from_features_bsub-v12"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -64,6 +64,9 @@ MODALITY="${MM_MODALITY:-both}"
 # modality=both. Default 0.0 → no dropout (preserves prior CV results).
 VIDEO_DROPOUT_PROB="${MM_VIDEO_DROPOUT_PROB:-0.0}"
 AUDIO_DROPOUT_PROB="${MM_AUDIO_DROPOUT_PROB:-0.0}"
+# v12: probe 2 — within-recording audio shuffle (data augmentation for the
+# audio-redundancy collapse). 0.0 → off.
+AUDIO_SHUFFLE_PROB="${MM_AUDIO_SHUFFLE_PROB:-0.0}"
 
 echo "=== [$SCRIPT_VERSION] ==="
 echo "  Arch:           $ARCH"
@@ -84,6 +87,9 @@ if [ "$MODALITY" != "both" ]; then
 fi
 if [ "$VIDEO_DROPOUT_PROB" != "0.0" ] || [ "$AUDIO_DROPOUT_PROB" != "0.0" ]; then
     echo "  Modality dropout (train): video=$VIDEO_DROPOUT_PROB audio=$AUDIO_DROPOUT_PROB"
+fi
+if [ "$AUDIO_SHUFFLE_PROB" != "0.0" ]; then
+    echo "  Audio shuffle (train, within-recording): p=$AUDIO_SHUFFLE_PROB"
 fi
 echo "  Threads:        OMP=$OMP_NUM_THREADS MKL=$MKL_NUM_THREADS"
 
@@ -126,7 +132,8 @@ echo "=== Starting Multi-Modal Feature Training ==="
     --fold-idx "$FOLD_IDX" \
     --modality "$MODALITY" \
     --video-dropout-prob "$VIDEO_DROPOUT_PROB" \
-    --audio-dropout-prob "$AUDIO_DROPOUT_PROB"
+    --audio-dropout-prob "$AUDIO_DROPOUT_PROB" \
+    --audio-shuffle-prob "$AUDIO_SHUFFLE_PROB"
 train_rc=$?
 if [ $train_rc -ne 0 ]; then
     echo "ERROR: training exited with code $train_rc — see traceback above."

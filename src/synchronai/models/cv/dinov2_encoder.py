@@ -244,6 +244,40 @@ class DINOv2FeatureExtractor(nn.Module):
 
         return features
 
+    def forward_patches(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract the full per-token sequence (CLS + patches) per image.
+
+        Used by the patch-grid feature extractor for probe 1 (spatial
+        attention over DINOv2 patches). The returned tensor is .clone()d
+        so it doesn't carry a reference to the larger model-internal
+        storage (avoids the torch.save view-bloat bug documented in
+        feedback_torch_save_view.md).
+
+        Args:
+            x: Input images (B, 3, 224, 224), ImageNet-normalized
+
+        Returns:
+            Token sequence (B, 1 + num_patches, feature_dim).
+            For 224x224 dinov2-base: (B, 257, 768) (1 CLS + 256 patches).
+        """
+        self._load_model()
+        x = x.to(self._device)
+
+        any_requires_grad = (
+            self.dinov2 is not None
+            and any(p.requires_grad for p in self.dinov2.parameters())
+        )
+        grad_ctx = torch.enable_grad() if any_requires_grad else torch.no_grad()
+
+        with grad_ctx:
+            outputs = self.dinov2(pixel_values=x)
+            tokens = outputs.last_hidden_state  # (B, 1 + P, D)
+
+        # Critical: clone() to break the link to the model's internal
+        # storage. Without this, torch.save serializes the entire
+        # last_hidden_state storage, bloating per-file size 250x.
+        return tokens.clone().contiguous()
+
     def forward_spatial(self, x: torch.Tensor) -> torch.Tensor:
         """Extract spatial feature map for Grad-CAM visualization.
 

@@ -17,6 +17,7 @@ import argparse
 import json
 import logging
 import os
+import random
 import sys
 import time
 from collections import defaultdict
@@ -58,9 +59,17 @@ class MultiModalFeatureDataset(Dataset):
         video_feature_dir: Path,
         audio_feature_dir: Path,
         entries: list[dict],
+        audio_shuffle_prob: float = 0.0,
     ):
         video_dir = Path(video_feature_dir) / "features"
         audio_dir = Path(audio_feature_dir) / "features"
+
+        # Probe 2: per-sample within-recording audio shuffle. When > 0, each
+        # __getitem__ has this probability of replacing the audio tensor with
+        # the audio from a different second in the SAME recording, and forcing
+        # label=0. Constrained to within-recording so the model can't shortcut
+        # via "different scene/subject" cues. shuffle_prob=0 → no change.
+        self.audio_shuffle_prob = audio_shuffle_prob
 
         n = len(entries)
         logger.info(f"Preloading {n} samples into RAM...")
@@ -114,12 +123,131 @@ class MultiModalFeatureDataset(Dataset):
             f"Audio tensor: {tuple(self.audio_tensor.shape)} ({a_mb:.2f} GB)"
         )
 
+        # Probe 2: build per-recording index for within-recording audio shuffle.
+        # Only built when audio_shuffle_prob > 0; otherwise dead weight.
+        self._by_recording: dict[str, list[int]] = {}
+        if self.audio_shuffle_prob > 0:
+            by_rec: dict[str, list[int]] = defaultdict(list)
+            for i, e in enumerate(entries):
+                by_rec[e["video_path"]].append(i)
+            # Only keep recordings with at least 2 samples (otherwise nothing to swap with).
+            self._by_recording = {k: v for k, v in by_rec.items() if len(v) > 1}
+            self._sample_recording = [e["video_path"] for e in entries]
+            n_recordings = len(self._by_recording)
+            n_eligible = sum(len(v) for v in self._by_recording.values())
+            logger.info(
+                f"Audio-shuffle augmentation enabled: prob={self.audio_shuffle_prob:.2f}, "
+                f"{n_recordings} eligible recordings, {n_eligible}/{n} eligible samples."
+            )
+
     def __len__(self) -> int:
         return self.labels.shape[0]
 
     def __getitem__(self, idx: int) -> dict:
+        # Probe 2: within-recording audio shuffle. Replace audio with audio
+        # from another second in the same recording and force label=0. Keeps
+        # subject/scene/recording-conditions identical → only the cross-modal
+        # temporal alignment is broken, isolating the synchrony signal.
+        if self.audio_shuffle_prob > 0:
+            rec = self._sample_recording[idx]
+            candidates = self._by_recording.get(rec)
+            if candidates is not None and random.random() < self.audio_shuffle_prob:
+                # Sample a different idx from the same recording.
+                other_idx = idx
+                while other_idx == idx:
+                    other_idx = random.choice(candidates)
+                return {
+                    "video_features": self.video_tensor[idx],
+                    "audio_features": self.audio_tensor[other_idx],
+                    "label": torch.zeros((), dtype=torch.float32),
+                }
         return {
             "video_features": self.video_tensor[idx],
+            "audio_features": self.audio_tensor[idx],
+            "label": self.labels[idx],
+        }
+
+
+class MultiModalPatchFeatureDataset(Dataset):
+    """Lazy-load variant for 3D video features (T, P, D) — e.g. DINOv2 patch grid.
+
+    The full DINOv2 patch features are (12, 257, 768) = 9.5 MB per file. For
+    ~59K samples that's ~565 GB, so we can't preload like the meanpatch path.
+    This dataset reads one video file per __getitem__ off disk. Audio features
+    are 2D (49, 768) = 0.19 MB per file and we preload those as usual to keep
+    audio I/O off the hot path.
+
+    Used by --arch v2_patch (probe 1: does spatial patch information rescue
+    the multimodal ceiling?).
+    """
+
+    def __init__(
+        self,
+        video_feature_dir: Path,
+        audio_feature_dir: Path,
+        entries: list[dict],
+    ):
+        self.video_dir = Path(video_feature_dir) / "features"
+        self.audio_dir = Path(audio_feature_dir) / "features"
+
+        n = len(entries)
+        # Peek at the first video to learn shape.
+        first_v = torch.load(
+            self.video_dir / entries[0]["video_feature_file"],
+            map_location="cpu", weights_only=True,
+        ).detach()
+        first_a = torch.load(
+            self.audio_dir / entries[0]["audio_feature_file"],
+            map_location="cpu", weights_only=True,
+        ).detach()
+        if first_v.ndim != 3:
+            raise ValueError(
+                f"PatchFeatureDataset expects 3D video features (T, P, D); got {first_v.shape}. "
+                f"Use the standard MultiModalFeatureDataset for 2D (T, D) features."
+            )
+        if first_a.ndim != 2:
+            raise ValueError(
+                f"Audio features must be 2D (T, D); got {first_a.shape}."
+            )
+        self.video_shape = tuple(first_v.shape)
+
+        # Preload audio (small, ~11 GB for full set) and labels; keep video lazy.
+        logger.info(
+            f"Preloading {n} audio samples (video is lazy-loaded per __getitem__)..."
+        )
+        load_start = time.time()
+        self.audio_tensor = torch.empty((n, *first_a.shape), dtype=torch.float32)
+        self.labels = torch.empty(n, dtype=torch.float32)
+        self.video_files = [entries[i]["video_feature_file"] for i in range(n)]
+        self.audio_tensor[0] = first_a
+        self.labels[0] = float(entries[0]["label"])
+        for i in range(1, n):
+            entry = entries[i]
+            self.audio_tensor[i] = torch.load(
+                self.audio_dir / entry["audio_feature_file"],
+                map_location="cpu", weights_only=True,
+            ).detach()
+            self.labels[i] = float(entry["label"])
+            if (i + 1) % 5000 == 0:
+                logger.info(f"  Loaded {i+1}/{n} audio samples")
+        a_gb = self.audio_tensor.element_size() * self.audio_tensor.nelement() / 1e9
+        logger.info(
+            f"Audio preload complete in {time.time() - load_start:.1f}s. "
+            f"Audio tensor: {tuple(self.audio_tensor.shape)} ({a_gb:.2f} GB). "
+            f"Video lazy-loaded: per-sample shape {self.video_shape} "
+            f"(~{4 * np.prod(self.video_shape) / 1e6:.1f} MB/file)."
+        )
+
+    def __len__(self) -> int:
+        return self.labels.shape[0]
+
+    def __getitem__(self, idx: int) -> dict:
+        v = torch.load(
+            self.video_dir / self.video_files[idx],
+            map_location="cpu", weights_only=True,
+        ).detach()
+        return {
+            "video_features": v,
             "audio_features": self.audio_tensor[idx],
             "label": self.labels[idx],
         }
@@ -475,6 +603,111 @@ class MultiModalV4(nn.Module):
         return self.head(pooled).squeeze(-1)
 
 
+class MultiModalV2Patch(nn.Module):
+    """v2 variant: spatial attention over DINOv2 patch tokens per frame.
+
+    Probe 1: tests whether the meanpatch collapse in v2 (which mean-pools the
+    257-patch grid into a single 768-dim per frame) is what's capping train_acc
+    at ~0.76. v2 with full patch features lets the model learn *which patches*
+    matter per frame instead of being fed the spatial average.
+
+    Video: (B, T_v, P, D_v) — e.g. (B, 12, 257, 768) from data/dinov2_features/
+      Per-frame spatial attention: a learnable query attends over P patches.
+        Q: (1, 1, D_v) learnable, broadcast to (B*T_v, 1, D_v)
+        K, V: (B*T_v, P, D_v)
+        → (B*T_v, D_v)
+      Reshape to (B, T_v, D_v), then standard v2 path:
+      Linear(D_v -> proj_dim) + GELU + Dropout
+      mean over T_v
+      Dropout
+      → (B, proj_dim) video_repr
+
+    Audio + Fusion: identical to MultiModalV2.
+
+    The spatial attention is one block with no FFN — kept minimal so the
+    only structural difference from v2 is the spatial aggregation strategy
+    (learned attention vs. mean pool).
+    """
+
+    def __init__(
+        self,
+        video_feature_dim: int,
+        audio_feature_dim: int,
+        proj_dim: int = 64,
+        head_hidden: int = 64,
+        proj_dropout: float = 0.3,
+        lstm_dropout: float = 0.2,
+        repr_dropout: float = 0.3,
+        head_dropout: float = 0.3,
+        spatial_attn_heads: int = 4,
+        spatial_attn_dropout: float = 0.1,
+    ):
+        super().__init__()
+        if video_feature_dim % spatial_attn_heads != 0:
+            raise ValueError(
+                f"video_feature_dim ({video_feature_dim}) must be divisible by "
+                f"spatial_attn_heads ({spatial_attn_heads})"
+            )
+        self.video_query = nn.Parameter(torch.randn(1, 1, video_feature_dim) * 0.02)
+        self.video_spatial_attn = nn.MultiheadAttention(
+            embed_dim=video_feature_dim,
+            num_heads=spatial_attn_heads,
+            dropout=spatial_attn_dropout,
+            batch_first=True,
+        )
+        self.video_proj = nn.Sequential(
+            nn.Linear(video_feature_dim, proj_dim),
+            nn.GELU(),
+            nn.Dropout(proj_dropout),
+        )
+        self.audio_proj = nn.Sequential(
+            nn.Linear(audio_feature_dim, proj_dim),
+            nn.GELU(),
+            nn.Dropout(proj_dropout),
+        )
+        self.audio_lstm = nn.LSTM(
+            proj_dim, proj_dim, num_layers=2,
+            dropout=lstm_dropout, batch_first=True,
+        )
+        self.video_repr_drop = nn.Dropout(repr_dropout)
+        self.audio_repr_drop = nn.Dropout(repr_dropout)
+        self.head = nn.Sequential(
+            nn.Linear(2 * proj_dim, head_hidden),
+            nn.GELU(),
+            nn.Dropout(head_dropout),
+            nn.Linear(head_hidden, 1),
+        )
+
+        n_params = sum(p.numel() for p in self.parameters())
+        logger.info(
+            f"MultiModalV2Patch: video=(T, P, {video_feature_dim}) → spatial-attn(heads="
+            f"{spatial_attn_heads}, drop={spatial_attn_dropout}) → proj({proj_dim}) → mean-T, "
+            f"audio_dim={audio_feature_dim} → {proj_dim} (LSTM x2), "
+            f"head_hidden={head_hidden}, "
+            f"dropouts: proj={proj_dropout}/lstm={lstm_dropout}/repr={repr_dropout}/head={head_dropout}, "
+            f"params={n_params:,}"
+        )
+
+    def forward(self, video_features: torch.Tensor, audio_features: torch.Tensor) -> torch.Tensor:
+        # video_features: (B, T, P, D)
+        B, T, P, D = video_features.shape
+        v = video_features.reshape(B * T, P, D)
+        q = self.video_query.expand(B * T, -1, -1)            # (B*T, 1, D)
+        v_attn, _ = self.video_spatial_attn(q, v, v)          # (B*T, 1, D)
+        v = v_attn.squeeze(1).reshape(B, T, D)                # (B, T, D)
+        v = self.video_proj(v)                                # (B, T, proj_dim)
+        v_repr = v.mean(dim=1)                                # (B, proj_dim)
+        v_repr = self.video_repr_drop(v_repr)
+
+        a = self.audio_proj(audio_features)                   # (B, 49, proj_dim)
+        _, (h_n, _) = self.audio_lstm(a)                      # h_n: (2, B, proj_dim)
+        a_repr = h_n[-1, :, :]
+        a_repr = self.audio_repr_drop(a_repr)
+
+        fused = torch.cat([v_repr, a_repr], dim=-1)           # (B, 2*proj_dim)
+        return self.head(fused).squeeze(-1)
+
+
 def merge_feature_indices(
     video_feature_dir: Path,
     audio_feature_dir: Path,
@@ -682,11 +915,13 @@ def train(
     modality: str = "both",
     video_dropout_prob: float = 0.0,
     audio_dropout_prob: float = 0.0,
+    audio_shuffle_prob: float = 0.0,
 ) -> None:
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(seed)
     np.random.seed(seed)
+    random.seed(seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
@@ -709,13 +944,33 @@ def train(
     pos_weight = compute_pos_weight(train_entries)
     logger.info(f"Train pos_weight: {pos_weight:.3f}")
 
+    # Probe 1 uses --arch v2_patch with 3D video features (T, P, D) too big to
+    # preload; switch to lazy-load dataset for that arch. Probe 2's audio shuffle
+    # only applies to the train loader (val keeps real labels).
+    if arch == "v2_patch":
+        train_dataset = MultiModalPatchFeatureDataset(video_dir, audio_dir, train_entries)
+        val_dataset = MultiModalPatchFeatureDataset(video_dir, audio_dir, val_entries)
+        if audio_shuffle_prob > 0:
+            raise ValueError(
+                "--audio-shuffle-prob is not yet wired to MultiModalPatchFeatureDataset. "
+                "Run probe 1 (--arch v2_patch) and probe 2 (--audio-shuffle-prob) separately."
+            )
+    else:
+        train_dataset = MultiModalFeatureDataset(
+            video_dir, audio_dir, train_entries,
+            audio_shuffle_prob=audio_shuffle_prob,
+        )
+        val_dataset = MultiModalFeatureDataset(
+            video_dir, audio_dir, val_entries,
+            audio_shuffle_prob=0.0,  # never shuffle val
+        )
     train_loader = DataLoader(
-        MultiModalFeatureDataset(video_dir, audio_dir, train_entries),
+        train_dataset,
         batch_size=batch_size, shuffle=True, num_workers=num_workers,
         collate_fn=collate, drop_last=True,
     )
     val_loader = DataLoader(
-        MultiModalFeatureDataset(video_dir, audio_dir, val_entries),
+        val_dataset,
         batch_size=batch_size, shuffle=False, num_workers=num_workers,
         collate_fn=collate,
     )
@@ -780,8 +1035,25 @@ def train(
             n_video_frames=video_frames,
             n_audio_frames=audio_frames,
         ).to(device)
+    elif arch == "v2_patch":
+        # Probe 1: v2 with spatial attention over DINOv2 patch tokens per frame.
+        # Requires 3D video features (T, P, D), e.g. data/dinov2_features/.
+        model = MultiModalV2Patch(
+            video_feature_dim=video_dim,
+            audio_feature_dim=audio_dim,
+            proj_dim=video_hidden,
+            head_hidden=head_hidden,
+            proj_dropout=dropout,
+            lstm_dropout=0.2,
+            repr_dropout=dropout,
+            head_dropout=dropout,
+            spatial_attn_heads=4,
+            spatial_attn_dropout=0.1,
+        ).to(device)
     else:
-        raise ValueError(f"Unknown --arch {arch!r}; expected 'v1', 'v2', 'v3', or 'v4'.")
+        raise ValueError(
+            f"Unknown --arch {arch!r}; expected 'v1', 'v2', 'v3', 'v4', or 'v2_patch'."
+        )
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device))
     optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -815,6 +1087,7 @@ def train(
         "modality": modality,
         "video_dropout_prob": video_dropout_prob,
         "audio_dropout_prob": audio_dropout_prob,
+        "audio_shuffle_prob": audio_shuffle_prob,
     }
     with open(save_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -1000,13 +1273,16 @@ def main():
     parser.add_argument("--audio-feature-dir", required=True)
     parser.add_argument("--save-dir", required=True)
     parser.add_argument(
-        "--arch", choices=["v1", "v2", "v3", "v4"], default="v1",
+        "--arch", choices=["v1", "v2", "v3", "v4", "v2_patch"], default="v1",
         help="Model architecture. v1=per-modality LSTM(D->H) + concat (original). "
              "v2=projection bottleneck + 2-layer LSTM (audio) + mean-pool (video) "
              "+ explicit aggregator dropout + concat. "
              "v3=v2 backbone with cross-attention fusion replacing concat. "
              "v4=token-level cross-modal transformer over the joint 61-token "
-             "sequence (every video frame attends to every audio frame).",
+             "sequence (every video frame attends to every audio frame). "
+             "v2_patch=v2 with spatial attention over DINOv2 patch tokens "
+             "(probe 1: requires 3D video features (T, P, D), e.g. "
+             "data/dinov2_features/; uses lazy-load dataset).",
     )
     parser.add_argument("--video-hidden", type=int, default=64)
     parser.add_argument("--audio-hidden", type=int, default=64)
@@ -1055,6 +1331,14 @@ def main():
         "--audio-dropout-prob", type=float, default=0.0,
         help="D3: stochastic audio-modality dropout during training. Mirror of "
              "--video-dropout-prob. If both would be dropped on a batch, we resample.",
+    )
+    parser.add_argument(
+        "--audio-shuffle-prob", type=float, default=0.0,
+        help="Probe 2: within-recording audio-shuffle augmentation. During training, "
+             "each sample has this probability of having its audio replaced with audio "
+             "from a different second in the same recording, with label forced to 0. "
+             "Constrained to within-recording so the model can't shortcut via "
+             "subject/scene cues. Validation is never shuffled. Default 0.0 = off.",
     )
     args = parser.parse_args()
 
