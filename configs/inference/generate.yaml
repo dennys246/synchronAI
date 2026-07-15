@@ -1,0 +1,32 @@
+inference:
+  checkpoint: experiments/multimodal/best.ckpt
+  device: cuda
+  batch_size: 4
+
+inputs:
+  modalities:
+    - video
+    - audio
+    - transcript
+    - fnirs
+  alignment:
+    method: linear_interpolation
+    target_sampling_rate: 7.81  # Hz, aligned with fNIRS
+
+outputs:
+  save_dir: outputs/generate
+  return_features: true        # save latent features for synchrony analysis
+  save_format: npy             # numpy arrays for downstream processing
+
+preprocessing:
+  video:
+    resize: [224, 224]
+    normalize: true
+  audio:
+    mel_spectrogram: true
+    sample_rate: 16000
+  transcript:
+    tokenizer: bert-base-uncased
+    max_length: 128
+  fnirs:
+    normalize: true

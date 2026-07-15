@@ -1,0 +1,9 @@
+dataset:
+  name: fnirs
+  root: data/fnirs
+  sampling_rate: 10  # Hz
+
+preprocessing:
+  tddr: true
+  detrend_order: 3
+  normalize: true

@@ -1,0 +1,14 @@
+# Video Classifier Inference Configuration
+
+model:
+  weights_path: "runs/video_classifier/best_model.pt"
+
+data:
+  sample_fps: 12.0
+  window_seconds: 1.0
+  frame_size: 640
+
+inference:
+  threshold: 0.5
+  device: "auto"  # auto, cpu, cuda
+  batch_size: 1

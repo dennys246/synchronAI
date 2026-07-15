@@ -1,0 +1,105 @@
+# Heatmap Generation Configuration
+# =================================
+# Configuration for generating synchrony heatmap visualizations from video.
+
+# Visualization settings
+visualization:
+  # Colormap for probability mapping (matplotlib colormap name)
+  # Options: RdYlGn, RdYlBu, coolwarm, viridis, plasma
+  colormap: "RdYlGn"
+
+  # Probability range for normalization
+  vmin: 0.0
+  vmax: 1.0
+
+  # Classification threshold for binary predictions
+  threshold: 0.5
+
+  # Figure sizes for different plot types
+  figsize_timeline: [16, 4]
+  figsize_grid: [16, 10]
+  figsize_distribution: [10, 6]
+
+  # Output resolution (DPI)
+  dpi: 150
+
+  # Axis labels
+  cbar_label: "Synchrony Probability"
+  xlabel: "Time (seconds)"
+
+  # Styling
+  grid_alpha: 0.3
+  annotation_fontsize: 8
+  title_fontsize: 14
+
+# Video overlay settings
+video_overlay:
+  # Enable video overlay generation (can be slow for long videos)
+  enabled: true
+
+  # Transparency of color overlay on frames (0=invisible, 1=opaque)
+  overlay_alpha: 0.25
+
+  # Output video codec (mp4v, avc1, XVID)
+  codec: "mp4v"
+
+  # Output FPS (null = same as input)
+  output_fps: null
+
+  # Show colored border indicating prediction
+  show_border: true
+
+  # Show probability text overlay
+  show_text: true
+
+  # Show probability progress bar
+  show_bar: true
+
+# Thumbnail grid settings
+thumbnails:
+  # Number of columns in thumbnail grid
+  cols: 6
+
+  # Thumbnail size (width, height)
+  size: [320, 180]
+
+  # Maximum number of thumbnails to include
+  max_thumbnails: 30
+
+# Segment summary settings
+segments:
+  # Duration of each segment for summary bar chart (seconds)
+  segment_duration: 10
+
+# Grid heatmap settings
+grid:
+  # Number of seconds per row in grid heatmap
+  cols: 30
+
+  # Minimum video length (seconds) to generate grid view
+  min_length_for_grid: 60
+
+# Output settings
+output:
+  # Which visualizations to generate
+  # Options: timeline, grid, distribution, segments, data, video, thumbnails
+  # Use "all" for all static visualizations
+  # Use "all_with_video" for all including video overlay
+  visualizations:
+    - timeline
+    - distribution
+    - segments
+    - thumbnails
+    - data
+    - video
+
+  # Output filename prefix (empty = use video name)
+  prefix: ""
+
+# Model settings (can be overridden by CLI)
+model:
+  # Path to model weights (required)
+  weights_path: null
+
+  # Device to run inference on (auto, cpu, cuda)
+  device: "auto"

@@ -1,0 +1,28 @@
+inference:
+  checkpoint: experiments/multimodal/best.ckpt
+  device: cuda
+  batch_size: 4
+
+inputs:
+  modalities:
+    - video
+    - audio
+    - transcript
+    - fnirs
+  alignment:
+    method: linear_interpolation
+    target_sampling_rate: 7.81
+
+outputs:
+  save_dir: outputs/predict
+  save_format: csv
+  synchrony_metrics:
+    - wavelet_coherence_synchrony
+    - global_synchrony
+  aggregate_over_window: 120  # seconds
+
+postprocessing:
+  smooth_predictions:
+    method: gaussian
+    sigma: 1
+  threshold_synchrony: 0.5

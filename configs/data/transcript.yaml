@@ -1,0 +1,5 @@
+dataset:
+  name: transcripts
+  root: data/transcripts
+  tokenizer: bert-base-uncased
+  max_length: 128

@@ -1,0 +1,18 @@
+transfer:
+  enabled: true
+  checkpoint:
+    video: checkpoints/video_pretrained.ckpt
+    audio: checkpoints/audio_pretrained.ckpt
+    text: checkpoints/text_pretrained.ckpt
+    fnirs: checkpoints/fnirs_diffusion.ckpt
+  strategy: finetune
+  freeze:
+    video: true
+    audio: true
+    text: true
+    fnirs: false   # you want fNIRS head trainable
+  unfreeze_at_epoch:
+    video: 20
+    audio: 20
+    text: 20
+    fnirs: 0
