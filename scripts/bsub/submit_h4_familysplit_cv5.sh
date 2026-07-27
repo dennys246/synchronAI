@@ -45,7 +45,11 @@ SCRIPT_VERSION="submit_h4_familysplit_cv5-v1"
 # partial failure.
 # =============================================================================
 
-LAUNCHER="$(dirname "$0")/pre_multimodal_from_features_bsub.sh"
+# The job body cds to $SYNCHRONAI_DIR itself, but the preflight checks below run
+# in the submit shell — so resolve to the repo root rather than trusting cwd.
+cd "$(dirname "$0")/../.." || exit 1
+
+LAUNCHER="scripts/bsub/pre_multimodal_from_features_bsub.sh"
 NUM_FOLDS=5
 SAVE_DIR_BASE="runs/multimodal_features/h4_familysplit_cv5"
 
