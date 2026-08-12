@@ -41,7 +41,15 @@ import openpyxl
 LOCAL_ROOT = "/Volumes/perlmansusan/Active/moochie"
 CLUSTER_ROOT = "/storage1/fs1/perlmansusan/Active/moochie"
 
-STUDY_DATA = f"{LOCAL_ROOT}/study_data"
+# The same NFS share is mounted at different paths on the mac and the cluster.
+# Discover which one actually exists rather than assuming the mac: running on
+# the cluster used to glob a nonexistent /Volumes path, find zero coding files,
+# and write a header-only CSV over a good one without erroring.
+DATA_ROOT = next(
+    (r for r in (LOCAL_ROOT, CLUSTER_ROOT) if os.path.isdir(f"{r}/study_data")),
+    LOCAL_ROOT,
+)
+STUDY_DATA = f"{DATA_ROOT}/study_data"
 LABEL_ENCODING = {"a": 0, "s": 1}
 
 
@@ -117,7 +125,9 @@ def ffprobe_duration(path: str) -> float | None:
 
 
 def emit_path(local_path: str) -> str:
-    return local_path.replace(LOCAL_ROOT, CLUSTER_ROOT, 1)
+    """Always emit the cluster prefix — extraction jobs run inside Docker there.
+    No-op when we are already reading from the cluster mount."""
+    return local_path.replace(DATA_ROOT, CLUSTER_ROOT, 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -280,6 +290,16 @@ def build(study: str, out_csv: str, no_ffprobe: bool, min_seconds: int) -> None:
 
     rows_out: list[tuple[str, int, int, str, str]] = []
     print(f"\n=== {study}: {len(by_id)} coded IDs (min_seconds={min_seconds}) ===")
+    print(f"    reading coding from {STUDY_DATA}")
+    if not by_id:
+        # Refuse to write. Silently emitting a header-only CSV here overwrote a
+        # good labels file once, because a wrong data root globs to nothing and
+        # looks identical to "this study has no coding yet".
+        raise SystemExit(
+            f"ERROR: found 0 coding files for '{study}' under {STUDY_DATA}.\n"
+            f"       Check that path exists and holds the expected layout. "
+            f"Refusing to write {out_csv}."
+        )
     n_ok = n_novideo = n_sparse = 0
     dist = collections.Counter()
     for pid in sorted(by_id):
