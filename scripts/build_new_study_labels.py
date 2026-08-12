@@ -1,6 +1,6 @@
-"""Build labels.csv for the EmoGrow and R56 P-CAT DB-DOS synchrony codings.
+"""Build labels.csv for the EmoGrow, R56 P-CAT and R01 P-CAT DB-DOS synchrony codings.
 
-These two studies use the same per-second `Time | Code | Notes` coding sheets as
+These studies use the same per-second `Time | Code | Notes` coding sheets as
 CARE (code `a`=async=0, `s`=sync=1), but two things prevent reuse of
 `preprocessing/raw_to_csv.preprocess_raw_to_csv` directly:
 
@@ -14,6 +14,8 @@ CARE (code `a`=async=0, `s`=sync=1), but two things prevent reuse of
      EmoGrow:  {rater}_Coding/V1/{ID}_Final.xlsx        (one file per participant)
      R56 PCAT: {rater}/{family}_{activity}_Complete.xlsx (activities = sequential,
                non-overlapping absolute-time segments of one {family}_DB-DOS video)
+     R01 PCAT: second-by-second/T1/{record}/{record}_T1_{Task}.xlsx (5-digit IDs;
+               Time is wall-clock from video start, shared with the verbal VAD export)
 
 Multiple raters are combined by per-second majority vote; ties are dropped.
 
@@ -196,12 +198,80 @@ def resolve_r56_video(fam: str) -> str | None:
 
 
 # --------------------------------------------------------------------------- #
+# R01 P-CAT
+# --------------------------------------------------------------------------- #
+# Time cells here are Excel numFmtId 20 (h:mm) holding what a coder typed as
+# m:ss, so openpyxl hands back time(minutes, seconds) and parse_mmss already
+# decodes them correctly — verified against an independent day-fraction*1440
+# decode on all 21,836 rows of all 22 files, zero mismatches. No new parser.
+#
+# Only 16 of the 156 subject dirs currently hold coding; the rest are empty
+# placeholders awaiting the coding queue. Re-run this as coding lands.
+def discover_r01(root_override: str | None = None) -> dict[str, list[str]]:
+    """record ID -> list of per-task coding files (Arts / Puzzles / Magnetiles).
+
+    Five-digit IDs, unlike R56's four. Reusing R56's r"(\\d{4})_" here would
+    match the first four digits, fail on the trailing digit, and skip every
+    file in silence.
+    """
+    root = root_override or f"{STUDY_DATA}/P-CAT/R01/synchrony_coding/second-by-second/T1"
+    by_id: dict[str, list[str]] = collections.defaultdict(list)
+    for f in glob.glob(os.path.join(root, "*", "*.xlsx")):
+        b = os.path.basename(f)
+        if b.startswith("~$") or b.startswith("._"):
+            continue
+        m = re.match(r"(\d{5})_", b)
+        if not m:
+            continue
+        by_id[m.group(1)].append(f)
+    return by_id
+
+
+def resolve_r01_video(rid: str) -> str | None:
+    """Pick the DB-DOS recording, tolerating the known anomalies.
+
+    Rejects AppleDouble sidecars, partial-transfer artifacts (a hash suffix
+    after the extension), zero-byte remux failures, and the loudness-fixed
+    derivatives, whose audio is heterogeneous down to 8 kHz mono. Accepts the
+    'ddbos' typo in 11181. Prefers the largest file when a session was split.
+    """
+    d = f"{STUDY_DATA}/P-CAT/R01/data/WUSTL_data/T1/video_data/dbdos/{rid}"
+    if not os.path.isdir(d):
+        return None
+    cands = []
+    for f in os.listdir(d):
+        if f.startswith("._") or "_fixed" in f:
+            continue
+        if not re.search(r"\.(mp4|mkv)$", f, re.IGNORECASE):
+            continue
+        if not re.search(r"d[db]dos", f, re.IGNORECASE):
+            continue
+        p = os.path.join(d, f)
+        try:
+            size = os.path.getsize(p)
+        except OSError:
+            continue
+        if size:
+            cands.append((size, p))
+    return max(cands)[1] if cands else None
+
+
+# --------------------------------------------------------------------------- #
 def build(study: str, out_csv: str, no_ffprobe: bool, min_seconds: int) -> None:
     if study == "emogrow":
         by_id = discover_emogrow()
         resolve = resolve_emogrow_video
         sid = lambda i: f"EG{i}"      # noqa: E731
         session = "V1"
+    elif study == "r01pcat":
+        by_id = discover_r01()
+        resolve = resolve_r01_video
+        # NEVER a bare 5-digit subject_id: family_id_from_subject
+        # (train_multimodal_from_features.py:2120) truncates those to 4 digits,
+        # so 11002/11003/11009 would collapse into one CV group. The "-dyad"
+        # suffix routes to the earlier branch and round-trips intact.
+        sid = lambda i: f"{i}-dyad"   # noqa: E731
+        session = "T1"
     else:
         by_id = discover_r56()
         resolve = resolve_r56_video
@@ -265,7 +335,7 @@ def build(study: str, out_csv: str, no_ffprobe: bool, min_seconds: int) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--study", required=True, choices=["emogrow", "r56pcat"])
+    ap.add_argument("--study", required=True, choices=["emogrow", "r56pcat", "r01pcat"])
     ap.add_argument("--out", required=True)
     ap.add_argument("--no-ffprobe", action="store_true",
                     help="skip video-duration probe (faster, no OOB filtering)")
