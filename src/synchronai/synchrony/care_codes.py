@@ -107,8 +107,16 @@ def parse_global_codes(root: str | Path, limit: int = 0) -> tuple[list[dict], li
                     problems.append(f"{rel}: does not match block template")
                     continue
                 if parsed["activity"] is None:
-                    problems.append(f"{rel}: unrecognized BLOCK {parsed!r}")
-                    continue
+                    # BLOCK cell unusable (template placeholder, odd label);
+                    # fall back to the activity token in the filename.
+                    m = re.search(r"_V\d_(.+?)(?:[_ ]\d)?\.xlsx$", f.name)
+                    fallback = normalize_activity(m.group(1)) if m else None
+                    if fallback is None:
+                        problems.append(f"{rel}: unrecognized BLOCK {parsed!r}")
+                        continue
+                    problems.append(f"{rel}: BLOCK cell unusable, using filename "
+                                    f"activity '{fallback}'")
+                    parsed["activity"] = fallback
                 if parsed["id_cell"] and parsed["id_cell"] != sub_dir.name:
                     problems.append(f"{rel}: ID cell {parsed['id_cell']} != dir "
                                     f"{sub_dir.name} (using dir)")

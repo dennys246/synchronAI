@@ -235,9 +235,24 @@ def main() -> None:
     ap.add_argument("--care-labels", action="store_true",
                     help="also parse CARE global codes and write the trial-level "
                          "label join")
+    ap.add_argument("--labels-only", action="store_true",
+                    help="skip the session walk; rebuild the CARE label join from "
+                         "the existing trial_table.csv (re-run as coding lands)")
     ap.add_argument("--verbose", action="store_true",
                     help="print per-session matched marker<->event pairs")
     args = ap.parse_args()
+
+    out_dir = Path(args.out_dir)
+    if args.labels_only:
+        table = out_dir / "trial_table.csv"
+        if not table.exists():
+            raise SystemExit(f"{table} not found; run the full walk first")
+        with open(table, newline="") as fh:
+            trial_rows = [{**r, "block": int(r["block"]), "trial": int(r["trial"]),
+                           "session_passed": r["session_passed"] == "True"}
+                          for r in csv.DictReader(fh)]
+        build_care_label_join(trial_rows, out_dir, limit=0)
+        return
 
     sessions: list[tuple[str, str, Path | None, Path | None]] = []
     if args.session:
@@ -266,7 +281,6 @@ def main() -> None:
         trial_rows.extend(build_trial_rows(al, sidecar, markers))
         tally[(study, al.offset_source, al.passed)] += 1
 
-    out_dir = Path(args.out_dir)
     print("\n=== per-session validation summary")
     for (study, source, passed), n in sorted(tally.items()):
         print(f"  {study:10s} {source:15s} {'PASS' if passed else 'fail':4s}  {n}")
