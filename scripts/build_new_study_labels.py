@@ -34,6 +34,7 @@ import datetime
 import glob
 import os
 import re
+import shutil
 import subprocess
 
 import openpyxl
@@ -291,6 +292,16 @@ def build(study: str, out_csv: str, no_ffprobe: bool, min_seconds: int) -> None:
     rows_out: list[tuple[str, int, int, str, str]] = []
     print(f"\n=== {study}: {len(by_id)} coded IDs (min_seconds={min_seconds}) ===")
     print(f"    reading coding from {STUDY_DATA}")
+    if not no_ffprobe and shutil.which("ffprobe") is None:
+        # ffprobe_duration swallows FileNotFoundError, so without this the
+        # out-of-range filter just stops running and every line reads
+        # "vid_dur=n/a" — easy to miss. It matters: a mis-decoded timebase, or
+        # a short recording (11091 is 75 s) or one of the 14 readme'd
+        # late-start sessions, would otherwise emit labels past the video end.
+        print("    WARNING: ffprobe not found — out-of-range label filtering is "
+              "DISABLED for this run.\n"
+              "             Durations will show n/a. Re-run where ffprobe exists, "
+              "or pass --no-ffprobe to acknowledge.")
     if not by_id:
         # Refuse to write. Silently emitting a header-only CSV here overwrote a
         # good labels file once, because a wrong data root globs to nothing and
