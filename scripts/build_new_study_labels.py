@@ -350,6 +350,19 @@ def build(study: str, out_csv: str, no_ffprobe: bool, min_seconds: int) -> None:
         n_ok += 1
 
     os.makedirs(os.path.dirname(os.path.abspath(out_csv)), exist_ok=True)
+    if not rows_out:
+        # Second half of the same guard as the zero-IDs case above. Discovery
+        # can succeed while every workbook fails to open — a broken openpyxl
+        # install does exactly this — and the sparse filter then drops all
+        # participants. That is indistinguishable from a real empty result and
+        # would overwrite a good labels file with a bare header.
+        raise SystemExit(
+            f"ERROR: discovered {len(by_id)} IDs but kept 0 labelled seconds "
+            f"({n_sparse} sparse-dropped, {n_novideo} without video).\n"
+            f"       Check the '! failed to open' lines above. "
+            f"Refusing to write {out_csv}."
+        )
+
     with open(out_csv, "w") as fh:
         fh.write("video_path,second,label,subject_id,session\n")
         for vp, sec, lab, s, sess in rows_out:
