@@ -255,6 +255,12 @@ docs/fnirs_alignment_audit.md
 # Job scratch dirs (per-job HOME on cluster) — never track
 .jobhome/
 
+# Human coding exports (verbal/behavioral coding pulled from REDCap etc.).
+# Study data, not code — never track, regardless of PHI status. Broad glob so a
+# new export with a different study/date prefix can't slip in via `git add -A`.
+verbal_*.csv
+*_coding_export*.csv
+
 # ---------------------------------------------------------------------------
 # TEMPORARY: fNIRS paper analysis scripts — private ONLY until the publication
 # is accepted, then DELETE this block so they become public. They are real
