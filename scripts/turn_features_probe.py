@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Probe: does speaker-attributed turn structure predict dyadic synchrony?
+Probe: which modality predicts dyadic synchrony, under one identical protocol?
 
 This is a CEILING test, not a model. The turn features come from HUMAN verbal
 coding (P-CAT R01 `ParentVerbal`/`ChildVerbal` tiers), so speaker attribution is
@@ -20,10 +20,28 @@ Caveat the caller must not forget: there is no matched video-only baseline for
 R01 (its DINOv2/WavLM features are not extracted). This measures signal against
 chance and against a within-subject label permutation null, NOT against video.
 
+Why not `train_multimodal_from_features.py`: its branches are ~100k-parameter
+LSTMs. With 15 subjects that capacity fits subject identity rather than
+synchrony, and the comparison stops meaning anything. Everything here is one
+L2 logistic regression on pooled features, so video, turn and their combination
+are judged at the same capacity and by the same LOSO folds.
+
+Video and audio features are per-window .pt files and need torch; turn features
+are packed numpy and do not. torch is imported lazily so the turn-only path
+still runs anywhere.
+
 Usage:
+    # turn features only (no torch needed)
     python scripts/turn_features_probe.py \
-        --feature-dir data/turntaking_features_r01 \
+        --turn-dir data/turntaking_features_r01 \
         --labels-file data/labels_r01pcat.csv
+
+    # three-way comparison on the same subjects and folds
+    python scripts/turn_features_probe.py \
+        --labels-file data/labels_r01pcat.csv \
+        --turn-dir  data/turntaking_features_r01 \
+        --video-dir data/dinov2_features_meanpatch_r01pcat \
+        --audio-dir data/wavlm_baseplus_features_r01pcat
 """
 
 from __future__ import annotations
@@ -78,6 +96,27 @@ def predict(X: np.ndarray, w: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(np.hstack([X, np.ones((len(X), 1))]) @ w, -30, 30)))
 
 
+def load_pt_dir(feature_dir: Path, keys: list[tuple[str, int]]):
+    """Mean-pool each window's .pt over frames -> (n, D). Frame-mean keeps the
+    dimensionality at the encoder width instead of frames x width, which at this
+    sample size is the difference between a fit and a memorisation."""
+    import torch  # lazy: only video/audio need it
+    idx = {}
+    for r in csv.DictReader(open(feature_dir / "feature_index.csv")):
+        idx[(r["video_path"], int(float(r["second"])))] = r["feature_file"]
+    out, miss = [], 0
+    for k in keys:
+        f = idx.get(k)
+        if f is None:
+            out.append(None)
+            miss += 1
+            continue
+        x = torch.load(feature_dir / "features" / f, map_location="cpu",
+                       weights_only=True).detach().float().numpy()
+        out.append(x.reshape(x.shape[0], -1).mean(0) if x.ndim >= 2 else x.ravel())
+    return out, miss
+
+
 def load(feature_dir: Path, labels_file: Path):
     meta = json.load(open(feature_dir / "features_meta.json"))
     shape = tuple(meta["shape"])
@@ -102,7 +141,10 @@ def load(feature_dir: Path, labels_file: Path):
     if not rows:
         raise SystemExit("ERROR: no labelled second joined to a feature row.")
     X = np.asarray(packed[rows], dtype=np.float64).reshape(len(rows), -1)
-    return X, np.asarray(ys), np.asarray(subs), meta, n_lab, n_miss
+    keys = [(r["video_path"], int(r["second"]))
+            for r in csv.DictReader(open(labels_file))
+            if (r["video_path"], int(r["second"])) in idx]
+    return X, np.asarray(ys), np.asarray(subs), meta, n_lab, n_miss, keys
 
 
 def loso(X, y, subs, l2, iters, lr, rng=None, shuffle="within"):
@@ -143,8 +185,10 @@ def loso(X, y, subs, l2, iters, lr, rng=None, shuffle="within"):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--feature-dir", required=True)
+    ap.add_argument("--turn-dir", "--feature-dir", dest="turn_dir", required=True)
     ap.add_argument("--labels-file", required=True)
+    ap.add_argument("--video-dir", help="DINOv2 dir; adds a video-only and a combined arm.")
+    ap.add_argument("--audio-dir", help="WavLM dir; adds an audio-only arm.")
     ap.add_argument("--l2", type=float, default=1.0)
     ap.add_argument("--iters", type=int, default=400)
     ap.add_argument("--lr", type=float, default=0.5)
@@ -152,21 +196,53 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
-    X, y, subs, meta, n_lab, n_miss = load(Path(args.feature_dir), Path(args.labels_file))
+    X, y, subs, meta, n_lab, n_miss, keys = load(Path(args.turn_dir), Path(args.labels_file))
     print(f"joined {len(y):,}/{n_lab:,} labelled seconds "
           f"({n_miss:,} had no turn features) across {len(set(subs))} subjects")
     print(f"features: {X.shape[1]} dims = {meta['shape'][1]} sec x {meta['shape'][2]} channels")
     print(f"overall synchronous rate: {y.mean():.3f}\n")
 
-    res, ps, py = loso(X, y, subs, args.l2, args.iters, args.lr)
+    arms = {"turn": X}
+    for name, d in (("video", args.video_dir), ("audio", args.audio_dir)):
+        if not d:
+            continue
+        vecs, _ = load_pt_dir(Path(d), keys)
+        keep = [i for i, v in enumerate(vecs) if v is not None]
+        if len(keep) != len(vecs):
+            print(f"NOTE: {name}: {len(vecs) - len(keep)} of {len(vecs)} labelled seconds "
+                  f"had no feature row; dropping from EVERY arm so all arms are "
+                  f"scored on identical rows.")
+            X = X[keep]; y = y[keep]; subs = subs[keep]
+            keys = [keys[i] for i in keep]
+            arms = {k: v[keep] for k, v in arms.items()}
+            vecs = [vecs[i] for i in keep]
+        arms[name] = np.asarray(vecs, dtype=np.float64)
+    if "video" in arms:
+        arms["video+turn"] = np.hstack([arms["video"], arms["turn"]])
+    if "video" in arms and "audio" in arms:
+        arms["video+audio+turn"] = np.hstack([arms["video"], arms["audio"], arms["turn"]])
+
+    print(f"{'arm':20s} {'dims':>6s} {'mean AUC':>9s} {'sd':>7s} {'pooled':>8s}")
+    summary = {}
+    for name, Xa in arms.items():
+        r, ps, py = loso(Xa, y, subs, args.l2, args.iters, args.lr)
+        a = np.array([v for *_, v in r], dtype=float)
+        summary[name] = (a[~np.isnan(a)], r)
+        print(f"{name:20s} {Xa.shape[1]:6d} {summary[name][0].mean():9.4f} "
+              f"{summary[name][0].std():7.4f} {auc(py, ps):8.4f}")
+
+    ok, res = summary["turn"]
+    print(f"\nper-subject detail, turn arm:")
     print(f"{'subject':14s} {'n':>6s} {'sync%':>6s} {'AUC':>7s}")
     for s, n, bal, a in res:
-        print(f"{s:14s} {n:6d} {bal:6.3f} {a:7.3f}" + ("   (single-class, AUC undefined)" if a != a else ""))
+        print(f"{s:14s} {n:6d} {bal:6.3f} {a:7.3f}")
 
-    aucs = np.array([a for *_, a in res], dtype=float)
-    ok = aucs[~np.isnan(aucs)]
-    print(f"\nper-subject mean AUC : {ok.mean():.4f} +/- {ok.std():.4f}  (n={len(ok)} evaluable)")
-    print(f"pooled held-out AUC  : {auc(py, ps):.4f}")
+    if "video+turn" in summary:
+        d = summary["video+turn"][0] - summary["video"][0]
+        print(f"\nper-subject delta (video+turn) - video : {d.mean():+.4f} +/- {d.std():.4f}"
+              f"   ({int((d > 0).sum())}/{len(d)} subjects improved)")
+        print("  positive => turn structure is ADDITIVE to video; "
+              "~0 => redundant, as WavLM and prosody were")
 
     rng = np.random.default_rng(args.seed)
     nulls = {}
