@@ -1,12 +1,12 @@
 #!/bin/bash
-SCRIPT_VERSION="pre_newstudy_features-v1"
+SCRIPT_VERSION="pre_newstudy_features-v2"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
-#BSUB -M 99000000
+#BSUB -M 16000000
 #BSUB -a 'docker(continuumio/anaconda3)'
-#BSUB -n 40
-#BSUB -R 'select[mem>99GB && tmp>99GB] rusage[mem=99GB, tmp=99GB] span[hosts=1]'
+#BSUB -n 8
+#BSUB -R 'select[mem>16GB && tmp>20GB] rusage[mem=16GB, tmp=20GB] span[hosts=1]'
 #BSUB -J synchronai-newstudy-features
 #BSUB -oo /storage1/fs1/perlmansusan/Active/moochie/github/synchronAI/scripts/bsub/logs/newstudy_features_%J.log
 
@@ -28,6 +28,11 @@ SCRIPT_VERSION="pre_newstudy_features-v1"
 #   data/dinov2_features_meanpatch_${TAG}/
 #   data/wavlm_baseplus_features_${TAG}/
 #
+# v2: right-sized from 40 cores/99GB mem/99GB tmp, which PENDed indefinitely.
+# Measured need: models ~0.72GB (DINOv2-base 86M + WavLM-base-plus 94M, fp32),
+# one whole-recording audio load ~134MB at 16kHz float32, and 2.2GB of output
+# features for the full 11.7k-window R01 run. 16GB/20GB tmp is generous.
+#
 # span[hosts=1] + OMP: DINOv2-base and WavLM-base-plus are transformers; per-item
 # forward pass is heavy CPU work that needs intra-process threading. Fragmented
 # slots strand cores on remote hosts (see CLAUDE.md "LSF -n fragmentation").
@@ -45,8 +50,9 @@ NEWSTUDY_TAG="${NEWSTUDY_TAG:-emogrow}"
 export HF_HOME="/storage1/fs1/perlmansusan/Active/moochie/resources/huggingface"
 mkdir -p "$HF_HOME"
 export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
-export OMP_NUM_THREADS=40
-export MKL_NUM_THREADS=40
+NPROC="${LSB_DJOB_NUMPROC:-8}"
+export OMP_NUM_THREADS="$NPROC"
+export MKL_NUM_THREADS="$NPROC"
 
 echo "=== [$SCRIPT_VERSION] ==="
 echo "NEWSTUDY_LABELS=$NEWSTUDY_LABELS  NEWSTUDY_TAG=$NEWSTUDY_TAG"
