@@ -20,8 +20,9 @@ SCRIPT_VERSION="pre_newstudy_features-v1"
 #
 # Parameterised by two env vars (set before `bsub < ...`, LSF_DOCKER... or
 # hardcode). Defaults to EmoGrow.
-#   NEWSTUDY_LABELS : labels csv under data/   (labels_emogrow.csv | labels_r56pcat.csv)
-#   NEWSTUDY_TAG    : suffix for output dirs   (emogrow | r56pcat)
+#   NEWSTUDY_LABELS : labels csv under data/   (labels_emogrow.csv | labels_r56pcat.csv
+#                                               | labels_r01pcat.csv | labels_r01pcat_smoke.csv)
+#   NEWSTUDY_TAG    : suffix for output dirs   (emogrow | r56pcat | r01pcat | r01pcat_smoke)
 #
 # Outputs:
 #   data/dinov2_features_meanpatch_${TAG}/
