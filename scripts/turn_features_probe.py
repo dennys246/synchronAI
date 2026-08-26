@@ -77,19 +77,54 @@ def auc(y: np.ndarray, s: np.ndarray) -> float:
     return (ranks[pos].sum() - n1 * (n1 + 1) / 2) / (n1 * n0)
 
 
-def fit_logreg(X: np.ndarray, y: np.ndarray, l2: float, iters: int, lr: float) -> np.ndarray:
-    """Plain L2 logistic regression by gradient descent. Bias is not penalised."""
-    w = np.zeros(X.shape[1] + 1)
+def _step_size(Xb: np.ndarray, l2: float) -> float:
+    """1/L for logistic loss: L <= 0.25 * lambda_max(Xb^T Xb)/n + l2.
+
+    A fixed learning rate cannot work across arms: with standardised features
+    lambda_max grows with dimensionality, so a rate that is stable at 99 dims
+    diverges to inf/NaN at 1635 and the fit silently returns garbage. Power
+    iteration gives lambda_max cheaply.
+    """
+    n = len(Xb)
+    v = np.ones(Xb.shape[1]) / np.sqrt(Xb.shape[1])
+    lam = 1.0
+    for _ in range(20):
+        u = Xb.T @ (Xb @ v)
+        nrm = np.linalg.norm(u)
+        if nrm < 1e-12:
+            break
+        v = u / nrm
+        lam = nrm
+    return 1.0 / (0.25 * lam / n + l2 + 1e-12)
+
+
+def fit_logreg(X: np.ndarray, y: np.ndarray, l2: float, iters: int, lr: float | None = None) -> np.ndarray:
+    """L2 logistic regression by gradient descent with a data-derived step.
+
+    `lr` is ignored unless explicitly given; the default step comes from
+    _step_size so every arm is optimised comparably rather than one being
+    tuned and the rest diverging.
+    """
     Xb = np.hstack([X, np.ones((len(X), 1))])
+    step = _step_size(Xb, l2) if lr is None else lr
     # class weights so a 1.8%-synchronous subject does not collapse to the prior
     n1, n0 = max(int((y == 1).sum()), 1), max(int((y == 0).sum()), 1)
     sw = np.where(y == 1, len(y) / (2 * n1), len(y) / (2 * n0))
-    for _ in range(iters):
-        p = 1.0 / (1.0 + np.exp(-np.clip(Xb @ w, -30, 30)))
-        g = Xb.T @ (sw * (p - y)) / len(y)
-        g[:-1] += l2 * w[:-1]
-        w -= lr * g
-    return w
+    for attempt in range(4):
+        w = np.zeros(Xb.shape[1])
+        ok = True
+        for _ in range(iters):
+            p = 1.0 / (1.0 + np.exp(-np.clip(Xb @ w, -30, 30)))
+            g = Xb.T @ (sw * (p - y)) / len(y)
+            g[:-1] += l2 * w[:-1]
+            w -= step * g
+            if not np.all(np.isfinite(w)):
+                ok = False
+                break
+        if ok:
+            return w
+        step *= 0.1          # diverged: back off and retry rather than return NaN
+    return np.zeros(Xb.shape[1])
 
 
 def predict(X: np.ndarray, w: np.ndarray) -> np.ndarray:
@@ -156,7 +191,7 @@ def pick_l2(X, y, subs, grid, iters, lr):
     'this arm was mis-regularised'. Selection never sees the held-out subject.
     """
     us = sorted(set(subs))
-    folds = [us[i::4] for i in range(4)]
+    folds = [us[i::3] for i in range(3)]
     best, best_a = grid[0], -1.0
     for l2 in grid:
         aucs = []
@@ -166,7 +201,7 @@ def pick_l2(X, y, subs, grid, iters, lr):
                 continue
             mu, sd = X[~te].mean(0), X[~te].std(0)
             sd[sd < 1e-8] = 1.0
-            w = fit_logreg((X[~te] - mu) / sd, y[~te], l2, iters, lr)
+            w = fit_logreg((X[~te] - mu) / sd, y[~te], l2, iters, None)
             aucs.append(auc(y[te], predict((X[te] - mu) / sd, w)))
         a = np.nanmean(aucs) if aucs else float("nan")
         if a == a and a > best_a:
@@ -204,7 +239,7 @@ def loso(X, y, subs, l2, iters, lr, rng=None, shuffle="within", l2_grid=None):
                     yt[m] = rng.permutation(yt[m])
         mu, sd = X[tr].mean(0), X[tr].std(0)
         sd[sd < 1e-8] = 1.0
-        w = fit_logreg((X[tr] - mu) / sd, yt, l2, iters, lr)
+        w = fit_logreg((X[tr] - mu) / sd, yt, l2, iters, None)
         p = predict((X[te] - mu) / sd, w)
         out.append((s, int(te.sum()), float(y[te].mean()), auc(y[te], p)))
         pooled_s.append(p)
@@ -221,10 +256,11 @@ def main() -> int:
     ap.add_argument("--video-dir", help="DINOv2 dir; adds a video-only and a combined arm.")
     ap.add_argument("--audio-dir", help="WavLM dir; adds an audio-only arm.")
     ap.add_argument("--l2", type=float, default=1.0)
-    ap.add_argument("--l2-grid", default="0.03,0.3,3,30,300",
+    ap.add_argument("--l2-grid", default="0.3,3,30",
                     help="Per-arm L2 chosen by inner CV. Empty string = use --l2 for all arms.")
-    ap.add_argument("--iters", type=int, default=400)
-    ap.add_argument("--lr", type=float, default=0.5)
+    ap.add_argument("--iters", type=int, default=800)
+    ap.add_argument("--lr", type=float, default=None,
+                    help="Override the data-derived step size. Leave unset.")
     ap.add_argument("--n-perm", type=int, default=20, help="Permutation-null repeats.")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
