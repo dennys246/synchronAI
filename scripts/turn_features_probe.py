@@ -147,7 +147,34 @@ def load(feature_dir: Path, labels_file: Path):
     return X, np.asarray(ys), np.asarray(subs), meta, n_lab, n_miss, keys
 
 
-def loso(X, y, subs, l2, iters, lr, rng=None, shuffle="within"):
+def pick_l2(X, y, subs, grid, iters, lr):
+    """Choose L2 by inner CV over TRAINING subjects only.
+
+    A single L2 across arms of 99 vs 1635 dims is not a fair comparison: the
+    wide arms end up under-regularised against ~14 effective samples and score
+    below chance, which reads as 'this modality is useless' when it only means
+    'this arm was mis-regularised'. Selection never sees the held-out subject.
+    """
+    us = sorted(set(subs))
+    folds = [us[i::4] for i in range(4)]
+    best, best_a = grid[0], -1.0
+    for l2 in grid:
+        aucs = []
+        for f in folds:
+            te = np.isin(subs, f)
+            if te.all() or not te.any():
+                continue
+            mu, sd = X[~te].mean(0), X[~te].std(0)
+            sd[sd < 1e-8] = 1.0
+            w = fit_logreg((X[~te] - mu) / sd, y[~te], l2, iters, lr)
+            aucs.append(auc(y[te], predict((X[te] - mu) / sd, w)))
+        a = np.nanmean(aucs) if aucs else float("nan")
+        if a == a and a > best_a:
+            best, best_a = l2, a
+    return best
+
+
+def loso(X, y, subs, l2, iters, lr, rng=None, shuffle="within", l2_grid=None):
     """Leave-one-subject-out. Returns per-subject AUCs and pooled held-out scores.
 
     Each fold's AUC is computed inside ONE held-out subject, so it measures
@@ -160,10 +187,13 @@ def loso(X, y, subs, l2, iters, lr, rng=None, shuffle="within"):
     because a model can still learn a valid feature->base-rate mapping from
     between-subject variation. Report it as a training-regime comparison only.
     """
-    out, pooled_s, pooled_y = [], [], []
+    out, pooled_s, pooled_y, chosen = [], [], [], []
     for s in sorted(set(subs)):
         te = subs == s
         tr = ~te
+        if l2_grid is not None:
+            l2 = pick_l2(X[tr], y[tr], subs[tr], l2_grid, iters, lr)
+            chosen.append(l2)
         yt = y[tr].copy()
         if rng is not None:
             if shuffle == "global":
@@ -179,6 +209,7 @@ def loso(X, y, subs, l2, iters, lr, rng=None, shuffle="within"):
         out.append((s, int(te.sum()), float(y[te].mean()), auc(y[te], p)))
         pooled_s.append(p)
         pooled_y.append(y[te])
+    loso.last_l2 = chosen
     return out, np.concatenate(pooled_s), np.concatenate(pooled_y)
 
 
@@ -190,6 +221,8 @@ def main() -> int:
     ap.add_argument("--video-dir", help="DINOv2 dir; adds a video-only and a combined arm.")
     ap.add_argument("--audio-dir", help="WavLM dir; adds an audio-only arm.")
     ap.add_argument("--l2", type=float, default=1.0)
+    ap.add_argument("--l2-grid", default="0.03,0.3,3,30,300",
+                    help="Per-arm L2 chosen by inner CV. Empty string = use --l2 for all arms.")
     ap.add_argument("--iters", type=int, default=400)
     ap.add_argument("--lr", type=float, default=0.5)
     ap.add_argument("--n-perm", type=int, default=20, help="Permutation-null repeats.")
@@ -222,14 +255,16 @@ def main() -> int:
     if "video" in arms and "audio" in arms:
         arms["video+audio+turn"] = np.hstack([arms["video"], arms["audio"], arms["turn"]])
 
-    print(f"{'arm':20s} {'dims':>6s} {'mean AUC':>9s} {'sd':>7s} {'pooled':>8s}")
+    print(f"{'arm':20s} {'dims':>6s} {'mean AUC':>9s} {'sd':>7s} {'pooled':>8s} {'med L2':>9s}")
     summary = {}
+    grid = [float(v) for v in args.l2_grid.split(",")] if args.l2_grid.strip() else None
     for name, Xa in arms.items():
-        r, ps, py = loso(Xa, y, subs, args.l2, args.iters, args.lr)
+        r, ps, py = loso(Xa, y, subs, args.l2, args.iters, args.lr, l2_grid=grid)
         a = np.array([v for *_, v in r], dtype=float)
         summary[name] = (a[~np.isnan(a)], r)
+        med = np.median(loso.last_l2) if grid else args.l2
         print(f"{name:20s} {Xa.shape[1]:6d} {summary[name][0].mean():9.4f} "
-              f"{summary[name][0].std():7.4f} {auc(py, ps):8.4f}")
+              f"{summary[name][0].std():7.4f} {auc(py, ps):8.4f} {med:9.3g}")
 
     ok, res = summary["turn"]
     print(f"\nper-subject detail, turn arm:")
