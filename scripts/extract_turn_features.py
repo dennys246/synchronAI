@@ -157,6 +157,40 @@ def timelines(intervals: list, lo: int, hi: int) -> np.ndarray:
     return out
 
 
+def corrupt(p_act, c_act, covered, der, rng):
+    """Inject diarization-style errors into perfect speaker VAD.
+
+    The turn features are a CEILING because the speaker labels are human. To ask
+    "would a real diarizer be good enough", degrade the labels to a target DER
+    and re-measure. DER's three components are applied at der/3 each, relative
+    to speech time:
+      confusion   - the segment is attributed to the wrong speaker
+      miss        - speech marked as silence
+      false alarm - silence marked as speech
+    Returns (p, c, realised_der).
+    """
+    p, c = p_act.copy(), c_act.copy()
+    r = der / 3.0
+    speech = (p | c) & covered
+    n_speech = max(int(speech.sum()), 1)
+
+    conf = speech & (rng.random(len(p)) < r)          # swap the two channels
+    p[conf], c[conf] = c_act[conf], p_act[conf]
+
+    miss = speech & (rng.random(len(p)) < r)
+    p[miss] = False
+    c[miss] = False
+
+    sil = covered & ~(p_act | c_act)
+    fa = sil & (rng.random(len(p)) < r * n_speech / max(int(sil.sum()), 1))
+    to_p = rng.random(len(p)) < 0.5
+    p[fa & to_p] = True
+    c[fa & ~to_p] = True
+
+    err = int((conf | miss).sum()) + int(fa.sum())
+    return p, c, err / n_speech
+
+
 def build_record(p_act: np.ndarray, c_act: np.ndarray, covered: np.ndarray) -> np.ndarray:
     """Stack the 9 per-second channels for a whole record."""
     ch = np.zeros((len(p_act), N_CHANNELS), dtype=np.float32)
@@ -184,6 +218,10 @@ def main() -> int:
     ap.add_argument("--video-root", default=VIDEO_ROOT)
     ap.add_argument("--window", type=int, default=5,
                     help="Half-width in seconds; entry is (2*window+1, 9). Default 5.")
+    ap.add_argument("--corrupt-der", type=float, default=0.0,
+                    help="Degrade the human speaker labels to this DER to simulate a "
+                         "real diarizer. 0 = use the human labels unchanged.")
+    ap.add_argument("--corrupt-seed", type=int, default=0)
     ap.add_argument("--require-video", action="store_true",
                     help="Skip records with no resolvable recording (default: keep, "
                          "with an empty video_path, so coding-only records stay usable).")
@@ -198,7 +236,7 @@ def main() -> int:
     records = sorted(set(speech) | set(trials))
     logger.info("Records with verbal coding: %d", len(records))
 
-    per_record, index_rows, no_video = {}, [], []
+    per_record, index_rows, no_video, realised_ders = {}, [], [], []
     for rid in records:
         if not trials[rid]:
             logger.warning("%s: no Trial rows, skipping (no authoritative coded span)", rid)
@@ -207,11 +245,13 @@ def main() -> int:
         covered = timelines(trials[rid], 0, hi)
         if not covered.any():
             continue
-        ch = build_record(
-            timelines(speech[rid][PARENT], 0, hi),
-            timelines(speech[rid][CHILD], 0, hi),
-            covered,
-        )
+        p_act = timelines(speech[rid][PARENT], 0, hi)
+        c_act = timelines(speech[rid][CHILD], 0, hi)
+        if args.corrupt_der > 0:
+            p_act, c_act, realised = corrupt(p_act, c_act, covered, args.corrupt_der,
+                                             np.random.default_rng(args.corrupt_seed + int(rid)))
+            realised_ders.append(realised)
+        ch = build_record(p_act, c_act, covered)
         vpath = resolve_video(rid, video_root)
         if vpath is None:
             no_video.append(rid)
@@ -264,6 +304,9 @@ def main() -> int:
 
     mb = n * W * N_CHANNELS * 4 / 1e6
     logger.info("Wrote %d entries (%.1f MB) to %s", n, mb, out)
+    if realised_ders:
+        logger.info("Simulated diarizer: target DER %.2f, realised %.3f +/- %.3f",
+                    args.corrupt_der, float(np.mean(realised_ders)), float(np.std(realised_ders)))
     logger.info("Records packed: %d; without a resolvable recording: %d %s",
                 len(per_record), len(no_video), no_video[:10] if no_video else "")
     return 0
