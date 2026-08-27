@@ -1,0 +1,96 @@
+#!/bin/bash
+SCRIPT_VERSION="diarize_r01-v1"
+#BSUB -G compute-perlmansusan
+#BSUB -q general
+#BSUB -m general
+#BSUB -M 16000000
+#BSUB -a 'docker(continuumio/anaconda3)'
+#BSUB -n 8
+#BSUB -R 'select[mem>16GB && tmp>20GB] rusage[mem=16GB, tmp=20GB] span[hosts=1]'
+#BSUB -J synchronai-diarize-r01
+#BSUB -oo /storage1/fs1/perlmansusan/Active/moochie/github/synchronAI/scripts/bsub/logs/diarize_r01_%J.log
+
+# =============================================================================
+# Run pyannote speaker diarization on P-CAT R01 DB-DOS recordings, then score it
+# against the human verbal VAD.
+#
+# Why: docs/results/turn_structure_probe.md shows turn structure survives
+# SIMULATED diarization error (0.709 -> 0.680 at ~28% DER), but that simulation
+# injects i.i.d. per-second errors. Real errors are bursty. This measures the
+# real DER and its run-length structure on records that already have human VAD.
+#
+# Two findings from that probe simplify the job:
+#   * only SEPARATION matters, not identity -> num_speakers=2, no child/adult
+#     classifier, no Voice Type Classification stage
+#   * R01 "stereo" is duplicated mono (measured) -> the ffmpeg downmix is lossless
+#
+# Env vars:
+#   DIAR_RECORDS : space-separated record IDs   (default: one smoke record)
+#   DIAR_OUT     : output dir                   (default: data/diarization_r01)
+#   HF_TOKEN     : REQUIRED. pyannote's models are gated; accept the terms at
+#                  huggingface.co/pyannote/speaker-diarization-3.1 and
+#                  huggingface.co/pyannote/segmentation-3.0 first.
+#
+# Deps live in a SEPARATE venv (diar-env), not ml-env: pyannote pins torch and
+# would break it, exactly as openSMILE did before prosodic-env was split out.
+# CLAUDE.md bans pip install into the shared ml-env for that reason.
+#
+# Resources: pyannote-3.1 on CPU is ~30M params; peak is the model plus one
+# decoded recording (~35 min at 16 kHz mono = 34 MB). 16GB is generous. Threads
+# follow LSB_DJOB_NUMPROC so a -n override can't desync them.
+# =============================================================================
+
+export SYNCHRONAI_DIR="/storage1/fs1/perlmansusan/Active/moochie/github/synchronAI"
+cd "$SYNCHRONAI_DIR" || exit 1
+
+DIAR_RECORDS="${DIAR_RECORDS:-11002}"
+DIAR_OUT="${DIAR_OUT:-data/diarization_r01}"
+VERBAL_CSV="${VERBAL_CSV:-verbal_pcat_r01_07-27-2026.csv}"
+DIAR_ENV="$SYNCHRONAI_DIR/diar-env"
+
+# Per-job HOME on storage1: torch/pyannote write caches under $HOME, and the RIS
+# home quota has crashed jobs (Errno 122) and hung them on NFS lock contention.
+export HOME="$SYNCHRONAI_DIR/.jobhome/diarize_${LSB_JOBID:-local}"
+mkdir -p "$HOME"
+export HF_HOME="/storage1/fs1/perlmansusan/Active/moochie/resources/huggingface"
+mkdir -p "$HF_HOME"
+export PYTHONPATH="$SYNCHRONAI_DIR/src:$SYNCHRONAI_DIR:$PYTHONPATH"
+NPROC="${LSB_DJOB_NUMPROC:-8}"
+export OMP_NUM_THREADS="$NPROC"
+export MKL_NUM_THREADS="$NPROC"
+
+echo "=== [$SCRIPT_VERSION] ==="
+echo "records=$DIAR_RECORDS"
+echo "out=$DIAR_OUT  threads=$NPROC  HOME=$HOME"
+
+if [ -z "$HF_TOKEN" ]; then
+    echo "ERROR: HF_TOKEN is unset. pyannote's models are gated — accept the licences"
+    echo "       and export a read token before submitting. Aborting."
+    exit 2
+fi
+
+# --- one-time env bootstrap (serial: do NOT run two of these concurrently) ---
+if [ ! -x "$DIAR_ENV/bin/python" ]; then
+    echo "=== creating diar-env (one-time) ==="
+    python -m venv "$DIAR_ENV" || exit 1
+    "$DIAR_ENV/bin/pip" install --quiet --upgrade pip || exit 1
+    "$DIAR_ENV/bin/pip" install --quiet "pyannote.audio>=3.1" || exit 1
+fi
+DIAR_PY="$DIAR_ENV/bin/python"
+
+"$DIAR_PY" -c "import pyannote.audio, torch; print('pyannote', pyannote.audio.__version__, 'torch', torch.__version__)"
+rc=$?
+if [ $rc -ne 0 ]; then echo "ERROR: diar-env import check failed (rc=$rc)"; exit $rc; fi
+
+echo "=== [1/2] diarizing ==="
+"$DIAR_PY" scripts/diarize_recordings.py --records $DIAR_RECORDS --out "$DIAR_OUT" \
+    --scratch "${TMPDIR:-/tmp}"
+rc=$?
+if [ $rc -ne 0 ]; then echo "ERROR: diarization failed (rc=$rc)"; exit $rc; fi
+
+echo "=== [2/2] scoring against human VAD ==="
+"$DIAR_PY" scripts/score_diarization.py --diar-dir "$DIAR_OUT" --verbal-csv "$VERBAL_CSV"
+rc=$?
+if [ $rc -ne 0 ]; then echo "ERROR: scoring failed (rc=$rc)"; exit $rc; fi
+
+echo "=== [$SCRIPT_VERSION] complete ==="
