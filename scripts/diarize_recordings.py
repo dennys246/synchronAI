@@ -91,7 +91,10 @@ def to_wav(video: str, wav: Path, sr: int = 16000) -> None:
 
 
 def diarize(wav: Path, pipeline) -> tuple[np.ndarray, int]:
-    ann = pipeline({"uri": wav.stem, "audio": str(wav)}, num_speakers=2)
+    out = pipeline({"uri": wav.stem, "audio": str(wav)}, num_speakers=2)
+    # pyannote 4.x returns a result object wrapping the Annotation; 3.x returns
+    # the Annotation directly.
+    ann = getattr(out, "speaker_diarization", out)
     segs = [(s.start, s.end, spk) for s, _, spk in ann.itertracks(yield_label=True)]
     if not segs:
         return np.zeros((0, 2), dtype=bool), 0
@@ -141,8 +144,22 @@ def main() -> int:
     logger.info("HF token loaded from %s (%d chars)", src, len(token))
 
     from pyannote.audio import Pipeline
-    logger.info("Loading %s (CPU)", args.model)
-    pipeline = Pipeline.from_pretrained(args.model, use_auth_token=token)
+    import pyannote.audio as _pa
+    logger.info("Loading %s (pyannote %s, CPU)", args.model,
+                getattr(_pa, "__version__", "?"))
+    # pyannote 4.x renamed use_auth_token -> token. Try the new name first and
+    # fall back, so this works on both without pinning a major version.
+    try:
+        pipeline = Pipeline.from_pretrained(args.model, token=token)
+    except TypeError:
+        pipeline = Pipeline.from_pretrained(args.model, use_auth_token=token)
+    if pipeline is None:
+        raise SystemExit(
+            "ERROR: Pipeline.from_pretrained returned None — this is what pyannote\n"
+            "       does when the token is valid but the gated model terms have NOT\n"
+            "       been accepted. Accept them at\n"
+            "         huggingface.co/pyannote/speaker-diarization-3.1\n"
+            "         huggingface.co/pyannote/segmentation-3.0")
 
     n_ok = n_skip = n_fail = 0
     for rid in recs:
