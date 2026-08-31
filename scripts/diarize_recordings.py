@@ -25,6 +25,9 @@ Requires pyannote.audio and a HF token with the gated models accepted:
     huggingface.co/pyannote/speaker-diarization-3.1
     huggingface.co/pyannote/segmentation-3.0
 
+The token is read from $HF_TOKEN, else from --token-file (default
+secrets/.hf_token, which is git-ignored). It is never logged.
+
 Usage:
     python scripts/diarize_recordings.py --records 11002 --out data/diarization_r01
     python scripts/diarize_recordings.py --records-file recs.txt --out data/diarization_r01
@@ -112,19 +115,30 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--model", default="pyannote/speaker-diarization-3.1")
     ap.add_argument("--scratch", default=os.environ.get("TMPDIR", "/tmp"))
+    ap.add_argument("--token-file", default="secrets/.hf_token",
+                    help="Fallback HF token file, used when $HF_TOKEN is unset.")
     args = ap.parse_args()
 
     recs = args.records or [l.strip() for l in open(args.records_file) if l.strip()]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    token = (os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or "").strip()
+    src = "$HF_TOKEN"
+    if not token:
+        tf = Path(args.token_file)
+        if tf.is_file():
+            # .strip() matters: a trailing newline from `echo >` makes the token
+            # invalid and HF reports it as a 401, which reads like a bad token.
+            token = tf.read_text().strip()
+            src = str(tf)
     if not token:
         raise SystemExit(
-            "ERROR: HF_TOKEN not set. pyannote's models are gated — accept the terms at\n"
-            "  huggingface.co/pyannote/speaker-diarization-3.1\n"
-            "  huggingface.co/pyannote/segmentation-3.0\n"
-            "then export a read token as HF_TOKEN.")
+            f"ERROR: no HF token. Set $HF_TOKEN or put one in {args.token_file}.\n"
+            "       pyannote's models are gated — accept the terms at\n"
+            "         huggingface.co/pyannote/speaker-diarization-3.1\n"
+            "         huggingface.co/pyannote/segmentation-3.0")
+    logger.info("HF token loaded from %s (%d chars)", src, len(token))
 
     from pyannote.audio import Pipeline
     logger.info("Loading %s (CPU)", args.model)

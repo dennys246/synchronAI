@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="diarize_r01-v1"
+SCRIPT_VERSION="diarize_r01-v2"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -27,9 +27,12 @@ SCRIPT_VERSION="diarize_r01-v1"
 # Env vars:
 #   DIAR_RECORDS : space-separated record IDs   (default: one smoke record)
 #   DIAR_OUT     : output dir                   (default: data/diarization_r01)
-#   HF_TOKEN     : REQUIRED. pyannote's models are gated; accept the terms at
+#   HF_TOKEN     : optional. If unset, the token is read from HF_TOKEN_FILE.
+#   HF_TOKEN_FILE: default secrets/.hf_token (git-ignored). pyannote's models are
+#                  gated; accept the terms at
 #                  huggingface.co/pyannote/speaker-diarization-3.1 and
 #                  huggingface.co/pyannote/segmentation-3.0 first.
+#                  The token is passed to python by path, never echoed.
 #
 # Deps live in a SEPARATE venv (diar-env), not ml-env: pyannote pins torch and
 # would break it, exactly as openSMILE did before prosodic-env was split out.
@@ -63,10 +66,16 @@ echo "=== [$SCRIPT_VERSION] ==="
 echo "records=$DIAR_RECORDS"
 echo "out=$DIAR_OUT  threads=$NPROC  HOME=$HOME"
 
-if [ -z "$HF_TOKEN" ]; then
-    echo "ERROR: HF_TOKEN is unset. pyannote's models are gated — accept the licences"
-    echo "       and export a read token before submitting. Aborting."
+HF_TOKEN_FILE="${HF_TOKEN_FILE:-$SYNCHRONAI_DIR/secrets/.hf_token}"
+if [ -z "$HF_TOKEN" ] && [ ! -f "$HF_TOKEN_FILE" ]; then
+    echo "ERROR: no HF token — \$HF_TOKEN is unset and $HF_TOKEN_FILE does not exist."
+    echo "       pyannote's models are gated; accept the licences and provide a read token."
     exit 2
+fi
+if [ -n "$HF_TOKEN" ]; then
+    echo "HF token: from \$HF_TOKEN"
+else
+    echo "HF token: from $HF_TOKEN_FILE"
 fi
 
 # --- one-time env bootstrap (serial: do NOT run two of these concurrently) ---
@@ -84,7 +93,7 @@ if [ $rc -ne 0 ]; then echo "ERROR: diar-env import check failed (rc=$rc)"; exit
 
 echo "=== [1/2] diarizing ==="
 "$DIAR_PY" scripts/diarize_recordings.py --records $DIAR_RECORDS --out "$DIAR_OUT" \
-    --scratch "${TMPDIR:-/tmp}"
+    --scratch "${TMPDIR:-/tmp}" --token-file "$HF_TOKEN_FILE"
 rc=$?
 if [ $rc -ne 0 ]; then echo "ERROR: diarization failed (rc=$rc)"; exit $rc; fi
 
