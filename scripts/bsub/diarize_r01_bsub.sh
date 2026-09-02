@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="diarize_r01-v3"
+SCRIPT_VERSION="diarize_r01-v4"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -34,9 +34,19 @@ SCRIPT_VERSION="diarize_r01-v3"
 #                  huggingface.co/pyannote/segmentation-3.0 first.
 #                  The token is passed to python by path, never echoed.
 #
-# Deps live in a SEPARATE venv (diar-env), not ml-env: pyannote pins torch and
+# Deps live in a SEPARATE venv (diar-env3), not ml-env: pyannote pins torch and
 # would break it, exactly as openSMILE did before prosodic-env was split out.
 # CLAUDE.md bans pip install into the shared ml-env for that reason.
+#
+# v4 pins pyannote.audio <4. The 4.x SpeakerDiarization class loads the 3.1
+# config and then pulls its own extra dependencies — a PLDA model from
+# pyannote/speaker-diarization-community-1, which is access-restricted with no
+# self-serve terms to accept, so it 403s and no amount of licence-clicking
+# fixes it. The 3.x pipeline class has no PLDA step and matches the
+# speaker-diarization-3.1 model card it was built for.
+#
+# New env PATH rather than deleting the old one: a batch job should not rm -rf a
+# shared directory. Reclaim the 4.x env manually with `rm -rf diar-env`.
 #
 # Resources: pyannote-3.1 on CPU is ~30M params; peak is the model plus one
 # decoded recording (~35 min at 16 kHz mono = 34 MB). 16GB is generous. Threads
@@ -49,7 +59,7 @@ cd "$SYNCHRONAI_DIR" || exit 1
 DIAR_RECORDS="${DIAR_RECORDS:-11002}"
 DIAR_OUT="${DIAR_OUT:-data/diarization_r01}"
 VERBAL_CSV="${VERBAL_CSV:-verbal_pcat_r01_07-27-2026.csv}"
-DIAR_ENV="$SYNCHRONAI_DIR/diar-env"
+DIAR_ENV="${DIAR_ENV:-$SYNCHRONAI_DIR/diar-env3}"
 
 # Per-job HOME on storage1: torch/pyannote write caches under $HOME, and the RIS
 # home quota has crashed jobs (Errno 122) and hung them on NFS lock contention.
@@ -83,13 +93,23 @@ if [ ! -x "$DIAR_ENV/bin/python" ]; then
     echo "=== creating diar-env (one-time) ==="
     python -m venv "$DIAR_ENV" || exit 1
     "$DIAR_ENV/bin/pip" install --quiet --upgrade pip || exit 1
-    "$DIAR_ENV/bin/pip" install --quiet "pyannote.audio>=3.1" || exit 1
+    "$DIAR_ENV/bin/pip" install --quiet "pyannote.audio>=3.1,<4" || exit 1
 fi
 DIAR_PY="$DIAR_ENV/bin/python"
 
-"$DIAR_PY" -c "import pyannote.audio, torch; print('pyannote', pyannote.audio.__version__, 'torch', torch.__version__)"
+"$DIAR_PY" - <<'PYCHK'
+import sys
+import pyannote.audio as pa, torch
+print("pyannote", pa.__version__, "torch", torch.__version__)
+major = int(pa.__version__.split(".")[0])
+if major >= 4:
+    sys.exit("ERROR: pyannote %s installed, but this pipeline needs 3.x — 4.x "
+             "requires the access-restricted speaker-diarization-community-1 PLDA "
+             "model. Remove %s and re-run to rebuild against the pin."
+             % (pa.__version__, sys.prefix))
+PYCHK
 rc=$?
-if [ $rc -ne 0 ]; then echo "ERROR: diar-env import check failed (rc=$rc)"; exit $rc; fi
+if [ $rc -ne 0 ]; then echo "ERROR: diar-env check failed (rc=$rc)"; exit $rc; fi
 
 echo "=== [1/2] diarizing ==="
 "$DIAR_PY" scripts/diarize_recordings.py --records $DIAR_RECORDS --out "$DIAR_OUT" \
