@@ -157,8 +157,18 @@ def main() -> int:
     os.environ["HUGGING_FACE_HUB_TOKEN"] = token
     try:
         pipeline = Pipeline.from_pretrained(args.model)
-    except TypeError:
-        # Only if some version insists on being handed one explicitly.
+    except TypeError as e:
+        # A TypeError naming use_auth_token comes from INSIDE pyannote, which
+        # passes it to hf_hub_download unconditionally. No calling convention
+        # here can avoid it — the two libraries are simply incompatible. Say so,
+        # rather than trying more spellings and burying the cause three
+        # tracebacks deep.
+        if "use_auth_token" in str(e):
+            raise SystemExit(
+                "ERROR: pyannote passes use_auth_token to hf_hub_download, which this "
+                "huggingface_hub has removed.\n"
+                "       These versions cannot work together. Pin huggingface_hub<1.0."
+            ) from e
         try:
             pipeline = Pipeline.from_pretrained(args.model, token=token)
         except TypeError:

@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="diarize_r01-v6"
+SCRIPT_VERSION="diarize_r01-v7"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -53,6 +53,11 @@ SCRIPT_VERSION="diarize_r01-v6"
 # 3.x predates and fails at import. The 2.2.x line is the newest that both
 # supports Python 3.12 (the anaconda3 image ships 3.12, and torch <2.2 has no
 # 3.12 wheels) and still exposes that attribute.
+#
+# v7 pins huggingface_hub <1.0. pyannote 3.x calls hf_hub_download with
+# use_auth_token UNCONDITIONALLY — not only when you hand it a token — and
+# huggingface_hub 1.0 removed that argument, so the pipeline cannot load at all
+# on the newer hub no matter how the caller authenticates.
 #
 # The pip step now runs on EVERY invocation, not only when the venv is absent —
 # otherwise a venv built with bad pins can never be corrected without deleting
@@ -109,7 +114,8 @@ fi
 # no reason to hold. Pure noise, but it has already cost debugging time once.
 echo "=== ensuring pinned deps ==="
 env -u PYTHONPATH "$DIAR_ENV/bin/pip" install --quiet \
-    "pyannote.audio>=3.1,<4" "torch>=2.2,<2.3" "torchaudio>=2.2,<2.3" || exit 1
+    "pyannote.audio>=3.1,<4" "torch>=2.2,<2.3" "torchaudio>=2.2,<2.3" \
+    "huggingface_hub<1.0" || exit 1
 DIAR_PY="$DIAR_ENV/bin/python"
 
 "$DIAR_PY" - <<'PYCHK'
