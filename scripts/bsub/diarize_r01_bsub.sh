@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="diarize_r01-v8"
+SCRIPT_VERSION="diarize_r01-v9"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -120,7 +120,7 @@ fi
 echo "=== ensuring pinned deps ==="
 env -u PYTHONPATH "$DIAR_ENV/bin/pip" install --quiet \
     "pyannote.audio>=3.1,<4" "torch>=2.2,<2.3" "torchaudio>=2.2,<2.3" \
-    "huggingface_hub<1.0" "numpy<2" || exit 1
+    "huggingface_hub<1.0" "numpy<2" "imageio-ffmpeg" || exit 1
 DIAR_PY="$DIAR_ENV/bin/python"
 
 "$DIAR_PY" - <<'PYCHK'
@@ -136,6 +136,9 @@ try:
 except RuntimeError as e:
     sys.exit("ERROR: torch.from_numpy failed (%s). torch %s needs numpy<2 — the "
              "2.x C ABI is incompatible." % (e, torch.__version__))
+sys.path.insert(0, "scripts")
+from diarize_recordings import ffmpeg_bin
+print("ffmpeg:", ffmpeg_bin())
 if not hasattr(torchaudio, "AudioMetaData"):
     sys.exit("ERROR: torchaudio %s has no AudioMetaData; pyannote 3.x needs it. "
              "Pin torchaudio lower." % torchaudio.__version__)

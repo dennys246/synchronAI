@@ -79,11 +79,32 @@ def resolve_video(record_id: str) -> str | None:
     return str(max(cands)[1]) if cands else None
 
 
+def ffmpeg_bin() -> str:
+    """Locate an ffmpeg binary.
+
+    The anaconda3 container LSF runs has none on PATH, so fall back to the
+    static build imageio-ffmpeg ships — already a declared [audio] extra in
+    pyproject and the same trick audio_synchrony_bsub.sh uses.
+    """
+    from shutil import which
+    exe = which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            "no ffmpeg on PATH and imageio-ffmpeg unavailable (%s); "
+            "pip install imageio-ffmpeg" % e
+        ) from e
+
+
 def to_wav(video: str, wav: Path, sr: int = 16000) -> None:
     """Decode to 16 kHz mono. R01 'stereo' is duplicated mono (measured), so the
     downmix is lossless here, not a compromise."""
     import subprocess
-    cmd = ["ffmpeg", "-v", "error", "-y", "-i", video,
+    cmd = [ffmpeg_bin(), "-v", "error", "-y", "-i", video,
            "-map", "0:a:0", "-ac", "1", "-ar", str(sr), str(wav)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not wav.exists():
