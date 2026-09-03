@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="diarize_r01-v7"
+SCRIPT_VERSION="diarize_r01-v8"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -53,6 +53,11 @@ SCRIPT_VERSION="diarize_r01-v7"
 # 3.x predates and fails at import. The 2.2.x line is the newest that both
 # supports Python 3.12 (the anaconda3 image ships 3.12, and torch <2.2 has no
 # 3.12 wheels) and still exposes that attribute.
+#
+# v8 pins numpy <2. torch 2.2.2 is compiled against the NumPy 1.x C ABI; with
+# NumPy 2.x installed, torch.from_numpy raises "Numpy is not available" deep
+# inside model construction (asteroid_filterbanks builds the SincNet filters
+# that way), which reads like a missing dependency rather than a version clash.
 #
 # v7 pins huggingface_hub <1.0. pyannote 3.x calls hf_hub_download with
 # use_auth_token UNCONDITIONALLY — not only when you hand it a token — and
@@ -115,7 +120,7 @@ fi
 echo "=== ensuring pinned deps ==="
 env -u PYTHONPATH "$DIAR_ENV/bin/pip" install --quiet \
     "pyannote.audio>=3.1,<4" "torch>=2.2,<2.3" "torchaudio>=2.2,<2.3" \
-    "huggingface_hub<1.0" || exit 1
+    "huggingface_hub<1.0" "numpy<2" || exit 1
 DIAR_PY="$DIAR_ENV/bin/python"
 
 "$DIAR_PY" - <<'PYCHK'
@@ -124,6 +129,13 @@ import pyannote.audio as pa, torch
 import torchaudio
 print("pyannote", pa.__version__, "torch", torch.__version__,
       "torchaudio", torchaudio.__version__)
+import numpy as _np
+print("numpy", _np.__version__)
+try:
+    torch.from_numpy(_np.zeros(1))
+except RuntimeError as e:
+    sys.exit("ERROR: torch.from_numpy failed (%s). torch %s needs numpy<2 — the "
+             "2.x C ABI is incompatible." % (e, torch.__version__))
 if not hasattr(torchaudio, "AudioMetaData"):
     sys.exit("ERROR: torchaudio %s has no AudioMetaData; pyannote 3.x needs it. "
              "Pin torchaudio lower." % torchaudio.__version__)
