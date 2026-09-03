@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="diarize_r01-v4"
+SCRIPT_VERSION="diarize_r01-v5"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -48,6 +48,16 @@ SCRIPT_VERSION="diarize_r01-v4"
 # New env PATH rather than deleting the old one: a batch job should not rm -rf a
 # shared directory. Reclaim the 4.x env manually with `rm -rf diar-env`.
 #
+# v5 also pins torch/torchaudio. pyannote 3.x calls torchaudio.AudioMetaData,
+# which newer torchaudio removed, so an unpinned install resolves to a pair
+# 3.x predates and fails at import. The 2.2.x line is the newest that both
+# supports Python 3.12 (the anaconda3 image ships 3.12, and torch <2.2 has no
+# 3.12 wheels) and still exposes that attribute.
+#
+# The pip step now runs on EVERY invocation, not only when the venv is absent —
+# otherwise a venv built with bad pins can never be corrected without deleting
+# it by hand. pip is a no-op when the pins are already satisfied.
+#
 # Resources: pyannote-3.1 on CPU is ~30M params; peak is the model plus one
 # decoded recording (~35 min at 16 kHz mono = 34 MB). 16GB is generous. Threads
 # follow LSB_DJOB_NUMPROC so a -n override can't desync them.
@@ -90,17 +100,27 @@ fi
 
 # --- one-time env bootstrap (serial: do NOT run two of these concurrently) ---
 if [ ! -x "$DIAR_ENV/bin/python" ]; then
-    echo "=== creating diar-env (one-time) ==="
+    echo "=== creating $DIAR_ENV (one-time) ==="
     python -m venv "$DIAR_ENV" || exit 1
     "$DIAR_ENV/bin/pip" install --quiet --upgrade pip || exit 1
-    "$DIAR_ENV/bin/pip" install --quiet "pyannote.audio>=3.1,<4" || exit 1
 fi
+# PYTHONPATH is cleared for pip only: with the repo on it, pip sees synchronai
+# and prints alarming "dependency conflict" ERROR lines about deps this env has
+# no reason to hold. Pure noise, but it has already cost debugging time once.
+echo "=== ensuring pinned deps ==="
+env -u PYTHONPATH "$DIAR_ENV/bin/pip" install --quiet \
+    "pyannote.audio>=3.1,<4" "torch>=2.2,<2.3" "torchaudio>=2.2,<2.3" || exit 1
 DIAR_PY="$DIAR_ENV/bin/python"
 
 "$DIAR_PY" - <<'PYCHK'
 import sys
 import pyannote.audio as pa, torch
-print("pyannote", pa.__version__, "torch", torch.__version__)
+import torchaudio
+print("pyannote", pa.__version__, "torch", torch.__version__,
+      "torchaudio", torchaudio.__version__)
+if not hasattr(torchaudio, "AudioMetaData"):
+    sys.exit("ERROR: torchaudio %s has no AudioMetaData; pyannote 3.x needs it. "
+             "Pin torchaudio lower." % torchaudio.__version__)
 major = int(pa.__version__.split(".")[0])
 if major >= 4:
     sys.exit("ERROR: pyannote %s installed, but this pipeline needs 3.x — 4.x "
