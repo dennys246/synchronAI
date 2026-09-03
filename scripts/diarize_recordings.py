@@ -147,12 +147,22 @@ def main() -> int:
     import pyannote.audio as _pa
     logger.info("Loading %s (pyannote %s, CPU)", args.model,
                 getattr(_pa, "__version__", "?"))
-    # pyannote 4.x renamed use_auth_token -> token. Try the new name first and
-    # fall back, so this works on both without pinning a major version.
+    # Authenticate via the ENVIRONMENT, not a kwarg. pyannote and
+    # huggingface_hub disagree about the keyword across versions — 3.x's
+    # from_pretrained takes only `use_auth_token` and forwards it to
+    # hf_hub_download, where newer huggingface_hub has removed it, so every
+    # kwarg spelling fails on some pairing. huggingface_hub reads HF_TOKEN from
+    # the environment on its own, which works on all of them.
+    os.environ["HF_TOKEN"] = token
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = token
     try:
-        pipeline = Pipeline.from_pretrained(args.model, token=token)
+        pipeline = Pipeline.from_pretrained(args.model)
     except TypeError:
-        pipeline = Pipeline.from_pretrained(args.model, use_auth_token=token)
+        # Only if some version insists on being handed one explicitly.
+        try:
+            pipeline = Pipeline.from_pretrained(args.model, token=token)
+        except TypeError:
+            pipeline = Pipeline.from_pretrained(args.model, use_auth_token=token)
     if pipeline is None:
         raise SystemExit(
             "ERROR: Pipeline.from_pretrained returned None — this is what pyannote\n"

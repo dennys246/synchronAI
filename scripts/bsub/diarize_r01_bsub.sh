@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="diarize_r01-v5"
+SCRIPT_VERSION="diarize_r01-v6"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
