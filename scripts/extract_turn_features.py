@@ -218,6 +218,11 @@ def main() -> int:
     ap.add_argument("--video-root", default=VIDEO_ROOT)
     ap.add_argument("--window", type=int, default=5,
                     help="Half-width in seconds; entry is (2*window+1, 9). Default 5.")
+    ap.add_argument("--diar-dir",
+                    help="Use a diarizer's per-second output (<record>.npz from "
+                         "diarize_recordings.py) instead of the human speaker labels. "
+                         "The coded region still comes from the human Trial spans, so "
+                         "both versions produce identical rows and are directly comparable.")
     ap.add_argument("--corrupt-der", type=float, default=0.0,
                     help="Degrade the human speaker labels to this DER to simulate a "
                          "real diarizer. 0 = use the human labels unchanged.")
@@ -237,6 +242,7 @@ def main() -> int:
     logger.info("Records with verbal coding: %d", len(records))
 
     per_record, index_rows, no_video, realised_ders = {}, [], [], []
+    n_diar = 0
     for rid in records:
         if not trials[rid]:
             logger.warning("%s: no Trial rows, skipping (no authoritative coded span)", rid)
@@ -245,8 +251,22 @@ def main() -> int:
         covered = timelines(trials[rid], 0, hi)
         if not covered.any():
             continue
-        p_act = timelines(speech[rid][PARENT], 0, hi)
-        c_act = timelines(speech[rid][CHILD], 0, hi)
+        if args.diar_dir:
+            f = Path(args.diar_dir) / f"{rid}.npz"
+            if not f.exists():
+                logger.warning("%s: no diarizer output, skipping", rid)
+                continue
+            a = np.load(f, allow_pickle=True)["active"]
+            # Clusters are in arbitrary order and we do NOT remap them to the
+            # human labels: speaker identity was shown not to matter, and a real
+            # deployment would not know the mapping either.
+            p_act = np.zeros(hi, dtype=bool); c_act = np.zeros(hi, dtype=bool)
+            n = min(hi, len(a))
+            p_act[:n], c_act[:n] = a[:n, 0], a[:n, 1]
+            n_diar += 1
+        else:
+            p_act = timelines(speech[rid][PARENT], 0, hi)
+            c_act = timelines(speech[rid][CHILD], 0, hi)
         if args.corrupt_der > 0:
             p_act, c_act, realised = corrupt(p_act, c_act, covered, args.corrupt_der,
                                              np.random.default_rng(args.corrupt_seed + int(rid)))
@@ -304,6 +324,8 @@ def main() -> int:
 
     mb = n * W * N_CHANNELS * 4 / 1e6
     logger.info("Wrote %d entries (%.1f MB) to %s", n, mb, out)
+    if n_diar:
+        logger.info("Speaker activity came from %s for %d records", args.diar_dir, n_diar)
     if realised_ders:
         logger.info("Simulated diarizer: target DER %.2f, realised %.3f +/- %.3f",
                     args.corrupt_der, float(np.mean(realised_ders)), float(np.std(realised_ders)))
