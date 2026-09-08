@@ -213,7 +213,14 @@ def build_record(p_act: np.ndarray, c_act: np.ndarray, covered: np.ndarray) -> n
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--verbal-csv", required=True)
+    ap.add_argument("--verbal-csv",
+                    help="R01 human VAD export. Supplies both the speaker timelines and "
+                         "the coded region. Omit for studies without human speaker coding "
+                         "and pass --labels-file instead.")
+    ap.add_argument("--labels-file",
+                    help="Any labels CSV. Used to define the covered region when there is "
+                         "no verbal coding: a second counts as covered if it carries a "
+                         "synchrony label. Requires --diar-dir for the speaker activity.")
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--video-root", default=VIDEO_ROOT)
     ap.add_argument("--window", type=int, default=5,
@@ -237,8 +244,32 @@ def main() -> int:
     video_root = Path(args.video_root)
     W = 2 * args.window + 1
 
-    speech, trials = load_verbal(Path(args.verbal_csv))
-    records = sorted(set(speech) | set(trials))
+    if not args.verbal_csv and not args.labels_file:
+        raise SystemExit("ERROR: pass --verbal-csv (R01) or --labels-file (any study).")
+    if args.labels_file and not args.diar_dir:
+        raise SystemExit(
+            "ERROR: --labels-file gives only the coded region, not who was speaking. "
+            "Pair it with --diar-dir.")
+
+    if args.verbal_csv:
+        speech, trials = load_verbal(Path(args.verbal_csv))
+        records = sorted(set(speech) | set(trials))
+        label_paths = {}
+    else:
+        # No human speaker coding: the covered region is simply the seconds that
+        # carry a synchrony label, and speaker activity comes from the diarizer.
+        speech, trials = defaultdict(lambda: {PARENT: [], CHILD: []}), defaultdict(list)
+        secs, label_paths = defaultdict(list), {}
+        for r in csv.DictReader(open(args.labels_file)):
+            rid = r.get("subject_id") or Path(r["video_path"]).stem
+            secs[rid].append(int(float(r["second"])))
+            label_paths.setdefault(rid, r["video_path"])
+        for rid, ss in secs.items():
+            # one span per labelled second; the union is the covered mask
+            trials[rid] = [(float(x), float(x) + 1.0) for x in sorted(set(ss))]
+        records = sorted(trials)
+        logger.info("Covered region from %s: %d records, %d labelled seconds",
+                    args.labels_file, len(records), sum(len(v) for v in secs.values()))
     logger.info("Records with verbal coding: %d", len(records))
 
     per_record, index_rows, no_video, realised_ders = {}, [], [], []
@@ -272,7 +303,7 @@ def main() -> int:
                                              np.random.default_rng(args.corrupt_seed + int(rid)))
             realised_ders.append(realised)
         ch = build_record(p_act, c_act, covered)
-        vpath = resolve_video(rid, video_root)
+        vpath = label_paths.get(rid) or resolve_video(rid, video_root)
         if vpath is None:
             no_video.append(rid)
             if args.require_video:

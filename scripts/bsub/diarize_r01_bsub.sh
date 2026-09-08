@@ -1,5 +1,5 @@
 #!/bin/bash
-SCRIPT_VERSION="diarize_r01-v9"
+SCRIPT_VERSION="diarize_r01-v10"
 #BSUB -G compute-perlmansusan
 #BSUB -q general
 #BSUB -m general
@@ -25,7 +25,9 @@ SCRIPT_VERSION="diarize_r01-v9"
 #   * R01 "stereo" is duplicated mono (measured) -> the ffmpeg downmix is lossless
 #
 # Env vars:
-#   DIAR_RECORDS : space-separated record IDs   (default: one smoke record)
+#   DIAR_RECORDS : space-separated R01 record IDs (default: one smoke record)
+#   DIAR_LABELS  : any labels CSV; takes recording paths from it instead of the
+#                  R01 tree, so CARE and R56 work too. Overrides DIAR_RECORDS.
 #   DIAR_OUT     : output dir                   (default: data/diarization_r01)
 #   HF_TOKEN     : optional. If unset, the token is read from HF_TOKEN_FILE.
 #   HF_TOKEN_FILE: default secrets/.hf_token (git-ignored). pyannote's models are
@@ -77,6 +79,7 @@ export SYNCHRONAI_DIR="/storage1/fs1/perlmansusan/Active/moochie/github/synchron
 cd "$SYNCHRONAI_DIR" || exit 1
 
 DIAR_RECORDS="${DIAR_RECORDS:-11002}"
+DIAR_LABELS="${DIAR_LABELS:-}"
 DIAR_OUT="${DIAR_OUT:-data/diarization_r01}"
 VERBAL_CSV="${VERBAL_CSV:-verbal_pcat_r01_07-27-2026.csv}"
 DIAR_ENV="${DIAR_ENV:-$SYNCHRONAI_DIR/diar-env3}"
@@ -153,14 +156,24 @@ rc=$?
 if [ $rc -ne 0 ]; then echo "ERROR: diar-env check failed (rc=$rc)"; exit $rc; fi
 
 echo "=== [1/2] diarizing ==="
-"$DIAR_PY" scripts/diarize_recordings.py --records $DIAR_RECORDS --out "$DIAR_OUT" \
+if [ -n "$DIAR_LABELS" ]; then
+    SELECT="--from-labels $DIAR_LABELS"
+else
+    SELECT="--records $DIAR_RECORDS"
+fi
+echo "selection: $SELECT"
+"$DIAR_PY" scripts/diarize_recordings.py $SELECT --out "$DIAR_OUT" \
     --scratch "${TMPDIR:-/tmp}" --token-file "$HF_TOKEN_FILE"
 rc=$?
 if [ $rc -ne 0 ]; then echo "ERROR: diarization failed (rc=$rc)"; exit $rc; fi
 
-echo "=== [2/2] scoring against human VAD ==="
-"$DIAR_PY" scripts/score_diarization.py --diar-dir "$DIAR_OUT" --verbal-csv "$VERBAL_CSV"
-rc=$?
-if [ $rc -ne 0 ]; then echo "ERROR: scoring failed (rc=$rc)"; exit $rc; fi
+if [ -n "$DIAR_LABELS" ]; then
+    echo "=== [2/2] skipping DER scoring — $DIAR_LABELS has no human speaker coding ==="
+else
+    echo "=== [2/2] scoring against human VAD ==="
+    "$DIAR_PY" scripts/score_diarization.py --diar-dir "$DIAR_OUT" --verbal-csv "$VERBAL_CSV"
+    rc=$?
+    if [ $rc -ne 0 ]; then echo "ERROR: scoring failed (rc=$rc)"; exit $rc; fi
+fi
 
 echo "=== [$SCRIPT_VERSION] complete ==="

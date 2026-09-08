@@ -36,6 +36,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import os
 import re
@@ -134,8 +135,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--records", nargs="+", help="Record IDs, e.g. 11002 11004")
-    g.add_argument("--records-file", help="File with one record ID per line")
+    g.add_argument("--records", nargs="+", help="R01 record IDs, e.g. 11002 11004")
+    g.add_argument("--records-file", help="File with one R01 record ID per line")
+    g.add_argument("--from-labels",
+                   help="Any labels CSV with video_path + subject_id columns. Takes the "
+                        "recording path straight from the file instead of walking the R01 "
+                        "tree, so this works for CARE and R56 too, which have no human "
+                        "speaker coding and a different directory layout.")
     ap.add_argument("--out", required=True)
     ap.add_argument("--model", default="pyannote/speaker-diarization-3.1")
     ap.add_argument("--scratch", default=os.environ.get("TMPDIR", "/tmp"))
@@ -143,7 +149,23 @@ def main() -> int:
                     help="Fallback HF token file, used when $HF_TOKEN is unset.")
     args = ap.parse_args()
 
-    recs = args.records or [l.strip() for l in open(args.records_file) if l.strip()]
+    # (record_id, video_path) pairs. R01 resolves paths from its tree; every other
+    # study supplies them via --from-labels.
+    if args.from_labels:
+        seen, pairs = set(), []
+        for r in csv.DictReader(open(args.from_labels)):
+            vp = r["video_path"]
+            rid = r.get("subject_id") or Path(vp).stem
+            if rid in seen:
+                continue
+            seen.add(rid)
+            # labels carry CLUSTER paths; map back if we are on the mac mount
+            local = vp.replace(CLUSTER_ROOT, DATA_ROOT, 1)
+            pairs.append((rid, local))
+        logger.info("%d recordings from %s", len(pairs), args.from_labels)
+    else:
+        recs = args.records or [l.strip() for l in open(args.records_file) if l.strip()]
+        pairs = [(r, None) for r in recs]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -203,13 +225,16 @@ def main() -> int:
             "         huggingface.co/pyannote/segmentation-3.0")
 
     n_ok = n_skip = n_fail = 0
-    for rid in recs:
+    for rid, given in pairs:
         dst = out / f"{rid}.npz"
         if dst.exists():
             logger.info("%s: exists, skipping", rid)
             n_skip += 1
             continue
-        vid = resolve_video(rid)
+        vid = given if given else resolve_video(rid)
+        if vid and not os.path.exists(vid):
+            logger.warning("%s: path from labels does not exist: %s", rid, vid)
+            vid = None
         if vid is None:
             logger.warning("%s: no resolvable recording", rid)
             n_fail += 1
