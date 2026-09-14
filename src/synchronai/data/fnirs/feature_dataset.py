@@ -428,12 +428,81 @@ def load_fnirs_feature_index(feature_dir: Union[str, Path]) -> pd.DataFrame:
     return pd.read_csv(index_file)
 
 
+def _leading_digits(subject_id: str) -> str:
+    digits = ""
+    for ch in str(subject_id):
+        if not ch.isdigit():
+            break
+        digits += ch
+    return digits
+
+
+def fnirs_participant_id(subject_id: str, fnirs_path: str = "") -> str:
+    """Person-level key, independent of visit/timepoint.
+
+    CARE subject_ids embed the visit: the same child appears as
+    "50001_V0_fNIRS", "50001_V1_fNIRS", "50001_V2_fNIRS". Grouping on
+    subject_id therefore lets one person's later visit land in val while an
+    earlier visit trains — genuine identity leakage. The leading digit run
+    identifies the person (parent 5000 and child 50001 stay distinct).
+
+    P-CAT subject_ids ("11001_C", "1102-P") are already person-level and
+    repeat across timepoints unchanged, so they are returned as-is.
+    """
+    if "/CARE/" not in str(fnirs_path):
+        return str(subject_id)
+    digits = _leading_digits(subject_id)
+    return f"CARE:{digits}" if digits else str(subject_id)
+
+
+def fnirs_family_id(subject_id: str, fnirs_path: str = "") -> str:
+    """Family/dyad key — the most conservative grouping.
+
+    Keeps every recording of a household together: both members of a dyad,
+    all of their visits, and siblings enrolled with the same parent.
+
+    CARE ids carry a 4-digit parent number or a 5-digit child number that
+    extends it (parent 5000, child 50001) -> truncate to 4 digits. P-CAT ids
+    are "{family}-C"/"{family}-P"/"{family}_C"/"{family}_P" with a study-wide
+    family number -> keep the full leading digit run. CARE is identified from
+    the path because a 5-digit id is a CARE child but an R01 family.
+
+    Falls back to subject_id when there are no leading digits, i.e. degrades to
+    subject-level grouping rather than collapsing unknowns into one group.
+    """
+    digits = _leading_digits(subject_id)
+    if not digits:
+        return str(subject_id)
+    if "/CARE/" in str(fnirs_path) and len(digits) >= 4:
+        return digits[:4]
+    return digits
+
+
+def _entry_group(entry: dict, group_key: str, index: int = 0) -> str:
+    if group_key == "family_id":
+        return fnirs_family_id(
+            entry.get("subject_id", ""), entry.get("fnirs_path", "")
+        )
+    if group_key == "participant_id":
+        return fnirs_participant_id(
+            entry.get("subject_id", ""), entry.get("fnirs_path", "")
+        )
+    return entry.get("subject_id", entry.get("fnirs_path", str(index)))
+
+
 def split_fnirs_feature_entries(
     entries: list[dict],
     val_split: float = 0.2,
     seed: int = 42,
+    group_key: str = "subject_id",
 ) -> tuple[list[dict], list[dict]]:
-    """Split entries into train/val by subject_id to prevent leakage.
+    """Split entries into train/val by group_key to prevent leakage.
+
+    'subject_id' keeps one subject_id's windows together, but CARE encodes the
+    visit in the subject_id, so a person's V0 and V1 land in different groups.
+    'participant_id' collapses those visits and is the correct default for any
+    task where seeing the same person twice is leakage. 'family_id' is more
+    conservative still, additionally grouping dyad members and siblings.
 
     NOTE: groups are sorted() before shuffling. `set()` iteration order over
     strings is hash-randomized per process (PYTHONHASHSEED), so `list(set(...))`
@@ -444,8 +513,7 @@ def split_fnirs_feature_entries(
     split is reproducible across processes for a given seed.
     """
     groups = sorted(set(
-        e.get("subject_id", e.get("fnirs_path", str(i)))
-        for i, e in enumerate(entries)
+        _entry_group(e, group_key, i) for i, e in enumerate(entries)
     ))
 
     rng = random.Random(seed)
@@ -457,16 +525,15 @@ def split_fnirs_feature_entries(
     train_entries = []
     val_entries = []
     for entry in entries:
-        group = entry.get("subject_id", entry.get("fnirs_path", ""))
-        if group in val_groups:
+        if _entry_group(entry, group_key) in val_groups:
             val_entries.append(entry)
         else:
             train_entries.append(entry)
 
     logger.info(
         f"Split {len(entries)} entries into {len(train_entries)} train, "
-        f"{len(val_entries)} val ({len(groups) - n_val} train subjects, "
-        f"{n_val} val subjects)"
+        f"{len(val_entries)} val ({len(groups) - n_val} train {group_key}s, "
+        f"{n_val} val {group_key}s)"
     )
     return train_entries, val_entries
 
@@ -559,6 +626,7 @@ def create_fnirs_feature_dataloaders(
     seed: int = 42,
     include_tiers: list[str] | None = None,
     window_idx_filter: str | None = None,
+    group_key: str = "subject_id",
 ) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, float, int]:
     """Create train/val dataloaders from pre-extracted fNIRS features.
 
@@ -569,6 +637,9 @@ def create_fnirs_feature_dataloaders(
         window_idx_filter: If set, restrict to entries matching a window-idx
             condition (e.g. 'eq:0', 'gt:0'). Use to train/eval on a specific
             slice of each recording (window 0 = recording-onset, later = steady state).
+        group_key: Grouping unit for the split — 'subject_id',
+            'participant_id' (collapses CARE repeat visits), or 'family_id'
+            (additionally groups dyad members and siblings).
 
     Returns:
         (train_loader, val_loader, pos_weight, feature_dim)
@@ -617,7 +688,9 @@ def create_fnirs_feature_dataloaders(
     feature_dim = int(entries[0]["feature_dim"])
     logger.info(f"Loaded {len(entries)} fNIRS feature entries, dim={feature_dim}")
 
-    train_entries, val_entries = split_fnirs_feature_entries(entries, val_split, seed)
+    train_entries, val_entries = split_fnirs_feature_entries(
+        entries, val_split, seed, group_key
+    )
 
     if is_feature_dir_packed(feature_dir):
         logger.info("Using packed feature format (mmap-backed)")

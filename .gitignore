@@ -315,6 +315,7 @@ scripts/bsub/pre_fnirs_matched_steps_bsub.sh
 scripts/bsub/pre_fnirs_ablation_random_tile_bsub.sh
 scripts/bsub/pre_fnirs_extract_random_tile_bsub.sh
 scripts/bsub/pre_fnirs_child_adult_sweep_tile_bsub.sh
+scripts/bsub/pre_fnirs_child_adult_groupkey_bsub.sh
 scripts/bsub/submit_crossperson_probe_fold0.sh
 scripts/bsub/submit_v2_subject_filter_fold0.sh
 scripts/bsub/submit_v5coupling_probe_fold0.sh

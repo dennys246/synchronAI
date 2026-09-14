@@ -387,6 +387,7 @@ def train_fnirs_from_features(
     plot_every: int = 5,
     window_idx_filter: str | None = None,
     save_final: bool = False,
+    group_key: str = "subject_id",
 ) -> None:
     """Train a classifier on pre-extracted fNIRS features.
 
@@ -408,6 +409,7 @@ def train_fnirs_from_features(
         is_feature_dir_packed,
         load_fnirs_feature_index,
         split_fnirs_feature_entries,
+        _entry_group,
         FnirsFeatureDataset,
         FnirsPackedFeatureDataset,
         _fnirs_feature_collate_fn,
@@ -436,6 +438,7 @@ def train_fnirs_from_features(
             seed=seed,
             include_tiers=include_tiers,
             window_idx_filter=window_idx_filter,
+            group_key=group_key,
         )
     )
 
@@ -462,9 +465,13 @@ def train_fnirs_from_features(
         train_pool = filter_by_window_idx(
             filter_by_quality_tier(all_entries, include_tiers), window_idx_filter
         )
-        _, val_train_split = split_fnirs_feature_entries(train_pool, val_split, seed)
-        val_subjects = {e.get("subject_id") for e in val_train_split}
-        val_entries = [e for e in all_entries if e.get("subject_id") in val_subjects]
+        _, val_train_split = split_fnirs_feature_entries(
+            train_pool, val_split, seed, group_key
+        )
+        val_groups = {_entry_group(e, group_key) for e in val_train_split}
+        val_entries = [
+            e for e in all_entries if _entry_group(e, group_key) in val_groups
+        ]
 
         holdout_dataset_cls = (
             FnirsPackedFeatureDataset
@@ -543,6 +550,7 @@ def train_fnirs_from_features(
         "warmup_epochs": warmup_epochs,
         "patience": patience,
         "seed": seed,
+        "group_key": group_key,
     }
     with open(save_dir / "config.json", "w") as f:
         json.dump(config, f, indent=2)
@@ -790,6 +798,12 @@ def main():
     parser.add_argument("--warmup-epochs", type=int, default=3)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--val-split", type=float, default=0.2)
+    parser.add_argument("--group-key", default="subject_id",
+                        choices=["subject_id", "participant_id", "family_id"],
+                        help="Grouping unit for the leakage-safe split. "
+                             "'participant_id' collapses CARE repeat visits "
+                             "(50001_V0/_V1/_V2 are one person). 'family_id' "
+                             "additionally groups dyad members and siblings.")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--include-tiers", default=None,
@@ -841,6 +855,7 @@ def main():
         plot_every=args.plot_every,
         window_idx_filter=args.window_idx_filter,
         save_final=args.save_final,
+        group_key=args.group_key,
     )
 
 
